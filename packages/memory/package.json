@@ -1,0 +1,23 @@
+﻿{
+    "scripts":  {
+                    "build":  "tsc --noEmit",
+                    "typecheck":  "tsc --noEmit",
+                    "test":  "echo \"no tests\""
+                },
+    "description":  "Short-term and long-term memory",
+    "type":  "module",
+    "version":  "0.1.0",
+    "dependencies":  {
+                         "@deskpet/contracts":  "workspace:*",
+                         "openai":  "^4.73.0"
+                     },
+    "name":  "@deskpet/memory",
+    "private":  true,
+    "exports":  {
+                    ".":  "./src/index.ts"
+                },
+    "devDependencies":  {
+                            "typescript":  "^5.6.3"
+                        },
+    "license":  "MIT"
+}

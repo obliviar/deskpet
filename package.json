@@ -1,0 +1,22 @@
+{
+  "name": "deskpet",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A modular AI agent built with the Port pattern",
+  "license": "MIT",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "pnpm -F @deskpet/cli dev",
+    "dev:server": "pnpm -F @deskpet/server dev",
+    "dev:electron": "pnpm -F @deskpet/electron dev",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "turbo": "^2.9.6",
+    "typescript": "^5.6.3"
+  },
+  "packageManager": "pnpm@9.12.0"
+}

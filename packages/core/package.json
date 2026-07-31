@@ -1,0 +1,23 @@
+﻿{
+    "scripts":  {
+                    "build":  "tsc --noEmit",
+                    "typecheck":  "tsc --noEmit",
+                    "test":  "vitest run"
+                },
+    "description":  "Agent runtime orchestration",
+    "type":  "module",
+    "version":  "0.1.0",
+    "dependencies":  {
+                         "@deskpet/contracts":  "workspace:*"
+                     },
+    "name":  "@deskpet/core",
+    "private":  true,
+    "exports":  {
+                    ".":  "./src/index.ts"
+                },
+    "devDependencies":  {
+                            "vitest":  "^2.1.0",
+                            "typescript":  "^5.6.3"
+                        },
+    "license":  "MIT"
+}

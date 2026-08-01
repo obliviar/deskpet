@@ -28,9 +28,7 @@ if (config.memoryEnabled) {
 const tools = createToolRegistry([webSearchTool, fileReadTool, httpFetchTool])
 const hooks = createChatHooks()
 
-let currentChunks: string[] = []
 hooks.onTokenLiteral(async (literal) => {
-  currentChunks.push(literal)
   mainWindow?.webContents.send('chat:token', literal)
 })
 
@@ -42,8 +40,7 @@ const runtime = createAgentRuntime({
 })
 
 function setupIPC() {
-  ipcMain.handle('chat:send', async (_event, message: string, _sessionId: string) => {
-    currentChunks = []
+  ipcMain.handle('chat:send', async (_event, message: string) => {
     const result = await runtime.send('default', message)
     return { text: result.text, toolCalls: result.toolCalls }
   })
@@ -58,8 +55,8 @@ function createWindow() {
     title: 'DeskPet',
     backgroundColor: '#0f1117',
     webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      nodeIntegration: true,
+      contextIsolation: false,
     },
   })
 

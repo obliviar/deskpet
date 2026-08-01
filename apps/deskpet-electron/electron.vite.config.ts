@@ -7,7 +7,10 @@ export default defineConfig({
     build: { outDir: 'dist/main', rollupOptions: { external: ['electron'] } },
   },
   preload: {
-    build: { outDir: 'dist/preload', rollupOptions: { external: ['electron'] } },
+    build: {
+      outDir: 'dist/preload',
+      rollupOptions: { output: { format: 'cjs', entryFileNames: 'index.js' } },
+    },
   },
   renderer: {
     resolve: {

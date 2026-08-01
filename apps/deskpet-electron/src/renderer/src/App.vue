@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { ref, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, nextTick, onMounted } from 'vue'
+
+const { ipcRenderer } = (window as any).require('electron')
 
 interface Message {
   role: 'user' | 'assistant'
@@ -12,17 +14,14 @@ const input = ref('')
 const isLoading = ref(false)
 const chatEl = ref<HTMLElement | null>(null)
 
-let unsubToken: (() => void) | null = null
-
 onMounted(() => {
-  const deskpet = (window as any).deskpet
-  if (deskpet) {
-    unsubToken = deskpet.onToken((_token: string) => {})
-  }
-})
-
-onUnmounted(() => {
-  unsubToken?.()
+  ipcRenderer.on('chat:token', (_event: any, token: string) => {
+    const last = messages.value[messages.value.length - 1]
+    if (last && last.role === 'assistant') {
+      last.content += token
+      scrollToBottom()
+    }
+  })
 })
 
 async function send() {
@@ -40,26 +39,13 @@ async function send() {
 
   scrollToBottom()
 
-  const deskpet = (window as any).deskpet
-  if (!deskpet) {
-    assistantMsg.content = '[Error: deskpet bridge not found]'
-    isLoading.value = false
-    return
-  }
-
-  const tokenCleanup = deskpet.onToken((token: string) => {
-    assistantMsg.content += token
-    scrollToBottom()
-  })
-
   try {
-    await deskpet.sendMessage(text, 'default')
+    await ipcRenderer.invoke('chat:send', text)
   }
   catch (err) {
-    assistantMsg.content += '\n\n[Error: ' + (err instanceof Error ? err.message : 'unknown') + ']'
+    assistantMsg.content = '[Error: ' + (err instanceof Error ? err.message : 'unknown') + ']'
   }
   finally {
-    tokenCleanup()
     isLoading.value = false
     scrollToBottom()
   }

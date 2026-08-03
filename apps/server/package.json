@@ -1,4 +1,4 @@
-﻿{
+{
     "scripts":  {
                     "typecheck":  "tsc --noEmit",
                     "build":  "tsc --noEmit",

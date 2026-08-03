@@ -5,3 +5,6 @@ dist/
 .env.local
 .turbo/
 coverage/
+release/
+out/
+resources/char/

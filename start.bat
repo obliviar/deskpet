@@ -1,0 +1,14 @@
+@echo off
+chcp 65001 >nul
+cd /d D:\GitHub\deskpet
+
+set OPENAI_API_KEY=sk-5otXLG6e8GGmqXraw_6K3Q
+set OPENAI_BASE_URL=https://api.llm.ustc.edu.cn/v1
+set DESKPET_MODEL=deepseek-v4-pro
+set DESKPET_MEMORY=false
+
+:: 刷新 PATH 确保找到 pnpm
+set "PATH=%PATH%;C:\Program Files\nodejs;C:\Users\%USERNAME%\AppData\Roaming\npm"
+
+pnpm dev:electron
+pause

@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'node:path'
+import { readFileSync, existsSync } from 'node:fs'
 
 import { createAgentRuntime, createSessionManager, createChatHooks } from '@deskpet/core'
 import { createOpenAILlm } from '@deskpet/llm-openai'
@@ -8,12 +9,34 @@ import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '
 
 let mainWindow: BrowserWindow | null = null
 
+function loadConfig() {
+  const cfgPath = join(app.getAppPath(), '..', 'config.json')
+  if (existsSync(cfgPath)) {
+    try {
+      return JSON.parse(readFileSync(cfgPath, 'utf-8'))
+    }
+    catch {}
+  }
+  return {}
+}
+
+const fileConfig = loadConfig()
+const charConfig = fileConfig.character || {}
+
+const systemPrompt = `你是${charConfig.name || 'DeskPet'}。${charConfig.persona || '一个友好的AI助手。'}
+
+规则：
+- 说话温柔可爱，像朋友一样自然
+- 回复简洁，控制在100字以内
+- 用一点颜文字增加可爱感 (｡･ω･｡)
+- 不要提自己是AI`
+
 const config = {
-  apiKey: process.env.OPENAI_API_KEY || '',
-  baseURL: process.env.OPENAI_BASE_URL || undefined,
-  model: process.env.DESKPET_MODEL || 'gpt-4o-mini',
-  systemPrompt: process.env.DESKPET_SYSTEM_PROMPT || 'You are a helpful AI assistant named DeskPet.',
-  memoryEnabled: process.env.DESKPET_MEMORY !== 'false',
+  apiKey: process.env.OPENAI_API_KEY || fileConfig.apiKey || '',
+  baseURL: process.env.OPENAI_BASE_URL || fileConfig.baseURL || undefined,
+  model: process.env.DESKPET_MODEL || fileConfig.model || 'gpt-4o-mini',
+  systemPrompt: process.env.DESKPET_SYSTEM_PROMPT || systemPrompt,
+  memoryEnabled: process.env.DESKPET_MEMORY ? process.env.DESKPET_MEMORY !== 'false' : (fileConfig.memoryEnabled !== false),
 }
 
 const llm = createOpenAILlm({ apiKey: config.apiKey, baseURL: config.baseURL })
@@ -44,6 +67,8 @@ function setupIPC() {
     const result = await runtime.send('default', message)
     return { text: result.text, toolCalls: result.toolCalls }
   })
+
+  ipcMain.handle('get:character', () => charConfig)
 }
 
 function createWindow() {

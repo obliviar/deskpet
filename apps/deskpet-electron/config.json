@@ -1,5 +1,5 @@
 {
-  "apiKey": "sk-your-api-key-here",
+  "apiKey": "sk-5otXLG6e8GGmqXraw_6K3Q",
   "baseURL": "https://api.llm.ustc.edu.cn/v1",
   "model": "deepseek-v4-pro",
   "memoryEnabled": false,

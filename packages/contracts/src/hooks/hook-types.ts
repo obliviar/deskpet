@@ -7,7 +7,7 @@ import type { ChatStreamEventContext, StreamingAssistantMessage } from '../types
  * Each `emit*` is called by the runtime; implementors should not call them.
  */
 export interface ChatHookRegistry {
-  onBeforeMessageComposed: (cb: (message: string, ctx: Omit<ChatStreamEventContext, 'composedMessage'>) => Promise<void>) => () => void
+  onBeforeMessageComposed: (cb: (message: string, ctx: ChatStreamEventContext) => Promise<void>) => () => void
   onAfterMessageComposed: (cb: (message: string, ctx: ChatStreamEventContext) => Promise<void>) => () => void
   onBeforeSend: (cb: (message: string, ctx: ChatStreamEventContext) => Promise<void>) => () => void
   onAfterSend: (cb: (message: string, ctx: ChatStreamEventContext) => Promise<void>) => () => void
@@ -15,7 +15,7 @@ export interface ChatHookRegistry {
   onStreamEnd: (cb: (ctx: ChatStreamEventContext) => Promise<void>) => () => void
   onAssistantMessage: (cb: (message: StreamingAssistantMessage, text: string, ctx: ChatStreamEventContext) => Promise<void>) => () => void
 
-  emitBeforeMessageComposedHooks: (message: string, ctx: Omit<ChatStreamEventContext, 'composedMessage'>) => Promise<void>
+  emitBeforeMessageComposedHooks: (message: string, ctx: ChatStreamEventContext) => Promise<void>
   emitAfterMessageComposedHooks: (message: string, ctx: ChatStreamEventContext) => Promise<void>
   emitBeforeSendHooks: (message: string, ctx: ChatStreamEventContext) => Promise<void>
   emitAfterSendHooks: (message: string, ctx: ChatStreamEventContext) => Promise<void>

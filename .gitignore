@@ -8,3 +8,4 @@ coverage/
 release/
 out/
 resources/char/
+apps/deskpet-electron/config.json

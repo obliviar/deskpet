@@ -4,11 +4,9 @@ import { createInMemorySession } from './in-memory-session'
 /**
  * Wraps a raw session store into the AgentSessionPort contract.
  *
- * Also generates ids and timestamps for newly appended items so callers do
- * not need to fabricate them.
+ * Accepts an optional store for dependency injection; defaults to in-memory.
  */
-export function createSessionManager(maxPerSession = 100): AgentSessionPort {
-  const store = createInMemorySession(maxPerSession)
+export function createSessionManager(maxPerSession = 100, store = createInMemorySession(maxPerSession)): AgentSessionPort {
 
   return {
     ensureSession: store.ensureSession,

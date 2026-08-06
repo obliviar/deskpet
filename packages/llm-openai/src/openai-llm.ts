@@ -20,7 +20,7 @@ export function createOpenAILlm(config: ProviderConfig): AgentLLMPort {
           model,
           messages: messages.map(toOpenAIMessage),
           tools: options.tools?.map(t => ({ type: 'function' as const, function: t.function })),
-          tool_choice: options.toolChoice as any,
+          tool_choice: options.toolChoice as OpenAI.Chat.Completions.ChatCompletionToolChoiceOption,
           temperature: options.temperature ?? 0.7,
           max_tokens: options.maxTokens,
           stream: true,
@@ -76,7 +76,7 @@ export function createOpenAILlm(config: ProviderConfig): AgentLLMPort {
   }
 }
 
-function toOpenAIMessage(m: ChatMessage): any {
+function toOpenAIMessage(m: ChatMessage): OpenAI.Chat.Completions.ChatCompletionMessageParam {
   const content = typeof m.content === 'string'
     ? m.content
     : m.content.map(p => {
@@ -99,5 +99,5 @@ function toOpenAIMessage(m: ChatMessage): any {
   if (m.name)
     result.name = m.name
 
-  return result
+  return result as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam
 }

@@ -1,16 +1,16 @@
-import type { AgentRuntime } from '@deskpet/core'
 import { Hono } from 'hono'
+import type { AppEnv } from '../index'
 
-type Env = { Variables: { runtime: AgentRuntime } }
-
-export const chatRoutes = new Hono<Env>()
+export const chatRoutes = new Hono<AppEnv>()
 
 chatRoutes.post('/', async (c) => {
   const runtime = c.get('runtime')
   const body = await c.req.json().catch(() => ({}))
-  const { sessionId = 'default', message, model } = body
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : 'default'
+  const message = typeof body.message === 'string' ? body.message : ''
+  const model = typeof body.model === 'string' ? body.model : undefined
 
-  if (!message)
+  if (!message.trim())
     return c.json({ error: 'message is required' }, 400)
 
   try {

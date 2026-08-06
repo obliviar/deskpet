@@ -1,6 +1,5 @@
 export { createOpenAILlm } from './openai-llm'
 export { buildMultimodalContent, loadImageAttachment } from './openai-multimodal'
 export type { ImageAttachment } from './openai-multimodal'
-export type { ProviderConfig, ProviderPreset, ResolvedProvider } from './providers'
+export type { ProviderConfig, ProviderPreset } from './providers'
 export { resolveProvider } from './providers'
-export { PRESET_BASE_URLS } from './providers'

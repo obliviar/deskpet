@@ -47,6 +47,8 @@ export interface ChatStreamEventContext {
   sessionId: string
   generation: number
   input?: { type: 'text' | 'voice' | 'image' }
+  /** The user message that triggered this turn; set by before/after-message-composed hooks. */
+  composedMessage?: string
 }
 
 /** A streaming assistant message being assembled token by token. */

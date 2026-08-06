@@ -19,12 +19,12 @@ export function createOpenAITTS(options: OpenAITTSOptions): TextToSpeechPort {
     async synthesize(text, opts = {}): Promise<ArrayBuffer> {
       const mp3 = await client.audio.speech.create({
         model: options.model ?? 'tts-1',
-        voice: (opts.voice ?? options.voice ?? 'alloy') as any,
+        voice: (opts.voice ?? options.voice ?? 'alloy') as OpenAI.Audio.Speech.SpeechCreateParams['voice'],
         input: text,
-        response_format: (opts.format ?? options.format ?? 'mp3') as any,
+        response_format: (opts.format ?? options.format ?? 'mp3') as OpenAI.Audio.Speech.SpeechCreateParams['response_format'],
       })
 
-      return (mp3 as unknown as Response).arrayBuffer()
+      return mp3.arrayBuffer()
     },
   }
 }

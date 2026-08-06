@@ -6,10 +6,10 @@
  */
 
 export async function playAudioBuffer(buffer: ArrayBuffer, format = 'mp3') {
-  const { writeFileSync } = await import('node:fs')
+  const { writeFile } = await import('node:fs/promises')
   const { randomUUID } = await import('node:crypto')
   const filename = `voice-output-${randomUUID()}.${format}`
-  writeFileSync(filename, Buffer.from(buffer))
+  await writeFile(filename, Buffer.from(buffer))
   console.log(`[deskpet] voice output saved to ${filename}`)
   return filename
 }

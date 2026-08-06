@@ -31,8 +31,8 @@ export function buildMultimodalContent(
  * Reads a file from disk and encodes it as a base64 data URL for image attachments.
  */
 export async function loadImageAttachment(filePath: string, mimeType = 'image/png'): Promise<ImageAttachment> {
-  const { readFileSync } = await import('node:fs')
-  const buffer = readFileSync(filePath)
+  const { readFile } = await import('node:fs/promises')
+  const buffer = await readFile(filePath)
   return {
     type: 'image',
     data: buffer.toString('base64'),

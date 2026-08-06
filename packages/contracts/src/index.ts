@@ -1,6 +1,6 @@
 export type { ChatRole, ContentPart, ChatMessage, ToolCall, ChatHistoryItem, ChatStreamEventContext, StreamingAssistantMessage } from './types/chat'
 export type { ContextMessage } from './types/context'
-export type { StreamEvent, StreamOptions, ToolDefinitionRef } from './types/llm'
+export type { StreamEvent, StreamOptions } from './types/llm'
 export type { ToolDefinition, ToolResult, ToolHandler, ToolExecutionContext } from './types/tool'
 export type { MemoryFragment } from './ports/memory-port'
 

@@ -1,21 +1,19 @@
-import type { AgentRuntime } from '@deskpet/core'
 import { Hono } from 'hono'
+import type { AppEnv } from '../index'
 
-type Env = { Variables: { runtime: AgentRuntime } }
-
-export const voiceRoutes = new Hono<Env>()
+export const voiceRoutes = new Hono<AppEnv>()
 
 voiceRoutes.post('/transcribe', async (c) => {
   const runtime = c.get('runtime')
   const body = await c.req.parseBody()
-  const sessionId = String(body.sessionId || 'default')
-  const text = body.text
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : 'default'
+  const text = typeof body.text === 'string' ? body.text : ''
 
-  if (!text || typeof text !== 'string')
+  if (!text.trim())
     return c.json({ error: 'text field is required' }, 400)
 
   try {
-    const result = await runtime.send(sessionId, text as string, { input: { type: 'voice' } })
+    const result = await runtime.send(sessionId, text, { input: { type: 'voice' } })
     return c.json({ text: result.text, toolCalls: result.toolCalls })
   }
   catch (err) {

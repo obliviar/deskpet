@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, desktopCapturer } from 'electron'
 import { join } from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
 
@@ -9,7 +9,7 @@ import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '
 
 import { createPersistence } from './persist'
 import { createSettingsManager } from './settings'
-import type { AppSettings } from './settings'
+import { setupVoiceIPC } from './voice'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -66,16 +66,26 @@ if (config.memoryEnabled) {
 
 // ── Runtime ─────────────────────────────────────────────
 const settings = settingsMgr.get()
-const agentName = settings.agentName || 'DeskPet'
-const defaultPersona = settings.persona || `You are ${agentName}, a friendly and helpful AI companion. Respond warmly and naturally.`
+let agentName = settings.agentName || 'DeskPet'
+
+function buildPersona(name: string): string {
+  return [
+    `Your name is ${name}. You are a friendly and helpful AI companion.`,
+    `Always refer to yourself as "${name}" when introducing yourself or referring to yourself.`,
+    `If someone asks your name, tell them it is ${name}.`,
+    `Respond warmly and naturally, as ${name} would.`,
+  ].join(' ')
+}
+
+let currentPersona = settings.agentName ? buildPersona(settings.agentName) : 'You are a helpful AI assistant named DeskPet.'
 
 const hooks = createChatHooks()
 hooks.onTokenLiteral(async (literal) => {
   mainWindow?.webContents.send('chat:token', literal)
 })
 
-const runtime = createAgentRuntime({
-  persona: { systemPrompt: defaultPersona, model: config.model },
+let runtime = createAgentRuntime({
+  persona: { systemPrompt: currentPersona, model: config.model },
   llm, session: sessionStore, memory,
   tools: tools.hasTools() ? tools : undefined,
   hooks,
@@ -83,10 +93,29 @@ const runtime = createAgentRuntime({
 
 // ── IPC ─────────────────────────────────────────────────
 function setupIPC() {
-  ipcMain.handle('chat:send', async (_event, message: string) => {
-    const result = await runtime.send('default', message)
+  ipcMain.handle('chat:send', async (_event, message: string, attachments?: { type: 'image'; data: string; mimeType: string }[]) => {
+    const result = await runtime.send('default', message, attachments && attachments.length > 0 ? { attachments } : undefined)
     saveSessions()
     return { text: result.text, toolCalls: result.toolCalls }
+  })
+
+  ipcMain.handle('screen:capture', async () => {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      thumbnailSize: { width: 1280, height: 720 },
+      fetchWindowIcons: false,
+    })
+    if (sources.length === 0)
+      return { ok: false, error: 'no sources' }
+    // Use the first screen source
+    const source = sources[0]!
+    const thumbnail = source.thumbnail
+    const dataUrl = thumbnail.toDataURL()
+    // Parse data URL: data:image/jpeg;base64,xxxx
+    const match = /^data:(image\/\w+);base64,(.+)$/.exec(dataUrl)
+    if (!match)
+      return { ok: false, error: 'failed to encode thumbnail' }
+    return { ok: true, data: match[2]!, mimeType: match[1]! }
   })
 
   ipcMain.handle('settings:get', () => {
@@ -95,11 +124,35 @@ function setupIPC() {
 
   ipcMain.handle('settings:set-name', async (_event, name: string) => {
     settingsMgr.setName(name)
+    agentName = name
+    currentPersona = buildPersona(name)
+    runtime = createAgentRuntime({
+      persona: { systemPrompt: currentPersona, model: config.model },
+      llm, session: sessionStore, memory,
+      tools: tools.hasTools() ? tools : undefined,
+      hooks,
+    })
+    mainWindow?.setTitle(name)
+    return { ok: true }
+  })
+
+  ipcMain.handle('settings:set-theme', async (_event, theme: string) => {
+    settingsMgr.setTheme(theme)
     return { ok: true }
   })
 
   ipcMain.handle('sessions:history', () => {
     return sessionStore.getSessionMessages('default')
+  })
+
+  ipcMain.handle('sessions:truncate-after', async (_event, messageId: string) => {
+    const msgs = sessionStore.getSessionMessages('default')
+    const idx = msgs.findIndex(m => m.id === messageId)
+    if (idx < 0)
+      return { ok: false, error: 'message not found' }
+    msgs.splice(idx)
+    saveSessions()
+    return { ok: true }
   })
 
   ipcMain.handle('app:reset', async () => {
@@ -109,6 +162,7 @@ function setupIPC() {
     app.relaunch()
     app.exit(0)
   })
+  setupVoiceIPC()
 }
 
 // ── Window ──────────────────────────────────────────────

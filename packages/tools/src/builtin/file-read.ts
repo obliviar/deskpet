@@ -1,5 +1,5 @@
 import type { ToolHandler } from '@deskpet/contracts'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFile, access } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 /**
@@ -21,11 +21,15 @@ export const fileReadTool: ToolHandler = {
     const filePath = resolve(String(args.path))
     const maxLength = Number(args.maxLength) || 5000
 
-    if (!existsSync(filePath))
+    try {
+      await access(filePath)
+    }
+    catch {
       return JSON.stringify({ error: `File not found: ${filePath}` })
+    }
 
     try {
-      const content = readFileSync(filePath, 'utf-8')
+      const content = await readFile(filePath, 'utf-8')
       const truncated = content.length > maxLength
         ? content.slice(0, maxLength) + `\n... (truncated, ${content.length} total chars)`
         : content

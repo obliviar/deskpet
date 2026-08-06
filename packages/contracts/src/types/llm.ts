@@ -13,10 +13,12 @@ export type StreamEvent =
   | { type: 'finish'; reason: 'stop' | 'tool-calls' | 'length' }
   | { type: 'error'; error: unknown }
 
+import type { ToolDefinition } from './tool'
+
 /** Options passed to the LLM port for a single stream request. */
 export interface StreamOptions {
   /** Tool definitions exposed to the model. */
-  tools?: ToolDefinitionRef[]
+  tools?: ToolDefinition[]
   /** Force a specific tool or let the model decide. */
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; name: string }
   /** Sampling temperature. */
@@ -25,10 +27,4 @@ export interface StreamOptions {
   maxTokens?: number
   /** Provider-specific passthrough options. */
   providerOptions?: Record<string, unknown>
-}
-
-/** Minimal tool definition reference used by the stream options. */
-export interface ToolDefinitionRef {
-  type: 'function'
-  function: { name: string; description: string; parameters: Record<string, unknown> }
 }

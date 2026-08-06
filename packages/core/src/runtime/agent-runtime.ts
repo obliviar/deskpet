@@ -92,10 +92,10 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
 
     for await (const event of deps.llm.stream(model, messages, streamOpts)) {
       await handleStreamEvent(event, streaming, toolCalls, ctx)
-      if (event.type === 'text-delta')
-        assistantText += event.text
     }
 
+    assistantText = streaming.content
+    streaming.toolCalls = toolCalls.length > 0 ? toolCalls : undefined
     streaming.done = true
     deps.stream?.patch(streaming)
     await hooks.emitStreamEndHooks(ctx)

@@ -37,6 +37,20 @@ export function createChatHooks(): ChatHookRegistry {
     }
   }
 
+  async function runCtx(list: ((ctx: ChatStreamEventContext) => Promise<void>)[], ctx: ChatStreamEventContext): Promise<void> {
+    for (const cb of list) {
+      try { await cb(ctx) }
+      catch (err) { console.error('[deskpet] hook error:', err) }
+    }
+  }
+
+  async function runMsg(list: ((msg: StreamingAssistantMessage, text: string, ctx: ChatStreamEventContext) => Promise<void>)[], msg: StreamingAssistantMessage, text: string, ctx: ChatStreamEventContext): Promise<void> {
+    for (const cb of list) {
+      try { await cb(msg, text, ctx) }
+      catch (err) { console.error('[deskpet] hook error:', err) }
+    }
+  }
+
   return {
     onBeforeMessageComposed: cb => register(beforeComposed, cb as AsyncCb<string>),
     onAfterMessageComposed: cb => register(afterComposed, cb as AsyncCb<string>),
@@ -46,31 +60,13 @@ export function createChatHooks(): ChatHookRegistry {
     onStreamEnd: cb => register(streamEnd, cb),
     onAssistantMessage: cb => register(assistantMessage, cb),
 
-    emitBeforeMessageComposedHooks: (msg, ctx) => run(beforeComposed, msg, { ...ctx, composedMessage: msg } as ChatStreamEventContext),
+    emitBeforeMessageComposedHooks: (msg, ctx) => run(beforeComposed, msg, { ...ctx, composedMessage: msg }),
     emitAfterMessageComposedHooks: (msg, ctx) => run(afterComposed, msg, ctx),
     emitBeforeSendHooks: (msg, ctx) => run(beforeSend, msg, ctx),
     emitAfterSendHooks: (msg, ctx) => run(afterSend, msg, ctx),
     emitTokenLiteralHooks: (literal, ctx) => run(tokenLiteral, literal, ctx),
-    emitStreamEndHooks: async (ctx) => {
-      for (const cb of streamEnd) {
-        try {
-          await cb(ctx)
-        }
-        catch (err) {
-          console.error('[deskpet] streamEnd hook error:', err)
-        }
-      }
-    },
-    emitAssistantMessageHooks: async (msg, text, ctx) => {
-      for (const cb of assistantMessage) {
-        try {
-          await cb(msg, text, ctx)
-        }
-        catch (err) {
-          console.error('[deskpet] assistantMessage hook error:', err)
-        }
-      }
-    },
+    emitStreamEndHooks: ctx => runCtx(streamEnd, ctx),
+    emitAssistantMessageHooks: (msg, text, ctx) => runMsg(assistantMessage, msg, text, ctx),
 
     clearHooks: () => {
       beforeComposed.length = 0

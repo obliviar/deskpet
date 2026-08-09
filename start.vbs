@@ -1,2 +1,9 @@
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.Run "cmd /c ""cd /d D:\GitHub\deskpet && set OPENAI_API_KEY=sk-5otXLG6e8GGmqXraw_6K3Q && set OPENAI_BASE_URL=https://api.llm.ustc.edu.cn/v1 && set DESKPET_MODEL=deepseek-v4-pro && set DESKPET_MEMORY=false && set PATH=%PATH%;C:\Program Files\nodejs;C:\Users\%USERNAME%\AppData\Roaming\npm && pnpm dev:electron""", 0
+Set FileSystem = CreateObject("Scripting.FileSystemObject")
+
+ProjectDir = FileSystem.GetParentFolderName(WScript.ScriptFullName)
+WshShell.CurrentDirectory = ProjectDir
+
+' API configuration is loaded from the ignored local config.json or the
+' in-app API settings screen. Never hard-code secrets in this script.
+WshShell.Run "cmd /c ""set PATH=%PATH%;C:\Program Files\nodejs;C:\Users\%USERNAME%\AppData\Roaming\npm && pnpm dev:electron""", 0

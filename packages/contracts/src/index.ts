@@ -2,7 +2,7 @@ export type { ChatRole, ContentPart, ChatMessage, ToolCall, ChatHistoryItem, Cha
 export type { ContextMessage } from './types/context'
 export type { StreamEvent, StreamOptions } from './types/llm'
 export type { ToolDefinition, ToolResult, ToolHandler, ToolExecutionContext } from './types/tool'
-export type { MemoryFragment } from './ports/memory-port'
+export type { MemoryCapture, MemoryFragment, MemoryScope } from './ports/memory-port'
 
 export type { AgentLLMPort } from './ports/llm-port'
 export type { AgentSessionPort } from './ports/session-port'

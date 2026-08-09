@@ -15,11 +15,34 @@ export interface MemoryFragment {
   createdAt: number
 }
 
+/** Isolation boundary for long-term memories. */
+export interface MemoryScope {
+  /** Stable owner identifier. Server callers must derive this from authentication. */
+  ownerId: string
+  /** Stable agent/persona identifier. */
+  agentId?: string
+  /** Optional session restriction. Omit to recall across the owner's sessions. */
+  sessionId?: string
+}
+
+/** A completed turn from which durable facts may be extracted. */
+export interface MemoryCapture {
+  userMessage: string
+  assistantMessage: string
+  metadata?: Record<string, unknown>
+}
+
 export interface AgentMemoryPort {
-  /** Retrieve the top-K most relevant memories for a query. */
-  recall: (query: string, topK?: number) => Promise<MemoryFragment[]>
-  /** Persist a memory fragment for future recall. */
-  remember: (content: string, metadata?: Record<string, unknown>) => Promise<void>
-  /** Remove a memory by id. */
-  forget: (id: string) => Promise<void>
+  /** Retrieve the top-K relevant memories inside an isolation scope. */
+  recall: (query: string, scope: MemoryScope, topK?: number) => Promise<MemoryFragment[]>
+  /** Persist one already-sanitized fact. */
+  remember: (content: string, scope: MemoryScope, metadata?: Record<string, unknown>) => Promise<void>
+  /** Extract and persist durable facts from a completed conversation turn. */
+  capture: (turn: MemoryCapture, scope: MemoryScope) => Promise<number>
+  /** Remove a memory by id, constrained to its owner scope. */
+  forget: (id: string, scope: MemoryScope) => Promise<void>
+  /** Remove every memory inside a scope. */
+  clear: (scope: MemoryScope) => Promise<void>
+  /** Count memories inside a scope. */
+  count: (scope: MemoryScope) => Promise<number>
 }

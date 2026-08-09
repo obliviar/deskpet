@@ -2,6 +2,8 @@ import { createAgentRuntime, createSessionManager, createChatHooks } from '@desk
 import { createOpenAILlm } from '@deskpet/llm-openai'
 import { createMemoryWriter, createVectorStore } from '@deskpet/memory'
 import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '@deskpet/tools'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 import { loadConfig } from './config'
 import { startChatRepl } from './commands/chat'
@@ -21,7 +23,12 @@ hooks.onStreamEnd(async () => {
 
 let memory: ReturnType<typeof createMemoryWriter> | undefined
 if (config.memoryEnabled) {
-  const store = createVectorStore({ apiKey: config.openaiApiKey })
+  const store = createVectorStore({
+    apiKey: config.embeddingApiKey,
+    baseURL: config.embeddingBaseURL,
+    embeddingModel: config.embeddingModel,
+    storagePath: config.memoryPath ?? join(homedir(), '.deskpet', 'memories.json'),
+  })
   memory = createMemoryWriter({ store })
 }
 
@@ -35,6 +42,7 @@ const runtime = createAgentRuntime({
   llm,
   session,
   memory,
+  resolveMemoryScope: () => ({ ownerId: config.memoryOwnerId ?? 'local-user', agentId: 'deskpet' }),
   tools,
   hooks,
 })

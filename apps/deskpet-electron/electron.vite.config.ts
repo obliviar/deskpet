@@ -16,6 +16,9 @@ export default defineConfig({
     },
   },
   renderer: {
+    // Packaged Electron pages are loaded with file://. Relative asset URLs keep
+    // Vite from resolving /assets against the drive root (for example D:/assets).
+    base: './',
     build: { outDir: resolve(__dirname, 'dist/renderer') },
     resolve: {
       alias: {

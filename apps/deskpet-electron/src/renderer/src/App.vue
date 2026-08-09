@@ -48,6 +48,16 @@ const chatEl = ref<HTMLElement | null>(null)
 const currentTheme = ref<Theme>(themes[0]!)
 const showThemeMenu = ref(false)
 
+// API settings state
+const showApiSettings = ref(false)
+const apiConfigured = ref(false)
+const apiKeyInput = ref('')
+const apiBaseURL = ref('https://api.openai.com/v1')
+const apiModel = ref('gpt-4o-mini')
+const apiSaving = ref(false)
+const apiStatusMessage = ref('')
+const apiStatusError = ref(false)
+
 // Screen capture state
 const pendingImage = ref<{ data: string; mimeType: string } | null>(null)
 const isCapturing = ref(false)
@@ -96,6 +106,8 @@ onMounted(async () => {
     if (t) currentTheme.value = t
   }
 
+  await refreshApiStatus()
+
   const history = await ipcRenderer.invoke('sessions:history')
   if (history && history.length > 0) {
     messages.value = history
@@ -135,6 +147,60 @@ async function confirmName() {
   isFirstRun.value = false
 }
 
+// ── API settings ────────────────────────────────────────
+async function refreshApiStatus() {
+  try {
+    const status = await ipcRenderer.invoke('api:get')
+    apiConfigured.value = !!status.configured
+    apiBaseURL.value = status.baseURL || 'https://api.openai.com/v1'
+    apiModel.value = status.model || 'gpt-4o-mini'
+  }
+  catch {
+    apiConfigured.value = false
+  }
+}
+
+async function openApiSettings() {
+  await refreshApiStatus()
+  apiKeyInput.value = ''
+  apiStatusMessage.value = ''
+  apiStatusError.value = false
+  showApiSettings.value = true
+}
+
+function closeApiSettings() {
+  if (!apiSaving.value)
+    showApiSettings.value = false
+}
+
+async function saveApiSettings() {
+  apiSaving.value = true
+  apiStatusMessage.value = ''
+  apiStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('api:set', {
+      apiKey: apiKeyInput.value,
+      baseURL: apiBaseURL.value,
+      model: apiModel.value,
+    })
+    if (!result?.ok) {
+      apiStatusError.value = true
+      apiStatusMessage.value = result?.error || '保存失败。'
+      return
+    }
+    apiConfigured.value = true
+    apiKeyInput.value = ''
+    apiStatusMessage.value = '保存成功，新配置已立即生效。'
+  }
+  catch (error) {
+    apiStatusError.value = true
+    apiStatusMessage.value = error instanceof Error ? error.message : '保存失败。'
+  }
+  finally {
+    apiSaving.value = false
+  }
+}
+
 // ── Send ────────────────────────────────────────────────
 async function send() {
   const text = input.value.trim()
@@ -155,7 +221,16 @@ async function send() {
   try {
     const attachments = image ? [{ type: 'image' as const, data: image.data, mimeType: image.mimeType }] : undefined
     const prompt = image ? (text || '请描述这个屏幕截图中的内容。') : text
-    await ipcRenderer.invoke('chat:send', prompt, attachments)
+    const result = await ipcRenderer.invoke('chat:send', prompt, attachments)
+    if (!result?.ok) {
+      const detail = result?.error || '未知错误'
+      assistantMsg.content = assistantMsg.content
+        ? `${assistantMsg.content}\n\n[请求失败] ${detail}`
+        : `[请求失败] ${detail}`
+    }
+    else if (!assistantMsg.content && result.text) {
+      assistantMsg.content = result.text
+    }
     if (autoSpeak.value) {
       nextTick(() => speak(assistantMsg.content))
     }
@@ -408,6 +483,9 @@ async function doReset() {
       <span class="name">{{ agentName }}</span>
       <span class="badge">在线</span>
       <span class="spacer" />
+      <button class="icon-btn api-btn" :class="{ active: apiConfigured }" title="API 设置" @click="openApiSettings">
+        <span class="api-dot" /> API
+      </button>
       <button class="icon-btn" :class="{ active: autoSpeak }" title="语音播报" @click="toggleAutoSpeak">🔊</button>
       <div class="theme-picker">
         <button class="icon-btn" title="切换主题" @click="showThemeMenu = !showThemeMenu">🎨</button>
@@ -420,6 +498,46 @@ async function doReset() {
         </div>
       </div>
       <button class="icon-btn reset-btn" @click="doReset">{{ confirmReset ? '确认?' : '重新开始' }}</button>
+    </div>
+
+    <!-- API settings dialog -->
+    <div v-if="showApiSettings" class="modal-backdrop" @click.self="closeApiSettings">
+      <div class="api-dialog" role="dialog" aria-modal="true" aria-label="API 设置">
+        <div class="dialog-header">
+          <div>
+            <h2>API 设置</h2>
+            <p>配置 OpenAI 兼容接口，保存后立即生效</p>
+          </div>
+          <button class="dialog-close" :disabled="apiSaving" title="关闭" @click="closeApiSettings">✕</button>
+        </div>
+
+        <label class="field-label" for="api-key">API Key</label>
+        <input
+          id="api-key"
+          v-model="apiKeyInput"
+          class="settings-input"
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+          :placeholder="apiConfigured ? '已配置；留空可保持原密钥' : '请输入 API Key'"
+        />
+        <div class="field-hint">密钥不会在界面中回显，并使用系统加密存储。</div>
+
+        <label class="field-label" for="api-base-url">Base URL</label>
+        <input id="api-base-url" v-model="apiBaseURL" class="settings-input" type="url" spellcheck="false" placeholder="https://api.openai.com/v1" />
+
+        <label class="field-label" for="api-model">模型名称</label>
+        <input id="api-model" v-model="apiModel" class="settings-input" type="text" spellcheck="false" placeholder="gpt-4o-mini" @keydown.enter="saveApiSettings" />
+
+        <div v-if="apiStatusMessage" :class="['api-status-message', { error: apiStatusError }]">{{ apiStatusMessage }}</div>
+
+        <div class="dialog-actions">
+          <span :class="['configured-state', { ready: apiConfigured }]">{{ apiConfigured ? '● 已配置' : '○ 未配置' }}</span>
+          <span class="dialog-spacer" />
+          <button class="secondary-btn" :disabled="apiSaving" @click="closeApiSettings">取消</button>
+          <button class="primary-btn" :disabled="apiSaving" @click="saveApiSettings">{{ apiSaving ? '保存中...' : '保存配置' }}</button>
+        </div>
+      </div>
     </div>
 
     <div class="chat" ref="chatEl">
@@ -492,6 +610,32 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .icon-btn:hover { background: var(--surface); color: var(--text); }
 .icon-btn.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 .reset-btn { white-space: nowrap; font-size: 12px; }
+.api-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.api-dot { width: 7px; height: 7px; border-radius: 50%; background: #d97757; box-shadow: 0 0 0 2px rgba(217,119,87,0.15); }
+.api-btn.active .api-dot { background: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+
+/* API settings dialog */
+.modal-backdrop { position: fixed; inset: 0; z-index: 300; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(0,0,0,0.58); backdrop-filter: blur(3px); }
+.api-dialog { width: min(480px, 100%); max-height: calc(100vh - 48px); overflow-y: auto; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: 0 24px 70px rgba(0,0,0,0.45); }
+.dialog-header { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 20px; }
+.dialog-header h2 { font-size: 19px; font-weight: 650; }
+.dialog-header p { margin-top: 5px; color: var(--text-muted); font-size: 12px; }
+.dialog-close { margin-left: auto; border: 0; background: transparent; color: var(--text-muted); padding: 4px; font-size: 16px; cursor: pointer; }
+.dialog-close:hover { color: var(--text); }
+.field-label { display: block; margin: 14px 0 7px; color: var(--text); font-size: 13px; font-weight: 600; }
+.settings-input { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; outline: none; background: var(--bg); color: var(--text); font-family: inherit; font-size: 13px; }
+.settings-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.field-hint { margin-top: 6px; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
+.api-status-message { margin-top: 14px; padding: 9px 11px; border-radius: 7px; background: var(--accent-soft); color: var(--accent); font-size: 12px; }
+.api-status-message.error { background: rgba(231,76,60,0.14); color: #e76f61; }
+.dialog-actions { display: flex; align-items: center; gap: 8px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+.configured-state { color: var(--text-muted); font-size: 11px; }
+.configured-state.ready { color: var(--accent); }
+.dialog-spacer { flex: 1; }
+.secondary-btn, .primary-btn { border-radius: 7px; padding: 8px 13px; font-family: inherit; font-size: 12px; cursor: pointer; }
+.secondary-btn { border: 1px solid var(--border); background: transparent; color: var(--text); }
+.primary-btn { border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+.secondary-btn:disabled, .primary-btn:disabled, .dialog-close:disabled { opacity: 0.5; cursor: default; }
 
 .theme-picker { position: relative; }
 .theme-menu { position: absolute; top: 100%; right: 0; margin-top: 6px; z-index: 100; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 6px; min-width: 150px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }

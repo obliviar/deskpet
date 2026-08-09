@@ -9,21 +9,22 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "package": "electron-vite build && electron-builder --win portable",
+    "package": "electron-vite build && electron-builder --win zip",
     "typecheck": "echo \"skipped (vue-tsc not available)\""
   },
   "build": {
     "appId": "com.deskpet.app",
     "productName": "DeskPet",
+    "electronVersion": "33.4.11",
+    "npmRebuild": false,
+    "artifactName": "DeskPet-${version}-win.${ext}",
     "directories": { "output": "release" },
     "files": ["dist/**/*"],
-    "extraResources": [{ "from": "config.json", "to": "." }],
+    "extraFiles": [{ "from": "config.example.json", "to": "config.example.json" }],
     "win": {
-      "target": "portable",
-      "icon": null
-    },
-    "portable": {
-      "artifactName": "DeskPet.exe"
+      "target": "zip",
+      "icon": null,
+      "signAndEditExecutable": false
     }
   },
   "dependencies": {

@@ -3,6 +3,7 @@ import type {
   AgentForegroundStreamPort,
   AgentLLMPort,
   AgentMemoryPort,
+  MemoryScope,
   AgentSessionPort,
   AgentToolPort,
   ChatHookRegistry,
@@ -34,6 +35,8 @@ export interface AgentRuntimeDeps {
   session: AgentSessionPort
   context?: AgentContextPort
   memory?: AgentMemoryPort
+  /** Resolve a stable, isolated memory owner for a session. */
+  resolveMemoryScope?: (sessionId: string) => MemoryScope
   tools?: AgentToolPort
   stream?: AgentForegroundStreamPort
   hooks?: ChatHookRegistry
@@ -127,7 +130,7 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
       }
       case 'error': {
         console.error('[deskpet] stream error:', event.error)
-        break
+        throw event.error instanceof Error ? event.error : new Error(String(event.error))
       }
     }
   }
@@ -175,6 +178,7 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
     }
 
     const model = options?.model ?? deps.persona.model
+    const memoryScope = deps.resolveMemoryScope?.(sessionId) ?? { ownerId: sessionId, agentId: 'default' }
     await hooks.emitBeforeMessageComposedHooks(userMessage, ctx)
 
     // Build the user message content (possibly multimodal).
@@ -195,7 +199,7 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
     let memories
     if (deps.memory) {
       try {
-        memories = await deps.memory.recall(userMessage, options?.memoryTopK ?? 5)
+        memories = await deps.memory.recall(userMessage, memoryScope, options?.memoryTopK ?? 5)
       }
       catch (err) {
         console.error('[deskpet] memory recall failed:', err)
@@ -261,11 +265,22 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
     }
     deps.session.appendSessionMessage(sessionId, assistantItem)
 
-    // Persist a memory of this turn if memory is configured.
+    // Extract and persist durable facts from this turn if memory is configured.
     if (deps.memory) {
-      deps.memory.remember(`User: ${userMessage}\nAssistant: ${result.text}`).catch((err) => {
+      try {
+        await deps.memory.capture({
+          userMessage,
+          assistantMessage: result.text,
+          metadata: {
+            sessionId,
+            sourceMessageIds: [userItem.id, assistantItem.id],
+            inputType: ctx.input?.type ?? 'text',
+          },
+        }, memoryScope)
+      }
+      catch (err) {
         console.error('[deskpet] memory write failed:', err)
-      })
+      }
     }
 
     await hooks.emitAfterSendHooks(result.text, ctx)

@@ -1,1 +1,7 @@
-﻿{"apiKey": "YOUR_API_KEY", "baseURL": "https://api.llm.ustc.edu.cn/v1", "model": "deepseek-v4-pro", "memoryEnabled": false}
+{
+  "apiKey": "YOUR_API_KEY",
+  "baseURL": "https://api.llm.ustc.edu.cn/v1",
+  "model": "deepseek-v4-pro",
+  "memoryEnabled": true,
+  "embeddingModel": "local-hash-v1"
+}

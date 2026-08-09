@@ -1,5 +1,6 @@
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
+import { join } from 'node:path'
 import type { AgentRuntime } from '@deskpet/core'
 import { createAgentRuntime, createSessionManager } from '@deskpet/core'
 import { createOpenAILlm } from '@deskpet/llm-openai'
@@ -17,6 +18,10 @@ const config = {
   baseURL: process.env.OPENAI_BASE_URL || undefined,
   model: process.env.DESKPET_MODEL || 'gpt-4o-mini',
   systemPrompt: process.env.DESKPET_SYSTEM_PROMPT || 'You are a helpful AI assistant named DeskPet.',
+  embeddingApiKey: process.env.DESKPET_EMBEDDING_API_KEY || process.env.OPENAI_API_KEY || '',
+  embeddingBaseURL: process.env.DESKPET_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || undefined,
+  embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || 'local-hash-v1',
+  memoryPath: process.env.DESKPET_MEMORY_PATH || join(process.cwd(), 'data', 'memories.json'),
 }
 
 if (!config.apiKey) {
@@ -29,7 +34,12 @@ const session = createSessionManager(200)
 
 let memory: ReturnType<typeof createMemoryWriter> | undefined
 if (process.env.DESKPET_MEMORY !== 'false') {
-  const store = createVectorStore({ apiKey: config.apiKey })
+  const store = createVectorStore({
+    apiKey: config.embeddingApiKey,
+    baseURL: config.embeddingBaseURL,
+    embeddingModel: config.embeddingModel,
+    storagePath: config.memoryPath,
+  })
   memory = createMemoryWriter({ store })
 }
 
@@ -38,6 +48,8 @@ const tools = createToolRegistry([webSearchTool, fileReadTool, httpFetchTool])
 const runtime = createAgentRuntime({
   persona: { systemPrompt: config.systemPrompt, model: config.model },
   llm, session, memory, tools,
+  // Without authentication, use the session id as the owner boundary to avoid cross-session leaks.
+  resolveMemoryScope: sessionId => ({ ownerId: sessionId, agentId: 'deskpet' }),
 })
 
 const app = new Hono<AppEnv>()

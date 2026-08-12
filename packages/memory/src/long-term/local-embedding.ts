@@ -1,12 +1,62 @@
 /** Privacy-preserving local embedding used by default by the desktop app. */
-export const LOCAL_EMBEDDING_MODEL = 'local-hash-v1'
+export const LOCAL_EMBEDDING_MODEL = 'local-hash-v2'
 
 const DEFAULT_DIMENSIONS = 384
+const CONCEPT_WEIGHT = 5
+
+const SEMANTIC_CONCEPT_PATTERNS: Array<[string, RegExp]> = [
+  ['profile.name', /姓名|名字|称呼|叫(?:我|你)|\bname\b|\bcall\b/i],
+  ['profile.location', /所在地|住在|居住|常住|哪座城市|哪里住|based\s+in|live\s+in/i],
+  ['relationship.pet', /宠物|毛孩子|猫咪|猫|狗狗|狗|\bdog\b|\bcat\b|\bpet\b/i],
+  ['preference.music', /音乐|歌曲|爵士|爱听|耳机|\bmusic\b|\bsong\b|\bjazz\b/i],
+  ['health.allergy', /过敏|必须避开|不能吃|忌口|allerg/i],
+  ['project.current', /当前项目|项目|开发|手头.{0,12}(?:忙|软件)|哪个软件|\bproject\b|develop/i],
+  ['routine.exercise', /固定安排|每周|锻炼|运动|徒步|游泳|瑜伽|\broutine\b|\bweekly\b|\bexercise\b/i],
+  ['profile.operating-system', /电脑系统|操作系统|运行.{0,8}平台|windows|macos|linux|operating\s+system/i],
+  ['preference.response-style', /回答偏好|回复|回答|篇幅|简洁|详细|\bresponse\b|\breply\b|\bconcise\b/i],
+  ['profile.programming-language', /编程语言|哪门语言|写程序|python|typescript|javascript|programming\s+language/i],
+  ['preference.drink', /饮品|喝什么|泡什么|乌龙茶|咖啡|饮料|\bdrink\b|\bbeverage\b|\btea\b|\bcoffee\b/i],
+  ['routine.work-time', /工作习惯|工作时间|夜间|晚上工作|时段.{0,8}效率|效率最高|白天.{0,8}夜|办公|work.{0,12}(?:night|day)/i],
+  ['profile.birthday', /生日|出生日期|生日祝福|\bbirthday\b/i],
+  ['relationship.friend', /好友|朋友|那位朋友|\bfriend\b/i],
+  ['preference.food', /不喜欢.{0,12}(?:食物|吃)|不要(?:放|加)|香菜|\bdislike\b|\bhate\b|cilantro/i],
+  ['preference.interface-theme', /界面.{0,8}(?:主题|模式)|深色主题|黑色主题|dark\s+mode|interface\s+theme/i],
+  ['plan.travel', /旅行|目的地|去哪里玩|下一趟|京都|\btravel\b|\btrip\b|\bdestination\b/i],
+  ['preference.book', /喜欢的书|小说|哪部.{0,8}心头好|三体|\bbook\b|\bnovel\b/i],
+  ['profile.education', /毕业院校|高校毕业|大学|\buniversity\b|\bcollege\b/i],
+  ['preference.color', /颜色|什么色|藏青|\bcolor\b|\bcolour\b/i],
+  ['routine.rent', /房租|房东.{0,12}收钱|每月.{0,6}号|\brent\b/i],
+  ['profile.occupation', /职业|做什么工作|教师|occupation|work\s+as|\bjob\b/i],
+  ['relationship.partner', /妻子|丈夫|伴侣|爱人|spouse|wife|husband|partner/i],
+  ['goal.current', /目标|挑战|马拉松|\bgoal\b/i],
+  ['profile.device', /电脑是|笔记本|thinkpad|\bdevice\b|\blaptop\b/i],
+]
+const SEMANTIC_CONCEPT_PATTERN_MAP = new Map(SEMANTIC_CONCEPT_PATTERNS)
+
+/** Return stable semantic field tokens shared by common paraphrases. */
+export function localSemanticConcepts(text: string): string[] {
+  const normalized = text.normalize('NFKC').toLocaleLowerCase()
+  return SEMANTIC_CONCEPT_PATTERNS
+    .filter(([, pattern]) => pattern.test(normalized))
+    .map(([concept]) => concept)
+}
+
+/** Check only the query concepts instead of evaluating every concept rule. */
+export function sharesLocalSemanticConcept(text: string, concepts: ReadonlySet<string>): boolean {
+  if (concepts.size === 0)
+    return false
+  const normalized = text.normalize('NFKC').toLocaleLowerCase()
+  for (const concept of concepts) {
+    if (SEMANTIC_CONCEPT_PATTERN_MAP.get(concept)?.test(normalized))
+      return true
+  }
+  return false
+}
 
 /**
- * Produce a deterministic feature-hashed vector from Latin words and Chinese
- * unigrams/bigrams. It is intentionally lightweight: good enough for a local
- * personal fact store while avoiding an extra remote API call.
+ * Produce a deterministic feature-hashed vector from Latin words, Chinese
+ * unigrams/bigrams and weighted semantic field aliases. Version 2 improves
+ * paraphrase recall without sending personal text to a remote service.
  */
 export function createLocalEmbedding(text: string, dimensions = DEFAULT_DIMENSIONS): number[] {
   const normalized = text.normalize('NFKC').toLocaleLowerCase()
@@ -25,6 +75,11 @@ export function createLocalEmbedding(text: string, dimensions = DEFAULT_DIMENSIO
     tokens.push(`c:${han[i]}`)
     if (i + 1 < han.length)
       tokens.push(`b:${han[i]}${han[i + 1]}`)
+  }
+
+  for (const concept of localSemanticConcepts(normalized)) {
+    for (let weight = 0; weight < CONCEPT_WEIGHT; weight++)
+      tokens.push(`s:${concept}`)
   }
 
   const vector = Array.from<number>({ length: dimensions }).fill(0)

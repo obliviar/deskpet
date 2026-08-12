@@ -1,16 +1,28 @@
-import { app, BrowserWindow, ipcMain, desktopCapturer, safeStorage } from 'electron'
+import { app, BrowserWindow, ipcMain, desktopCapturer, safeStorage, shell } from 'electron'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 
 import { createAgentRuntime, createSessionManager, createChatHooks } from '@deskpet/core'
 import { createOpenAILlm } from '@deskpet/llm-openai'
-import { createMemoryWriter, createVectorStore } from '@deskpet/memory'
+import {
+  createEncryptedFilePersistence,
+  createMemoryWriter,
+  createSmartMemoryExtractor,
+  createVectorStore,
+  extractMemoryCandidates,
+  inferMemoryPrivacy,
+  isSafeMemoryContent,
+  LOCAL_EMBEDDING_MODEL,
+} from '@deskpet/memory'
+import type { MemoryCandidate, MemoryExtractor } from '@deskpet/memory'
 import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '@deskpet/tools'
 
 import { createPersistence } from './persist'
 import { createSettingsManager } from './settings'
 import { setupVoiceIPC } from './voice'
+import { createImageMemoryService, isExplicitImageMemoryRequest } from './image-memory'
+import { createSemanticMemoryService, SEMANTIC_MEMORY_MODEL, SEMANTIC_MEMORY_REVISION } from './semantic-memory'
 
 // Some Windows systems cannot initialize Electron's GPU subprocess. Disable
 // hardware acceleration before app readiness so the packaged app still starts.
@@ -53,11 +65,14 @@ const config = {
   memoryEnabled: process.env.DESKPET_MEMORY ? process.env.DESKPET_MEMORY !== 'false' : (fileConfig.memoryEnabled !== false),
   embeddingApiKey: process.env.DESKPET_EMBEDDING_API_KEY || fileConfig.embeddingApiKey || process.env.OPENAI_API_KEY || fileConfig.apiKey || '',
   embeddingBaseURL: process.env.DESKPET_EMBEDDING_BASE_URL || fileConfig.embeddingBaseURL || process.env.OPENAI_BASE_URL || fileConfig.baseURL || undefined,
-  embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || fileConfig.embeddingModel || 'local-hash-v1',
+  embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || fileConfig.embeddingModel || LOCAL_EMBEDDING_MODEL,
 }
 
 // ── Persistence ─────────────────────────────────────────
+// Packaged builds are portable by default: chat history, encrypted memories,
+// models and settings stay next to DeskPet.exe instead of AppData on C:.
 const requestedUserDataDir = process.env.DESKPET_USER_DATA_DIR?.trim()
+  || (app.isPackaged ? join(dirname(process.execPath), 'DeskPetData') : '')
 if (requestedUserDataDir) {
   mkdirSync(requestedUserDataDir, { recursive: true })
   app.setPath('userData', requestedUserDataDir)
@@ -121,35 +136,194 @@ function saveApiConfig() {
   persist.saveJson('api-config', stored)
 }
 
-// ── Session store: load from disk on startup ────────────
-const persistedSessions = persist.loadJson<Record<string, any[]>>('sessions', {})
+// ── Encrypted session store ─────────────────────────────
 const sessionStore = createSessionManager(200)
-
-for (const [sessionId, messages] of Object.entries(persistedSessions)) {
-  sessionStore.ensureSession(sessionId)
-  for (const msg of messages)
-    sessionStore.appendSessionMessage(sessionId, msg)
-}
-
 const sessionsCache = { default: sessionStore.getSessionMessages('default') }
+const sessionStoragePath = join(userDataDir, 'sessions.enc')
+const sessionKeyPath = join(userDataDir, 'session-key.json')
+const legacySessionStoragePath = join(userDataDir, 'sessions.json')
+let sessionPersistence: ReturnType<typeof createEncryptedFilePersistence> | undefined
+
+function initializeSessions(): void {
+  if (!safeStorage.isEncryptionAvailable()) {
+    writeBootLog('session persistence disabled because system encryption is unavailable')
+    return
+  }
+  try {
+    sessionPersistence = createEncryptedFilePersistence({
+      encryptedPath: sessionStoragePath,
+      keyPath: sessionKeyPath,
+      legacyPath: legacySessionStoragePath,
+      protectKey: key => safeStorage.encryptString(key.toString('base64')),
+      unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
+    })
+    const payload = sessionPersistence.load()
+    const persistedSessions = payload ? JSON.parse(payload) as Record<string, any[]> : {}
+    if (!persistedSessions || typeof persistedSessions !== 'object' || Array.isArray(persistedSessions))
+      throw new Error('Encrypted session payload is not an object')
+    for (const [sessionId, messages] of Object.entries(persistedSessions)) {
+      if (!Array.isArray(messages))
+        throw new Error(`Encrypted session ${sessionId} is not an array`)
+      sessionStore.ensureSession(sessionId)
+      for (const msg of messages)
+        sessionStore.appendSessionMessage(sessionId, msg)
+    }
+    if (!payload)
+      sessionPersistence.save('{}')
+    writeBootLog(`encrypted sessions initialized${sessionPersistence.wasLegacyMigrated() ? ' (legacy migrated)' : ''}`)
+  }
+  catch (error) {
+    sessionPersistence = undefined
+    writeBootLog(`session persistence disabled after initialization error: ${errorMessage(error)}`)
+  }
+}
 
 function saveSessions() {
+  if (!sessionPersistence)
+    return
   sessionsCache.default = sessionStore.getSessionMessages('default')
-  persist.saveJsonDebounced('sessions', sessionsCache)
+  sessionPersistence.save(JSON.stringify(sessionsCache))
 }
 
-// ── Memory store: load from disk on startup ─────────────
+// ── Scheme A long-term memory ───────────────────────────
+type MemoryExtractionMode = 'rules' | 'smart'
+type MemoryRemotePolicy = 'normal-only' | 'allow-private' | 'disabled'
+
+interface MemorySettings {
+  extractionMode: MemoryExtractionMode
+  semanticEnabled: boolean
+  imageMemoryEnabled: boolean
+  remotePolicy: MemoryRemotePolicy
+}
+
+const defaultMemorySettings: MemorySettings = {
+  extractionMode: 'rules',
+  semanticEnabled: false,
+  imageMemoryEnabled: true,
+  remotePolicy: 'normal-only',
+}
+
+function normalizeMemorySettings(value: Partial<MemorySettings> | undefined): MemorySettings {
+  return {
+    extractionMode: value?.extractionMode === 'smart' ? 'smart' : 'rules',
+    semanticEnabled: value?.semanticEnabled === true,
+    imageMemoryEnabled: value?.imageMemoryEnabled !== false,
+    remotePolicy: value?.remotePolicy === 'allow-private' || value?.remotePolicy === 'disabled'
+      ? value.remotePolicy
+      : 'normal-only',
+  }
+}
+
+let memorySettings = normalizeMemorySettings(persist.loadJson<Partial<MemorySettings>>('memory-settings', defaultMemorySettings))
 let memory: ReturnType<typeof createMemoryWriter> | undefined
+let memoryInitializationError = ''
+let memoryLegacyMigrated = false
 const localMemoryScope = { ownerId: 'local-user', agentId: 'deskpet' }
-if (config.memoryEnabled) {
-  const store = createVectorStore({
-    apiKey: config.embeddingApiKey,
-    baseURL: config.embeddingBaseURL,
-    embeddingModel: config.embeddingModel,
-    storagePath: join(userDataDir, 'memories.json'),
+const memoryStoragePath = join(userDataDir, 'memories.enc')
+const memoryKeyPath = join(userDataDir, 'memory-key.json')
+const legacyMemoryStoragePath = join(userDataDir, 'memories.json')
+let semanticModelProgress: { status: string; progress?: number; file?: string; error?: string } = { status: 'idle' }
+let imageMemoryProgress: { status: string; progress?: number } = { status: 'idle' }
+const semanticMemory = createSemanticMemoryService(join(userDataDir, 'models', 'memory'), (progress) => {
+  semanticModelProgress = progress
+  mainWindow?.webContents.send('memory:model-progress', progress)
+})
+const imageMemory = createImageMemoryService(join(userDataDir, 'models', 'ocr'), (progress) => {
+  imageMemoryProgress = progress
+  mainWindow?.webContents.send('memory:ocr-progress', progress)
+})
+
+function saveMemorySettings(): void {
+  persist.saveJson('memory-settings', memorySettings)
+}
+
+function mergeMemoryCandidates(candidates: MemoryCandidate[]): MemoryCandidate[] {
+  const unique = new Map<string, MemoryCandidate>()
+  for (const candidate of candidates)
+    unique.set(candidate.content.toLocaleLowerCase(), candidate)
+  return [...unique.values()].slice(0, 8)
+}
+
+function createConfiguredMemoryExtractor(): MemoryExtractor {
+  const smartExtractor = createSmartMemoryExtractor({
+    getConfig: () => ({ apiKey: apiConfig.apiKey, baseURL: apiConfig.baseURL, model: apiConfig.model }),
+    fallback: extractMemoryCandidates,
   })
-  memory = createMemoryWriter({ store })
-  writeBootLog('long-term memory initialized')
+  return async (turn) => {
+    const candidates = memorySettings.extractionMode === 'smart' && memorySettings.remotePolicy !== 'disabled'
+      ? await smartExtractor(turn)
+      : await extractMemoryCandidates(turn)
+    if (!memorySettings.imageMemoryEnabled
+      || !turn.attachments?.length
+      || !isExplicitImageMemoryRequest(turn.userMessage))
+      return candidates
+
+    const imageCandidates: MemoryCandidate[] = []
+    for (const attachment of turn.attachments) {
+      try {
+        const candidate = await imageMemory.extractCandidate(attachment)
+        if (candidate)
+          imageCandidates.push(candidate)
+      }
+      catch (error) {
+        writeBootLog(`image memory OCR failed: ${errorMessage(error)}`)
+      }
+    }
+    return mergeMemoryCandidates([...candidates, ...imageCandidates])
+  }
+}
+
+function initializeMemory(): void {
+  memory = undefined
+  memoryInitializationError = ''
+  memoryLegacyMigrated = false
+  if (!config.memoryEnabled)
+    return
+  try {
+    if (!safeStorage.isEncryptionAvailable())
+      throw new Error('系统安全存储不可用，为避免明文保存，长期记忆未启动。')
+    const persistence = createEncryptedFilePersistence({
+      encryptedPath: memoryStoragePath,
+      keyPath: memoryKeyPath,
+      legacyPath: legacyMemoryStoragePath,
+      protectKey: key => safeStorage.encryptString(key.toString('base64')),
+      unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
+    })
+    const semanticActive = memorySettings.semanticEnabled && semanticMemory.isInstalled()
+    const store = createVectorStore({
+      persistence,
+      embeddingModel: semanticActive
+        ? `${SEMANTIC_MEMORY_MODEL}@${SEMANTIC_MEMORY_REVISION}`
+        : LOCAL_EMBEDDING_MODEL,
+      ...(semanticActive ? { embedder: semanticMemory.embed } : {}),
+    })
+    memory = createMemoryWriter({ store, extractor: createConfiguredMemoryExtractor() })
+    memoryLegacyMigrated = persistence.wasLegacyMigrated()
+    writeBootLog(`long-term memory initialized (${semanticActive ? 'semantic' : 'local-hash'})`)
+  }
+  catch (error) {
+    memoryInitializationError = errorMessage(error)
+    writeBootLog(`long-term memory disabled after initialization error: ${memoryInitializationError}`)
+  }
+}
+
+function memoryForRemoteRuntime() {
+  if (!memory)
+    return undefined
+  const localMemory = memory
+  return {
+    ...localMemory,
+    async recall(query: string, scope: Parameters<typeof localMemory.recall>[1], topK = 5) {
+      if (memorySettings.remotePolicy === 'disabled')
+        return []
+      return localMemory.recall(query, scope, topK, {
+        sharePolicies: ['allow-remote'],
+        sensitivities: memorySettings.remotePolicy === 'allow-private'
+          ? ['normal', 'private']
+          : ['normal'],
+      })
+    },
+  }
 }
 
 // ── Runtime ─────────────────────────────────────────────
@@ -178,7 +352,7 @@ function rebuildRuntime() {
   const llm = createOpenAILlm({ apiKey: apiConfig.apiKey, baseURL: apiConfig.baseURL })
   runtime = createAgentRuntime({
     persona: { systemPrompt: currentPersona, model: apiConfig.model },
-    llm, session: sessionStore, memory,
+    llm, session: sessionStore, memory: memoryForRemoteRuntime(),
     resolveMemoryScope: () => localMemoryScope,
     tools: tools.hasTools() ? tools : undefined,
     hooks,
@@ -195,7 +369,9 @@ function setupIPC() {
     if (!apiConfig.apiKey.trim())
       return { ok: false, error: '尚未配置 API Key，请点击右上角“API 设置”。' }
     try {
-      const result = await runtime.send('default', message, attachments && attachments.length > 0 ? { attachments } : undefined)
+      const result = await runtime.send('default', message, attachments && attachments.length > 0
+        ? { attachments, input: { type: 'image' } }
+        : undefined)
       return { ok: true, text: result.text, toolCalls: result.toolCalls }
     }
     catch (error) {
@@ -285,7 +461,10 @@ function setupIPC() {
     const idx = msgs.findIndex(m => m.id === messageId)
     if (idx < 0)
       return { ok: false, error: 'message not found' }
+    const removedMessageIds = msgs.slice(idx).map(message => message.id)
     msgs.splice(idx)
+    if (memory && removedMessageIds.length > 0)
+      await memory.unlinkSources(removedMessageIds, localMemoryScope)
     saveSessions()
     return { ok: true }
   })
@@ -293,16 +472,140 @@ function setupIPC() {
   ipcMain.handle('memory:status', async () => ({
     enabled: !!memory,
     count: memory ? await memory.count(localMemoryScope) : 0,
+    storagePath: memoryStoragePath,
+    encrypted: !!memory,
+    error: memoryInitializationError,
+    legacyMigrated: memoryLegacyMigrated,
+    settings: memorySettings,
+    semantic: {
+      installed: semanticMemory.isInstalled(),
+      active: memorySettings.semanticEnabled && semanticMemory.isInstalled(),
+      model: SEMANTIC_MEMORY_MODEL,
+      progress: semanticModelProgress,
+      cachePath: semanticMemory.cacheDir,
+    },
+    ocr: { progress: imageMemoryProgress, cachePath: imageMemory.cachePath },
   }))
 
+  ipcMain.handle('memory:list', async (_event, limit = 200) => ({
+    ok: true,
+    enabled: !!memory,
+    count: memory ? await memory.count(localMemoryScope) : 0,
+    storagePath: memoryStoragePath,
+    encrypted: !!memory,
+    error: memoryInitializationError,
+    settings: memorySettings,
+    semantic: {
+      installed: semanticMemory.isInstalled(),
+      active: memorySettings.semanticEnabled && semanticMemory.isInstalled(),
+      model: SEMANTIC_MEMORY_MODEL,
+      progress: semanticModelProgress,
+    },
+    items: memory ? await memory.list(localMemoryScope, Number(limit)) : [],
+  }))
+
+  ipcMain.handle('memory:add', async (_event, content: string) => {
+    if (!memory)
+      return { ok: false, error: '长期记忆已关闭。' }
+    const normalized = typeof content === 'string' ? content.trim() : ''
+    if (!isSafeMemoryContent(normalized))
+      return { ok: false, error: '内容为空，或包含指令注入、密钥、密码等不安全信息。' }
+    const privacy = inferMemoryPrivacy(normalized)
+    await memory.remember(normalized, localMemoryScope, {
+      kind: 'manual',
+      importance: 1,
+      confidence: 1,
+      origin: 'manual',
+      ...privacy,
+      source: 'memory-manager',
+    })
+    return { ok: true, count: await memory.count(localMemoryScope) }
+  })
+
+  ipcMain.handle('memory:forget', async (_event, id: string) => {
+    if (!memory)
+      return { ok: false, error: '长期记忆已关闭。' }
+    if (typeof id !== 'string' || !id.trim())
+      return { ok: false, error: '无效的记忆 ID。' }
+    await memory.forget(id, localMemoryScope)
+    return { ok: true, count: await memory.count(localMemoryScope) }
+  })
+
+  ipcMain.handle('memory:update', async (_event, id: string, patch: Record<string, unknown>) => {
+    if (!memory)
+      return { ok: false, error: '长期记忆已关闭。' }
+    if (typeof id !== 'string' || !id.trim() || !patch || typeof patch !== 'object')
+      return { ok: false, error: '无效的记忆更新。' }
+    const allowed: Record<string, unknown> = {}
+    if (typeof patch.importance === 'number')
+      allowed.importance = patch.importance
+    if (patch.expiresAt === null || typeof patch.expiresAt === 'number')
+      allowed.expiresAt = patch.expiresAt
+    if (patch.sharePolicy === 'allow-remote' || patch.sharePolicy === 'local-only' || patch.sharePolicy === 'ask')
+      allowed.sharePolicy = patch.sharePolicy
+    if (patch.sensitivity === 'normal' || patch.sensitivity === 'private' || patch.sensitivity === 'secret')
+      allowed.sensitivity = patch.sensitivity
+    if (patch.status === 'active' || patch.status === 'superseded' || patch.status === 'expired'
+      || patch.status === 'conflicted' || patch.status === 'orphaned')
+      allowed.status = patch.status
+    const updated = await memory.update(id, localMemoryScope, allowed)
+    return updated ? { ok: true } : { ok: false, error: '没有找到该记忆。' }
+  })
+
+  ipcMain.handle('memory:restore', async (_event, id: string) => {
+    if (!memory)
+      return { ok: false, error: '长期记忆已关闭。' }
+    const restored = typeof id === 'string' && await memory.restore(id, localMemoryScope)
+    return restored ? { ok: true } : { ok: false, error: '没有找到该记忆。' }
+  })
+
+  ipcMain.handle('memory:settings-set', async (_event, input: Partial<MemorySettings>) => {
+    memorySettings = normalizeMemorySettings({ ...memorySettings, ...input })
+    if (memorySettings.semanticEnabled && !semanticMemory.isInstalled()) {
+      memorySettings.semanticEnabled = false
+      saveMemorySettings()
+      return { ok: false, error: '请先下载本地语义模型。', settings: memorySettings }
+    }
+    saveMemorySettings()
+    initializeMemory()
+    rebuildRuntime()
+    return { ok: true, settings: memorySettings }
+  })
+
+  ipcMain.handle('memory:model-install', async () => {
+    try {
+      await semanticMemory.install()
+      memorySettings.semanticEnabled = true
+      saveMemorySettings()
+      initializeMemory()
+      rebuildRuntime()
+      return { ok: true, settings: memorySettings }
+    }
+    catch (error) {
+      return { ok: false, error: errorMessage(error) }
+    }
+  })
+
   ipcMain.handle('memory:clear', async () => {
-    await memory?.clear(localMemoryScope)
-    return { ok: true }
+    if (!memory)
+      return { ok: false, error: '长期记忆已关闭。' }
+    await memory.clear(localMemoryScope)
+    return { ok: true, count: 0 }
+  })
+
+  ipcMain.handle('memory:open-location', async () => {
+    if (existsSync(memoryStoragePath)) {
+      shell.showItemInFolder(memoryStoragePath)
+      return { ok: true }
+    }
+    const error = await shell.openPath(userDataDir)
+    return error ? { ok: false, error } : { ok: true }
   })
 
   ipcMain.handle('app:reset', async () => {
     await memory?.clear(localMemoryScope)
-    persist.saveJson('sessions', {})
+    sessionStore.getSessionMessages('default').splice(0)
+    sessionPersistence?.save('{}')
     persist.saveJson('settings', { agentName: null, firstRunAt: null })
     persist.saveAllImmediately()
     app.relaunch()
@@ -326,6 +629,15 @@ function createWindow() {
     },
   })
 
+  mainWindow.webContents.on('did-finish-load', () => writeBootLog('renderer finished loading'))
+  mainWindow.webContents.on('did-fail-load', (_event, code, description) => {
+    writeBootLog(`renderer failed to load: ${code} ${description}`)
+  })
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    writeBootLog(`renderer process gone: ${details.reason} (${details.exitCode})`)
+  })
+  mainWindow.once('ready-to-show', () => writeBootLog('window ready to show'))
+
   if (process.env.ELECTRON_RENDERER_URL)
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
   else
@@ -335,6 +647,8 @@ function createWindow() {
 // ── App lifecycle ──────────────────────────────────────
 app.whenReady().then(() => {
   apiConfig = loadApiConfig()
+  initializeSessions()
+  initializeMemory()
   rebuildRuntime()
   setupIPC()
   createWindow()
@@ -351,7 +665,6 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
-  sessionsCache.default = sessionStore.getSessionMessages('default')
-  persist.saveJson('sessions', sessionsCache)
+  saveSessions()
   persist.saveAllImmediately()
 })

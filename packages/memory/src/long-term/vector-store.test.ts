@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createVectorStore } from './vector-store'
+import type { MemoryPersistenceDelta } from './vector-store'
 
 const temporaryDirectories: string[] = []
 
 afterEach(() => {
+  vi.restoreAllMocks()
   for (const directory of temporaryDirectories.splice(0))
     rmSync(directory, { recursive: true, force: true })
 })
@@ -18,7 +20,7 @@ describe('persistent vector store', () => {
     createVectorStore({ storagePath })
 
     expect(existsSync(storagePath)).toBe(true)
-    expect(JSON.parse(readFileSync(storagePath, 'utf-8'))).toEqual({ version: 1, items: [] })
+    expect(JSON.parse(readFileSync(storagePath, 'utf-8'))).toEqual({ version: 3, items: [] })
   })
 
   it('persists across instances and isolates owners', async () => {
@@ -39,8 +41,35 @@ describe('persistent vector store', () => {
     const second = createVectorStore(options)
     expect(await second.count(scopeA)).toBe(1)
     expect(await second.count(scopeB)).toBe(1)
+    expect((await second.list(scopeA)).map(item => item.content)).toEqual(['Alice likes coffee'])
+    expect((await second.list(scopeB)).map(item => item.content)).toEqual(['Bob likes tea'])
     expect((await second.recall('coffee', scopeA))[0]?.content).toBe('Alice likes coffee')
     expect(await second.recall('coffee', scopeB)).toEqual([])
+  })
+
+  it('uses record deltas after the initial snapshot when persistence supports them', async () => {
+    const snapshots: string[] = []
+    const deltas: MemoryPersistenceDelta[] = []
+    const store = createVectorStore({
+      persistence: {
+        load: () => undefined,
+        save: payload => snapshots.push(payload),
+        appendDelta: delta => deltas.push(delta),
+      },
+      embeddingModel: 'test-v1',
+      minScore: 0.1,
+      embedder: testEmbedder,
+    })
+    const scope = { ownerId: 'incremental', agentId: 'deskpet' }
+    await store.remember('Alice likes coffee', scope)
+    const recalled = await store.recall('coffee', scope)
+    await store.forget(recalled[0]!.id, scope)
+
+    expect(snapshots).toHaveLength(1)
+    expect(deltas).toHaveLength(3)
+    expect(deltas[0]?.upserts).toHaveLength(1)
+    expect(deltas[1]?.upserts).toHaveLength(1)
+    expect(deltas[2]?.deletes).toEqual([recalled[0]!.id])
   })
 
   it('deduplicates, forgets and clears within a scope', async () => {
@@ -56,6 +85,14 @@ describe('persistent vector store', () => {
     await store.remember('  User   likes coffee  ', scope, { importance: 1 })
     expect(await store.count(scope)).toBe(1)
 
+    const listed = await store.list(scope)
+    expect(listed).toHaveLength(1)
+    expect(listed[0]).toMatchObject({
+      content: 'User likes coffee',
+      metadata: { importance: 1 },
+    })
+    expect(listed[0]?.updatedAt).toEqual(expect.any(Number))
+
     const hit = (await store.recall('coffee', scope))[0]!
     await store.forget(hit.id, scope)
     expect(await store.count(scope)).toBe(0)
@@ -63,6 +100,221 @@ describe('persistent vector store', () => {
     await store.remember('User likes tea', scope)
     await store.clear(scope)
     expect(await store.count(scope)).toBe(0)
+  })
+
+  it('supersedes confident single-value facts and can restore lifecycle records', async () => {
+    const store = createVectorStore({ storagePath: temporaryFile(), embedder: testEmbedder })
+    const scope = { ownerId: 'local', agentId: 'deskpet' }
+    await store.remember('用户姓名/名字：小秦', scope, {
+      memoryKey: 'profile.name', cardinality: 'single', confidence: 0.95,
+    })
+    await store.remember('用户姓名/名字：小明', scope, {
+      memoryKey: 'profile.name', cardinality: 'single', confidence: 0.95,
+    })
+
+    const memories = await store.list(scope)
+    expect(memories).toHaveLength(2)
+    expect(memories.find(item => item.content.includes('小明'))?.status).toBe('active')
+    const old = memories.find(item => item.content.includes('小秦'))!
+    expect(old.status).toBe('superseded')
+    expect(old.validTo).toEqual(expect.any(Number))
+    expect(old.invalidatedAt).toEqual(expect.any(Number))
+    expect(await store.restore(old.id, scope)).toBe(true)
+    const restored = await store.list(scope)
+    expect(restored.find(item => item.id === old.id)?.status).toBe('active')
+    expect(restored.find(item => item.content.includes('小明'))?.status).toBe('superseded')
+
+    await store.remember('临时记忆', scope, { expiresAt: Date.now() - 1000 })
+    const expired = (await store.list(scope)).find(item => item.content === '临时记忆')!
+    expect(expired.status).toBe('expired')
+    expect(await store.restore(expired.id, scope)).toBe(true)
+    const restoredExpired = (await store.list(scope)).find(item => item.id === expired.id)!
+    expect(restoredExpired.status).toBe('active')
+    expect(restoredExpired.expiresAt).toBeUndefined()
+  })
+
+  it('requires semantic or lexical relevance instead of passing on importance and recency alone', async () => {
+    const store = createVectorStore({
+      storagePath: temporaryFile(),
+      minScore: 0.1,
+      minSemanticScore: 0.5,
+      minLexicalScore: 0.2,
+      embedder: relevanceEmbedder,
+    })
+    const scope = { ownerId: 'local', agentId: 'deskpet' }
+    await store.remember('用户喜欢咖啡', scope, { importance: 1 })
+
+    expect(await store.recall('今天天气如何', scope)).toEqual([])
+  })
+
+  it('applies privacy filters before ranking and access accounting', async () => {
+    const store = createVectorStore({
+      storagePath: temporaryFile(),
+      minScore: 0.1,
+      minSemanticScore: 0.5,
+      embedder: sharedEmbedder,
+    })
+    const scope = { ownerId: 'local', agentId: 'deskpet' }
+    await store.remember('private shared fact', scope, {
+      kind: 'private-test', sensitivity: 'private', sharePolicy: 'local-only',
+    })
+    await store.remember('public shared fact', scope, {
+      kind: 'public-test', sensitivity: 'normal', sharePolicy: 'allow-remote',
+    })
+
+    const recalled = await store.recall('shared', scope, 5, {
+      sharePolicies: ['allow-remote'], sensitivities: ['normal'],
+    })
+    expect(recalled.map(item => item.content)).toEqual(['public shared fact'])
+    const listed = await store.list(scope)
+    expect(listed.find(item => item.content.startsWith('private'))?.accessCount).toBe(0)
+    expect(listed.find(item => item.content.startsWith('public'))?.accessCount).toBe(1)
+  })
+
+  it('deduplicates conservative semantic paraphrases', async () => {
+    const store = createVectorStore({ storagePath: temporaryFile(), embedder: sharedEmbedder })
+    const scope = { ownerId: 'local', agentId: 'deskpet' }
+    await store.remember('User likes coffee', scope, { kind: 'preference', sourceMessageIds: ['m1'] })
+    await store.remember("Coffee is the user's preferred drink", scope, {
+      kind: 'preference', sourceMessageIds: ['m2'],
+    })
+
+    expect(await store.count(scope)).toBe(1)
+    expect((await store.list(scope))[0]?.sourceMessageIds).toEqual(['m1', 'm2'])
+  })
+
+  it('orphan automatic memories when deleted messages were their last evidence', async () => {
+    const store = createVectorStore({ storagePath: temporaryFile(), embedder: testEmbedder })
+    const scope = { ownerId: 'local', agentId: 'deskpet' }
+    await store.remember('用户喜欢咖啡', scope, {
+      sourceMessageIds: ['message-1'], origin: 'automatic',
+    })
+
+    expect(await store.unlinkSources(['message-1'], scope)).toEqual({ updated: 1, orphaned: 1 })
+    expect((await store.list(scope))[0]?.status).toBe('orphaned')
+    expect(await store.recall('咖啡', scope)).toEqual([])
+  })
+
+  it('recalls current and historical versions with real-world validity intervals', async () => {
+    const store = createVectorStore({
+      storagePath: temporaryFile(),
+      embedder: temporalEmbedder,
+      minScore: 0.1,
+      minSemanticScore: 0.1,
+    })
+    const scope = { ownerId: 'local', agentId: 'deskpet' }
+    const beijingFrom = Date.parse('2024-01-01T00:00:00Z')
+    const shanghaiFrom = Date.parse('2025-01-01T00:00:00Z')
+    await store.remember('用户所在地：北京', scope, {
+      memoryKey: 'profile.location', cardinality: 'single', confidence: 0.95,
+      kind: 'identity', validFrom: beijingFrom,
+    })
+    await store.remember('用户所在地：上海', scope, {
+      memoryKey: 'profile.location', cardinality: 'single', confidence: 0.95,
+      kind: 'identity', validFrom: shanghaiFrom,
+    })
+
+    const versions = await store.list(scope)
+    expect(versions.find(item => item.content.includes('北京'))).toMatchObject({
+      status: 'superseded', validFrom: beijingFrom, validTo: shanghaiFrom,
+    })
+    expect((await store.recall('用户当前所在地', scope))[0]?.content).toContain('上海')
+    expect((await store.recall('用户以前在北京居住', scope))[0]?.content).toContain('北京')
+    expect((await store.recall('2024 年我住在哪里', scope))[0]?.content).toContain('北京')
+  })
+
+  it('retains the newest write when capacity timestamps are identical', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    const store = createVectorStore({
+      storagePath: temporaryFile(), maxMemories: 5, embedder: testEmbedder,
+    })
+    const scope = { ownerId: 'capacity', agentId: 'deskpet' }
+    for (let index = 0; index < 6; index++)
+      await store.remember(`CAP-${index}`, scope, { kind: `capacity-${index}` })
+
+    const retained = (await store.list(scope)).map(item => item.content)
+    expect(retained).toHaveLength(5)
+    expect(retained).toContain('CAP-5')
+    expect(retained).not.toContain('CAP-0')
+  })
+
+  it('migrates a version 1 index to version 3 without losing memories', async () => {
+    const storagePath = temporaryFile()
+    writeFileSync(storagePath, JSON.stringify({
+      version: 1,
+      items: [{
+        id: 'legacy-1', content: 'legacy coffee', scope: { ownerId: 'local', agentId: 'deskpet' },
+        embedding: [1, 0, 0], embeddingModel: 'test-v1', createdAt: 1, updatedAt: 1,
+      }],
+    }), 'utf-8')
+
+    const store = createVectorStore({ storagePath, embeddingModel: 'test-v1', embedder: testEmbedder })
+    expect(await store.count({ ownerId: 'local', agentId: 'deskpet' })).toBe(1)
+    expect(JSON.parse(readFileSync(storagePath, 'utf-8')).version).toBe(3)
+  })
+
+  it('migrates the current version 2 index to temporal version 3', async () => {
+    const storagePath = temporaryFile()
+    const scope = { ownerId: 'local', agentId: 'deskpet' }
+    const original = createVectorStore({ storagePath, embedder: testEmbedder })
+    await original.remember('用户姓名/名字：小秦', scope, {
+      memoryKey: 'profile.name', cardinality: 'single', confidence: 0.95,
+    })
+    const versionTwo = JSON.parse(readFileSync(storagePath, 'utf-8'))
+    versionTwo.version = 2
+    for (const item of versionTwo.items) {
+      delete item.validFrom
+      delete item.validTo
+      delete item.invalidatedAt
+    }
+    writeFileSync(storagePath, JSON.stringify(versionTwo), 'utf-8')
+
+    const migrated = createVectorStore({ storagePath, embedder: testEmbedder })
+    expect((await migrated.list(scope))[0]?.validFrom).toEqual(expect.any(Number))
+    expect(JSON.parse(readFileSync(storagePath, 'utf-8')).version).toBe(3)
+  })
+
+  it('refuses a malformed version 2 index instead of silently dropping records', () => {
+    const storagePath = temporaryFile()
+    const malformed = JSON.stringify({ version: 2, items: [{ id: 'broken', content: 'keep me visible' }] })
+    writeFileSync(storagePath, malformed, 'utf-8')
+
+    expect(() => createVectorStore({ storagePath, embedder: testEmbedder })).toThrow('invalid version 2 item')
+    expect(readFileSync(storagePath, 'utf-8')).toBe(malformed)
+  })
+
+  it('recalls local semantic field paraphrases and rejects unrelated queries', async () => {
+    const store = createVectorStore()
+    const scope = { ownerId: 'local-semantic', agentId: 'deskpet' }
+    await store.remember('用户姓名/名字：林晨', scope, { kind: 'identity' })
+    await store.remember('用户过敏信息：花生', scope, { kind: 'health' })
+    await store.remember('用户当前项目：星云记账应用', scope, { kind: 'project' })
+    await store.remember('用户界面偏好：dark mode', scope, { kind: 'preference' })
+    await store.remember('用户工作时间偏好：晚上', scope, { kind: 'routine' })
+    await store.remember('用户不喜欢的食物：香菜', scope, { kind: 'preference' })
+
+    const nameRecall = await store.recall('我应该怎样称呼你', scope, 3)
+    expect(nameRecall[0]?.content).toContain('林晨')
+    expect(nameRecall).toHaveLength(1)
+    expect((await store.recall('点外卖时必须避开什么', scope, 3))[0]?.content).toContain('花生')
+    expect((await store.recall('手头主要在忙哪个软件', scope, 3))[0]?.content).toContain('星云记账')
+    expect((await store.recall('Which interface theme do you like', scope, 3))[0]?.content).toContain('dark mode')
+    expect((await store.recall('习惯白天还是夜里办公', scope, 3))[0]?.content).toContain('晚上')
+    expect((await store.recall('做菜时不要加哪样东西', scope, 3))[0]?.content).toContain('香菜')
+    expect(await store.recall('量子纠缠如何定义', scope, 3)).toEqual([])
+  })
+
+  it('deduplicates equivalent fact wording without merging opposite preferences', async () => {
+    const store = createVectorStore()
+    const scope = { ownerId: 'semantic-dedupe', agentId: 'deskpet' }
+    await store.remember('用户喜欢：爵士乐', scope, { kind: 'preference' })
+    await store.remember('用户偏爱爵士音乐', scope, { kind: 'preference' })
+    await store.remember('用户喜欢：香菜', scope, { kind: 'preference' })
+    await store.remember('用户不喜欢：香菜', scope, { kind: 'preference' })
+
+    const items = await store.list(scope)
+    expect(items.filter(item => item.content.includes('爵士'))).toHaveLength(1)
+    expect(items.filter(item => item.content.includes('香菜'))).toHaveLength(2)
   })
 })
 
@@ -77,6 +329,22 @@ async function testEmbedder(text: string): Promise<number[]> {
   if (normalized.includes('coffee'))
     return [1, 0, 0]
   if (normalized.includes('tea'))
+    return [0, 1, 0]
+  return [0, 0, 1]
+}
+
+async function relevanceEmbedder(text: string): Promise<number[]> {
+  return text.includes('咖啡') ? [1, 0] : [0, 1]
+}
+
+async function sharedEmbedder(text: string): Promise<number[]> {
+  return /shared|coffee|preferred|likes/i.test(text) ? [1, 0] : [0, 1]
+}
+
+async function temporalEmbedder(text: string): Promise<number[]> {
+  if (text.includes('北京') || text.includes('以前') || text.includes('2024'))
+    return [1, 0, 0]
+  if (text.includes('上海') || text.includes('当前') || text.includes('现在'))
     return [0, 1, 0]
   return [0, 0, 1]
 }

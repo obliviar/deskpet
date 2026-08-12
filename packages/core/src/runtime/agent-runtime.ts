@@ -163,6 +163,14 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
     return results
   }
 
+  function appendSessionMessage(sessionId: string, item: ChatHistoryItem): void {
+    // A bounded session may evict old messages only to control the active
+    // context size. That retention event is not a user deletion: durable facts
+    // must keep their provenance and remain recallable. Explicit chat deletion
+    // and editing are handled by the application through memory.unlinkSources.
+    deps.session.appendSessionMessage(sessionId, item)
+  }
+
   /** Execute one chat turn: user message -> assistant response (with tool rounds). */
   async function send(
     sessionId: string,
@@ -193,7 +201,7 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
       content: userMessage,
       createdAt: Date.now(),
     }
-    deps.session.appendSessionMessage(sessionId, userItem)
+    appendSessionMessage(sessionId, userItem)
 
     // Recall long-term memories relevant to this message.
     let memories
@@ -205,6 +213,25 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
         console.error('[deskpet] memory recall failed:', err)
       }
     }
+
+    // Start durable fact extraction before the model call so an API failure
+    // cannot discard facts from the user's message. Provider failures are
+    // handled inside the configured extractor and this promise never rejects.
+    const capturePromise = deps.memory
+      ? deps.memory.capture({
+          userMessage,
+          assistantMessage: '',
+          attachments: options?.attachments,
+          metadata: {
+            sessionId,
+            sourceMessageIds: [userItem.id],
+            inputType: ctx.input?.type ?? 'text',
+          },
+        }, memoryScope).catch((err) => {
+          console.error('[deskpet] memory write failed:', err)
+          return 0
+        })
+      : Promise.resolve(0)
 
     // Assemble the system prompt.
     const systemPrompt = buildSystemPrompt({
@@ -220,71 +247,61 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
       { role: 'system', content: systemPrompt },
       ...history.map(h => ({
         role: h.role,
-        content: h.content,
+        content: h.id === userItem.id ? userContent : h.content,
         toolCallId: h.toolCallId,
         toolCalls: h.toolCalls,
         name: h.name,
       })),
     ]
 
-    await hooks.emitAfterMessageComposedHooks(userMessage, ctx)
-    await hooks.emitBeforeSendHooks(userMessage, ctx)
+    try {
+      await hooks.emitAfterMessageComposedHooks(userMessage, ctx)
+      await hooks.emitBeforeSendHooks(userMessage, ctx)
 
-    // Run LLM rounds, executing tools until no more tool calls or limit reached.
-    let round = 0
-    let result: AgentTurnResult = { text: '', toolCalls: [] }
-    let currentMessages = messages
+      // Run LLM rounds, executing tools until no more tool calls or limit reached.
+      let round = 0
+      let result: AgentTurnResult = { text: '', toolCalls: [] }
+      let currentMessages = messages
 
-    while (round <= maxToolRounds) {
-      result = await runLLMRound(sessionId, currentMessages, model, ctx)
+      while (round <= maxToolRounds) {
+        result = await runLLMRound(sessionId, currentMessages, model, ctx)
 
-      if (result.toolCalls.length === 0)
-        break
+        if (result.toolCalls.length === 0)
+          break
 
-      // Append assistant message with tool calls, then tool results.
-      currentMessages = [
-        ...currentMessages,
-        {
-          role: 'assistant' as const,
-          content: result.text,
-          toolCalls: result.toolCalls,
-        },
-      ]
-      const toolResults = await executeToolCalls(sessionId, result.toolCalls, ctx)
-      currentMessages = [...currentMessages, ...toolResults]
-      round++
-    }
-
-    // Persist the final assistant message.
-    const assistantItem: ChatHistoryItem = {
-      id: crypto.randomUUID(),
-      role: 'assistant',
-      content: result.text,
-      toolCalls: result.toolCalls.length > 0 ? result.toolCalls : undefined,
-      createdAt: Date.now(),
-    }
-    deps.session.appendSessionMessage(sessionId, assistantItem)
-
-    // Extract and persist durable facts from this turn if memory is configured.
-    if (deps.memory) {
-      try {
-        await deps.memory.capture({
-          userMessage,
-          assistantMessage: result.text,
-          metadata: {
-            sessionId,
-            sourceMessageIds: [userItem.id, assistantItem.id],
-            inputType: ctx.input?.type ?? 'text',
+        // Append assistant message with tool calls, then tool results.
+        currentMessages = [
+          ...currentMessages,
+          {
+            role: 'assistant' as const,
+            content: result.text,
+            toolCalls: result.toolCalls,
           },
-        }, memoryScope)
+        ]
+        const toolResults = await executeToolCalls(sessionId, result.toolCalls, ctx)
+        currentMessages = [...currentMessages, ...toolResults]
+        round++
       }
-      catch (err) {
-        console.error('[deskpet] memory write failed:', err)
-      }
-    }
 
-    await hooks.emitAfterSendHooks(result.text, ctx)
-    return result
+      // Commit the user fact before persisting the completed assistant turn.
+      await capturePromise
+
+      // Persist the final assistant message.
+      const assistantItem: ChatHistoryItem = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: result.text,
+        toolCalls: result.toolCalls.length > 0 ? result.toolCalls : undefined,
+        createdAt: Date.now(),
+      }
+      appendSessionMessage(sessionId, assistantItem)
+
+      await hooks.emitAfterSendHooks(result.text, ctx)
+      return result
+    }
+    finally {
+      await capturePromise
+    }
   }
 
   return { send, hooks }

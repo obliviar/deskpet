@@ -20,7 +20,7 @@ const config = {
   systemPrompt: process.env.DESKPET_SYSTEM_PROMPT || 'You are a helpful AI assistant named DeskPet.',
   embeddingApiKey: process.env.DESKPET_EMBEDDING_API_KEY || process.env.OPENAI_API_KEY || '',
   embeddingBaseURL: process.env.DESKPET_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || undefined,
-  embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || 'local-hash-v1',
+  embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || 'local-hash-v2',
   memoryPath: process.env.DESKPET_MEMORY_PATH || join(process.cwd(), 'data', 'memories.json'),
 }
 

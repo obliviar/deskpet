@@ -1,12 +1,15 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { defineConfig } from 'electron-vite'
+import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import vue from '@vitejs/plugin-vue'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
 export default defineConfig({
   main: {
+    plugins: [externalizeDepsPlugin({
+      exclude: ['@deskpet/core', '@deskpet/llm-openai', '@deskpet/memory', '@deskpet/tools'],
+    })],
     build: { outDir: resolve(__dirname, 'dist/main'), rollupOptions: { external: ['electron'] } },
   },
   preload: {

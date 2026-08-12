@@ -37,7 +37,7 @@ export function loadConfig(): DeskPetConfig {
     memoryOwnerId: process.env.DESKPET_MEMORY_OWNER || 'local-user',
     embeddingApiKey: process.env.DESKPET_EMBEDDING_API_KEY || apiKey,
     embeddingBaseURL: process.env.DESKPET_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || undefined,
-    embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || 'local-hash-v1',
+    embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || 'local-hash-v2',
     tools: process.env.DESKPET_TOOLS ? process.env.DESKPET_TOOLS.split(',').map(t => t.trim()) : undefined,
   }
 }

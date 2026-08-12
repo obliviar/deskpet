@@ -18,9 +18,19 @@
     "electronVersion": "33.4.11",
     "npmRebuild": false,
     "artifactName": "DeskPet-${version}-win.${ext}",
-    "directories": { "output": "release" },
-    "files": ["dist/**/*"],
-    "extraFiles": [{ "from": "config.example.json", "to": "config.example.json" }],
+    "asar": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*"
+    ],
+    "extraFiles": [
+      {
+        "from": "config.example.json",
+        "to": "config.example.json"
+      }
+    ],
     "win": {
       "target": "zip",
       "icon": null,
@@ -32,6 +42,8 @@
     "@deskpet/llm-openai": "workspace:*",
     "@deskpet/memory": "workspace:*",
     "@deskpet/tools": "workspace:*",
+    "@huggingface/transformers": "3.8.1",
+    "tesseract.js": "7.0.0",
     "vue": "^3.5.0"
   },
   "devDependencies": {

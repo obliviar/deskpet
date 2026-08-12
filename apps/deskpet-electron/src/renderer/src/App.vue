@@ -25,6 +25,32 @@ interface Theme {
   scrollThumb: string
 }
 
+interface MemoryItem {
+  id: string
+  content: string
+  metadata?: Record<string, unknown>
+  createdAt: number
+  updatedAt?: number
+  status?: 'active' | 'superseded' | 'expired' | 'conflicted' | 'orphaned'
+  origin?: 'automatic' | 'manual' | 'image'
+  importance?: number
+  confidence?: number
+  accessCount?: number
+  lastAccessedAt?: number
+  expiresAt?: number
+  sharePolicy?: 'allow-remote' | 'local-only' | 'ask'
+  sensitivity?: 'normal' | 'private' | 'secret'
+  sourceMessageIds?: string[]
+  sourceAttachmentIds?: string[]
+}
+
+interface MemorySettings {
+  extractionMode: 'rules' | 'smart'
+  semanticEnabled: boolean
+  imageMemoryEnabled: boolean
+  remotePolicy: 'normal-only' | 'allow-private' | 'disabled'
+}
+
 // ── Speech synthesis types (Chromium built-in TTS) ─────
 // (speechSynthesis and SpeechSynthesisUtterance are global DOM types)
 
@@ -57,6 +83,31 @@ const apiModel = ref('gpt-4o-mini')
 const apiSaving = ref(false)
 const apiStatusMessage = ref('')
 const apiStatusError = ref(false)
+
+// Long-term memory manager state
+const showMemoryManager = ref(false)
+const memoryEnabled = ref(false)
+const memoryCount = ref(0)
+const memoryStoragePath = ref('')
+const memoryItems = ref<MemoryItem[]>([])
+const manualMemoryInput = ref('')
+const memoryLoading = ref(false)
+const memoryMutating = ref(false)
+const memoryStatusMessage = ref('')
+const memoryStatusError = ref(false)
+const pendingDeleteMemoryId = ref<string | null>(null)
+const confirmClearMemories = ref(false)
+const memorySettings = ref<MemorySettings>({
+  extractionMode: 'rules',
+  semanticEnabled: false,
+  imageMemoryEnabled: true,
+  remotePolicy: 'normal-only',
+})
+const memoryEncrypted = ref(false)
+const semanticInstalled = ref(false)
+const semanticModelName = ref('Xenova/bge-small-zh-v1.5')
+const semanticModelProgress = ref<{ status: string; progress?: number; file?: string; error?: string }>({ status: 'idle' })
+const semanticInstalling = ref(false)
 
 // Screen capture state
 const pendingImage = ref<{ data: string; mimeType: string } | null>(null)
@@ -94,6 +145,10 @@ function onToken(_event: unknown, token: string) {
   }
 }
 
+function onMemoryModelProgress(_event: unknown, progress: typeof semanticModelProgress.value) {
+  semanticModelProgress.value = progress
+}
+
 // ── Lifecycle ───────────────────────────────────────────
 onMounted(async () => {
   const settings = await ipcRenderer.invoke('settings:get')
@@ -107,6 +162,7 @@ onMounted(async () => {
   }
 
   await refreshApiStatus()
+  await refreshMemoryStatus()
 
   const history = await ipcRenderer.invoke('sessions:history')
   if (history && history.length > 0) {
@@ -124,10 +180,12 @@ onMounted(async () => {
     scrollToBottom()
 
   ipcRenderer.on('chat:token', onToken)
+  ipcRenderer.on('memory:model-progress', onMemoryModelProgress)
 })
 
 onUnmounted(() => {
   ipcRenderer.removeListener('chat:token', onToken)
+  ipcRenderer.removeListener('memory:model-progress', onMemoryModelProgress)
   if (resetTimer) clearTimeout(resetTimer)
   if (mediaRecorder) {
     mediaRecorder.stop()
@@ -165,6 +223,7 @@ async function openApiSettings() {
   apiKeyInput.value = ''
   apiStatusMessage.value = ''
   apiStatusError.value = false
+  showMemoryManager.value = false
   showApiSettings.value = true
 }
 
@@ -199,6 +258,312 @@ async function saveApiSettings() {
   finally {
     apiSaving.value = false
   }
+}
+
+// ── Long-term memory manager ────────────────────────────
+async function refreshMemoryStatus() {
+  try {
+    const status = await ipcRenderer.invoke('memory:status')
+    memoryEnabled.value = !!status?.enabled
+    memoryCount.value = Number(status?.count) || 0
+    memoryStoragePath.value = status?.storagePath || ''
+    applyMemoryRuntimeStatus(status)
+    if (status?.error) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = status.error
+    }
+  }
+  catch {
+    memoryEnabled.value = false
+    memoryCount.value = 0
+  }
+}
+
+function applyMemoryRuntimeStatus(status: any) {
+  if (status?.settings)
+    memorySettings.value = { ...memorySettings.value, ...status.settings }
+  memoryEncrypted.value = !!status?.encrypted
+  semanticInstalled.value = !!status?.semantic?.installed
+  semanticModelName.value = status?.semantic?.model || semanticModelName.value
+  if (status?.semantic?.progress)
+    semanticModelProgress.value = status.semantic.progress
+}
+
+async function openMemoryManager() {
+  showApiSettings.value = false
+  showThemeMenu.value = false
+  memoryStatusMessage.value = ''
+  memoryStatusError.value = false
+  pendingDeleteMemoryId.value = null
+  confirmClearMemories.value = false
+  showMemoryManager.value = true
+  await refreshMemoryList()
+}
+
+function closeMemoryManager() {
+  if (!memoryMutating.value)
+    showMemoryManager.value = false
+}
+
+async function refreshMemoryList() {
+  memoryLoading.value = true
+  try {
+    const result = await ipcRenderer.invoke('memory:list', 1000)
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '读取记忆失败。'
+      return
+    }
+    memoryEnabled.value = !!result.enabled
+    memoryCount.value = Number(result.count) || 0
+    memoryStoragePath.value = result.storagePath || ''
+    memoryItems.value = Array.isArray(result.items) ? result.items : []
+    applyMemoryRuntimeStatus(result)
+    if (result.error) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result.error
+    }
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '读取记忆失败。'
+  }
+  finally {
+    memoryLoading.value = false
+  }
+}
+
+async function saveMemorySettings(patch: Partial<MemorySettings>) {
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  memoryStatusMessage.value = ''
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:settings-set', patch)
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '记忆设置保存失败。'
+    }
+    if (result?.settings)
+      memorySettings.value = { ...memorySettings.value, ...result.settings }
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '记忆设置保存失败。'
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function installSemanticModel() {
+  if (semanticInstalling.value) return
+  semanticInstalling.value = true
+  memoryStatusMessage.value = '正在下载并校验本地语义模型，首次安装可能需要几分钟…'
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:model-install')
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '本地语义模型安装失败。'
+      return
+    }
+    semanticInstalled.value = true
+    memorySettings.value = { ...memorySettings.value, ...result.settings }
+    memoryStatusMessage.value = '本地语义模型已安装并启用；旧记忆会在召回时逐步重建向量。'
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '本地语义模型安装失败。'
+  }
+  finally {
+    semanticInstalling.value = false
+  }
+}
+
+async function updateMemory(item: MemoryItem, patch: Record<string, unknown>) {
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:update', item.id, patch)
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '更新记忆失败。'
+      return
+    }
+    memoryStatusMessage.value = '记忆设置已更新。'
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '更新记忆失败。'
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function updateMemorySensitivity(item: MemoryItem) {
+  await updateMemory(item, {
+    sensitivity: item.sensitivity,
+    ...(item.sensitivity === 'secret' ? { sharePolicy: 'local-only' } : {}),
+  })
+}
+
+async function restoreMemory(item: MemoryItem) {
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  try {
+    const result = await ipcRenderer.invoke('memory:restore', item.id)
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '恢复记忆失败。'
+      return
+    }
+    memoryStatusError.value = false
+    memoryStatusMessage.value = '记忆已恢复为有效状态。'
+    await refreshMemoryList()
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function addManualMemory() {
+  const content = manualMemoryInput.value.trim()
+  if (!content || memoryMutating.value) return
+  memoryMutating.value = true
+  memoryStatusMessage.value = ''
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:add', content)
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '添加记忆失败。'
+      return
+    }
+    manualMemoryInput.value = ''
+    memoryStatusMessage.value = '记忆已保存。'
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '添加记忆失败。'
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function deleteMemory(id: string) {
+  if (pendingDeleteMemoryId.value !== id) {
+    pendingDeleteMemoryId.value = id
+    return
+  }
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  memoryStatusMessage.value = ''
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:forget', id)
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '删除记忆失败。'
+      return
+    }
+    pendingDeleteMemoryId.value = null
+    memoryStatusMessage.value = '记忆已删除。'
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '删除记忆失败。'
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function clearAllMemories() {
+  if (!confirmClearMemories.value) {
+    confirmClearMemories.value = true
+    return
+  }
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  memoryStatusMessage.value = ''
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:clear')
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '清空记忆失败。'
+      return
+    }
+    confirmClearMemories.value = false
+    memoryStatusMessage.value = '所有长期记忆已清空。'
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '清空记忆失败。'
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function openMemoryLocation() {
+  try {
+    const result = await ipcRenderer.invoke('memory:open-location')
+    if (result?.ok) return
+    memoryStatusError.value = true
+    memoryStatusMessage.value = result?.error || '无法打开记忆文件位置。'
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '无法打开记忆文件位置。'
+  }
+}
+
+function memoryKindLabel(item: MemoryItem): string {
+  const kind = typeof item.metadata?.kind === 'string' ? item.metadata.kind : ''
+  return ({
+    identity: '身份',
+    preference: '偏好',
+    project: '项目',
+    explicit: '明确记忆',
+    manual: '手动添加',
+    image: '图片记忆',
+  } as Record<string, string>)[kind] || '自动记忆'
+}
+
+function memoryStatusLabel(item: MemoryItem): string {
+  return ({
+    active: '有效',
+    superseded: '已被替代',
+    expired: '已过期',
+    conflicted: '待确认冲突',
+    orphaned: '来源已删除',
+  } as Record<string, string>)[item.status || 'active'] || '有效'
+}
+
+function modelProgressLabel(): string {
+  const progress = semanticModelProgress.value
+  if (progress.status === 'error') return `安装错误：${progress.error || '未知错误'}`
+  if (progress.status === 'ready') return '模型就绪'
+  if (progress.status === 'downloading')
+    return `下载中${typeof progress.progress === 'number' ? ` ${Math.round(progress.progress)}%` : ''}${progress.file ? ` · ${progress.file}` : ''}`
+  if (progress.status === 'loading') return '正在加载模型…'
+  return semanticInstalled.value ? '模型已安装' : '尚未安装（聊天仍使用本地哈希检索）'
+}
+
+function formatMemoryDate(item: MemoryItem): string {
+  const timestamp = item.updatedAt || item.createdAt
+  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString('zh-CN') : ''
 }
 
 // ── Send ────────────────────────────────────────────────
@@ -239,6 +604,7 @@ async function send() {
     assistantMsg.content = '[Error: ' + (err instanceof Error ? err.message : 'unknown') + ']'
   }
   finally {
+    await refreshMemoryStatus()
     isLoading.value = false
     scrollToBottom()
   }
@@ -483,6 +849,9 @@ async function doReset() {
       <span class="name">{{ agentName }}</span>
       <span class="badge">在线</span>
       <span class="spacer" />
+      <button class="icon-btn memory-btn" :class="{ active: memoryEnabled }" title="长期记忆管理" @click="openMemoryManager">
+        🧠 记忆<span v-if="memoryEnabled" class="memory-count">{{ memoryCount }}</span>
+      </button>
       <button class="icon-btn api-btn" :class="{ active: apiConfigured }" title="API 设置" @click="openApiSettings">
         <span class="api-dot" /> API
       </button>
@@ -537,6 +906,157 @@ async function doReset() {
           <button class="secondary-btn" :disabled="apiSaving" @click="closeApiSettings">取消</button>
           <button class="primary-btn" :disabled="apiSaving" @click="saveApiSettings">{{ apiSaving ? '保存中...' : '保存配置' }}</button>
         </div>
+      </div>
+    </div>
+
+    <!-- Long-term memory manager dialog -->
+    <div v-if="showMemoryManager" class="modal-backdrop" @click.self="closeMemoryManager">
+      <div class="memory-dialog" role="dialog" aria-modal="true" aria-label="长期记忆管理">
+        <div class="dialog-header">
+          <div>
+            <h2>长期记忆管理</h2>
+            <p>查看、手动添加或删除 DeskPet 跨会话保存的事实</p>
+          </div>
+          <button class="dialog-close" :disabled="memoryMutating" title="关闭" @click="closeMemoryManager">✕</button>
+        </div>
+
+        <div class="memory-summary">
+          <span :class="['configured-state', { ready: memoryEnabled }]">
+            {{ memoryEnabled ? `● 已启用 · ${memoryCount} 条` : '○ 已关闭' }}
+          </span>
+          <span class="dialog-spacer" />
+          <button class="secondary-btn" :disabled="memoryLoading" @click="refreshMemoryList">{{ memoryLoading ? '读取中...' : '刷新' }}</button>
+          <button class="secondary-btn" @click="openMemoryLocation">打开文件位置</button>
+        </div>
+
+        <div v-if="memoryStoragePath" class="memory-path" :title="memoryStoragePath">{{ memoryStoragePath }}</div>
+
+        <div v-if="memoryStatusMessage" :class="['api-status-message', { error: memoryStatusError }]">{{ memoryStatusMessage }}</div>
+
+        <section class="memory-settings-panel">
+          <div class="memory-settings-title">
+            <strong>方案 A 设置</strong>
+            <span :class="['memory-encryption-state', { ready: memoryEncrypted }]">{{ memoryEncrypted ? '🔒 AES-256-GCM 加密' : '⚠ 加密存储不可用' }}</span>
+          </div>
+          <div class="memory-settings-grid">
+            <label>
+              <span>事实提取</span>
+              <select v-model="memorySettings.extractionMode" :disabled="memoryMutating" @change="saveMemorySettings({ extractionMode: memorySettings.extractionMode })">
+                <option value="rules">本地规则（稳定、免费）</option>
+                <option value="smart">智能提取（调用当前聊天模型）</option>
+              </select>
+            </label>
+            <label>
+              <span>发送给聊天模型</span>
+              <select v-model="memorySettings.remotePolicy" :disabled="memoryMutating" @change="saveMemorySettings({ remotePolicy: memorySettings.remotePolicy })">
+                <option value="normal-only">仅普通且允许分享</option>
+                <option value="allow-private">允许已授权的隐私记忆</option>
+                <option value="disabled">完全不发送长期记忆</option>
+              </select>
+            </label>
+          </div>
+          <label class="memory-check-row">
+            <input v-model="memorySettings.imageMemoryEnabled" type="checkbox" :disabled="memoryMutating" @change="saveMemorySettings({ imageMemoryEnabled: memorySettings.imageMemoryEnabled })" />
+            <span>仅在我明确说“记住图片/截图”时，本地 OCR 提取图片文字</span>
+          </label>
+          <div class="semantic-model-card">
+            <div>
+              <strong>中文本地语义检索</strong>
+              <p>{{ semanticModelName }} · {{ modelProgressLabel() }}</p>
+            </div>
+            <button v-if="!semanticInstalled" class="secondary-btn" :disabled="semanticInstalling" @click="installSemanticModel">
+              {{ semanticInstalling ? '安装中…' : '下载并启用' }}
+            </button>
+            <button v-else :class="['secondary-btn', { selected: memorySettings.semanticEnabled }]" :disabled="memoryMutating" @click="saveMemorySettings({ semanticEnabled: !memorySettings.semanticEnabled })">
+              {{ memorySettings.semanticEnabled ? '语义检索已启用' : '启用语义检索' }}
+            </button>
+          </div>
+          <div class="field-hint">模型与 OCR 数据保存在可执行文件旁的 DeskPetData；智能提取只分析用户原话，失败时自动退回本地规则。</div>
+        </section>
+
+        <div v-if="!memoryEnabled" class="memory-disabled">
+          长期记忆当前不可用。请查看上方错误；若是主动关闭，请检查 <code>config.json</code> 中的 <code>memoryEnabled</code> 或 <code>DESKPET_MEMORY</code> 环境变量。
+        </div>
+
+        <template v-else>
+          <label class="field-label" for="manual-memory">手动添加记忆</label>
+          <div class="memory-add-row">
+            <textarea
+              id="manual-memory"
+              v-model="manualMemoryInput"
+              class="settings-input memory-input"
+              maxlength="1000"
+              placeholder="例如：我偏好简短的中文回答"
+              @keydown.ctrl.enter="addManualMemory"
+            />
+            <button class="primary-btn" :disabled="memoryMutating || !manualMemoryInput.trim()" @click="addManualMemory">
+              {{ memoryMutating ? '处理中...' : '添加' }}
+            </button>
+          </div>
+          <div class="field-hint">按 Ctrl + Enter 可添加。疑似密钥、密码或指令注入内容会被拒绝。</div>
+
+          <div class="memory-list-header">
+            <strong>已保存的记忆</strong>
+            <span>按最近更新时间排序</span>
+          </div>
+
+          <div v-if="memoryLoading" class="memory-empty">正在读取长期记忆...</div>
+          <div v-else-if="memoryItems.length === 0" class="memory-empty">还没有长期记忆。你可以手动添加，或在聊天中说“请记住……”。</div>
+          <div v-else class="memory-list">
+            <div v-for="item in memoryItems" :key="item.id" class="memory-item">
+              <div class="memory-item-main">
+                <div class="memory-item-meta">
+                  <span class="memory-kind">{{ memoryKindLabel(item) }}</span>
+                  <span :class="['memory-state', item.status || 'active']">{{ memoryStatusLabel(item) }}</span>
+                  <span>{{ formatMemoryDate(item) }}</span>
+                  <span v-if="item.accessCount">召回 {{ item.accessCount }} 次</span>
+                </div>
+                <div class="memory-content">{{ item.content }}</div>
+                <div class="memory-item-controls">
+                  <label>重要度
+                    <select v-model.number="item.importance" :disabled="memoryMutating" @change="updateMemory(item, { importance: item.importance })">
+                      <option :value="0.25">低</option>
+                      <option :value="0.6">中</option>
+                      <option :value="0.85">高</option>
+                      <option :value="1">最高</option>
+                    </select>
+                  </label>
+                  <label>敏感级别
+                    <select v-model="item.sensitivity" :disabled="memoryMutating" @change="updateMemorySensitivity(item)">
+                      <option value="normal">普通</option>
+                      <option value="private">隐私</option>
+                      <option value="secret">机密（绝不发送）</option>
+                    </select>
+                  </label>
+                  <label>分享策略
+                    <select v-model="item.sharePolicy" :disabled="memoryMutating || item.sensitivity === 'secret'" @change="updateMemory(item, { sharePolicy: item.sharePolicy })">
+                      <option value="allow-remote">允许随请求发送</option>
+                      <option value="local-only">仅限本机</option>
+                      <option value="ask">待授权（暂不发送）</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+              <div class="memory-item-actions">
+                <button v-if="item.status && item.status !== 'active'" class="memory-restore-btn" :disabled="memoryMutating" @click="restoreMemory(item)">恢复</button>
+                <button
+                  :class="['memory-delete-btn', { confirm: pendingDeleteMemoryId === item.id }]"
+                  :disabled="memoryMutating"
+                  @click="deleteMemory(item.id)"
+                >
+                  {{ pendingDeleteMemoryId === item.id ? '确认永久删除' : '永久删除' }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="memory-footer">
+            <span>记忆加密写入 <code>memories.enc</code>；自动记忆的聊天来源被删除后会变为“来源已删除”，可恢复或永久删除。</span>
+            <button class="danger-btn" :disabled="memoryMutating || memoryItems.length === 0" @click="clearAllMemories">
+              {{ confirmClearMemories ? '再次点击确认清空' : '清空全部记忆' }}
+            </button>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -613,10 +1133,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .api-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
 .api-dot { width: 7px; height: 7px; border-radius: 50%; background: #d97757; box-shadow: 0 0 0 2px rgba(217,119,87,0.15); }
 .api-btn.active .api-dot { background: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.memory-btn { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-size: 12px; }
+.memory-count { min-width: 18px; padding: 1px 5px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); text-align: center; font-size: 10px; }
 
 /* API settings dialog */
 .modal-backdrop { position: fixed; inset: 0; z-index: 300; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(0,0,0,0.58); backdrop-filter: blur(3px); }
-.api-dialog { width: min(480px, 100%); max-height: calc(100vh - 48px); overflow-y: auto; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: 0 24px 70px rgba(0,0,0,0.45); }
+.api-dialog, .memory-dialog { max-height: calc(100vh - 48px); overflow-y: auto; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: 0 24px 70px rgba(0,0,0,0.45); }
+.api-dialog { width: min(480px, 100%); }
+.memory-dialog { width: min(780px, 100%); }
 .dialog-header { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 20px; }
 .dialog-header h2 { font-size: 19px; font-weight: 650; }
 .dialog-header p { margin-top: 5px; color: var(--text-muted); font-size: 12px; }
@@ -636,6 +1160,61 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .secondary-btn { border: 1px solid var(--border); background: transparent; color: var(--text); }
 .primary-btn { border: 1px solid var(--accent); background: var(--accent); color: #fff; }
 .secondary-btn:disabled, .primary-btn:disabled, .dialog-close:disabled { opacity: 0.5; cursor: default; }
+
+/* Long-term memory manager */
+.memory-summary { display: flex; align-items: center; gap: 8px; }
+.memory-path { margin-top: 10px; padding: 8px 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text-muted); font-family: Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.memory-settings-panel { margin-top: 14px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+.memory-settings-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; }
+.memory-encryption-state { color: #e76f61; font-size: 10px; }
+.memory-encryption-state.ready { color: var(--accent); }
+.memory-settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 11px; }
+.memory-settings-grid label, .memory-item-controls label { color: var(--text-muted); font-size: 10px; }
+.memory-settings-grid label > span { display: block; margin-bottom: 5px; }
+.memory-settings-grid select, .memory-item-controls select { width: 100%; padding: 7px 8px; border: 1px solid var(--border); border-radius: 6px; outline: none; background: var(--surface); color: var(--text); font: inherit; }
+.memory-check-row { display: flex; align-items: center; gap: 7px; margin-top: 11px; color: var(--text); font-size: 11px; cursor: pointer; }
+.memory-check-row input { accent-color: var(--accent); }
+.semantic-model-card { display: flex; align-items: center; gap: 12px; margin-top: 11px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.semantic-model-card > div { min-width: 0; flex: 1; }
+.semantic-model-card strong { font-size: 11px; }
+.semantic-model-card p { margin-top: 3px; overflow: hidden; color: var(--text-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.secondary-btn.selected { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.memory-disabled, .memory-empty { margin-top: 16px; padding: 22px 16px; border: 1px dashed var(--border); border-radius: 9px; color: var(--text-muted); text-align: center; font-size: 12px; line-height: 1.6; }
+.memory-disabled code, .memory-footer code { font-family: Consolas, monospace; color: var(--text); }
+.memory-add-row { display: flex; align-items: stretch; gap: 8px; }
+.memory-input { min-height: 62px; resize: vertical; line-height: 1.45; }
+.memory-add-row .primary-btn { min-width: 72px; }
+.memory-list-header { display: flex; align-items: baseline; justify-content: space-between; margin: 20px 0 8px; }
+.memory-list-header strong { font-size: 13px; }
+.memory-list-header span { color: var(--text-muted); font-size: 10px; }
+.memory-list { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; padding-right: 3px; }
+.memory-list::-webkit-scrollbar { width: 5px; }
+.memory-list::-webkit-scrollbar-thumb { border-radius: 3px; background: var(--scroll-thumb); }
+.memory-item { display: flex; align-items: flex-start; gap: 12px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
+.memory-item-main { min-width: 0; flex: 1; }
+.memory-item-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; color: var(--text-muted); font-size: 10px; }
+.memory-kind { padding: 2px 6px; border-radius: 5px; background: var(--accent-soft); color: var(--accent); }
+.memory-state { padding: 2px 5px; border-radius: 5px; background: rgba(231,76,60,0.12); color: #e76f61; }
+.memory-state.active { background: rgba(45,125,70,0.13); color: var(--accent); }
+.memory-state.conflicted { background: rgba(217,119,87,0.15); color: #d97757; }
+.memory-content { color: var(--text); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.memory-item-controls { display: grid; grid-template-columns: 0.65fr 1fr 1.2fr; gap: 7px; margin-top: 9px; }
+.memory-item-controls select { display: block; margin-top: 4px; padding: 5px 6px; font-size: 9px; }
+.memory-item-actions { display: flex; flex-direction: column; flex-shrink: 0; gap: 6px; }
+.memory-restore-btn { padding: 6px 9px; border: 1px solid var(--accent); border-radius: 7px; background: transparent; color: var(--accent); cursor: pointer; font: inherit; font-size: 11px; }
+.memory-delete-btn, .danger-btn { border: 1px solid rgba(231,76,60,0.45); border-radius: 7px; background: transparent; color: #e76f61; cursor: pointer; font-family: inherit; font-size: 11px; }
+.memory-delete-btn { flex-shrink: 0; padding: 6px 9px; }
+.memory-delete-btn.confirm, .danger-btn:hover { background: rgba(231,76,60,0.14); border-color: #e76f61; }
+.memory-delete-btn:disabled, .danger-btn:disabled { opacity: 0.45; cursor: default; }
+.memory-footer { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.memory-footer > span { flex: 1; color: var(--text-muted); font-size: 10px; }
+.danger-btn { padding: 7px 10px; }
+
+@media (max-width: 720px) {
+  .memory-settings-grid, .memory-item-controls { grid-template-columns: 1fr; }
+  .memory-item { flex-direction: column; }
+  .memory-item-actions { width: 100%; flex-direction: row; }
+}
 
 .theme-picker { position: relative; }
 .theme-menu { position: absolute; top: 100%; right: 0; margin-top: 6px; z-index: 100; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 6px; min-width: 150px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }

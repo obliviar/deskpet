@@ -20,6 +20,7 @@ export function createMemoryWriter(options: MemoryWriterOptions): AgentMemoryPor
   return {
     list: store.list,
     recall: store.recall,
+    recallAdaptive: store.recallAdaptive,
     remember,
     forget: store.forget,
     update: store.update,

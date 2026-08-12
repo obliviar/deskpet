@@ -68,6 +68,34 @@ describe('agent runtime memory safety', () => {
     expect(memory.unlinked).toEqual([])
     expect(session.getSessionMessages('s').map(message => message.content)).toEqual(['second', 'ok'])
   })
+
+  it('uses adaptive recall by default and fixed recall when memoryTopK is explicit', async () => {
+    const calls: string[] = []
+    const memory = createMemorySpy()
+    memory.port.recall = async (_query, _scope, topK) => {
+      calls.push(`fixed:${String(topK)}`)
+      return []
+    }
+    memory.port.recallAdaptive = async () => {
+      calls.push('adaptive')
+      return {
+        memories: [], retrievedMemoryIds: [], injectedMemoryIds: [],
+        candidateCount: 0, evaluatedCount: 0, batchesEvaluated: 0,
+        stopReason: 'no-candidates',
+      }
+    }
+    const runtime = createAgentRuntime({
+      persona: { systemPrompt: 'test', model: 'test' },
+      llm: createLlm([{ type: 'text-delta', text: 'ok' }]),
+      session: createSessionManager(10),
+      memory: memory.port,
+    })
+
+    await runtime.send('adaptive-session', 'first')
+    await runtime.send('fixed-session', 'second', { memoryTopK: 7 })
+
+    expect(calls).toEqual(['adaptive', 'fixed:7'])
+  })
 })
 
 function createLlm(events: StreamEvent[], observed: ChatMessage[][] = []): AgentLLMPort {

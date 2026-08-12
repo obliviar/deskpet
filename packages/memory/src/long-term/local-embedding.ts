@@ -5,6 +5,7 @@ const DEFAULT_DIMENSIONS = 384
 const CONCEPT_WEIGHT = 5
 
 const SEMANTIC_CONCEPT_PATTERNS: Array<[string, RegExp]> = [
+  ['preference.any', /偏好|喜欢|偏爱|爱听|爱看|不喜欢|讨厌|常喝|常吃|prefer|preference|like|dislike|favorite|favourite/i],
   ['profile.name', /姓名|名字|称呼|叫(?:我|你)|\bname\b|\bcall\b/i],
   ['profile.location', /所在地|住在|居住|常住|哪座城市|哪里住|based\s+in|live\s+in/i],
   ['relationship.pet', /宠物|毛孩子|猫咪|猫|狗狗|狗|\bdog\b|\bcat\b|\bpet\b/i],

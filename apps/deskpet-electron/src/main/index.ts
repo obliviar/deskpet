@@ -355,6 +355,21 @@ function memoryForRemoteRuntime() {
           : ['normal'],
       })
     },
+    async recallAdaptive(query: string, scope: Parameters<typeof localMemory.recall>[1]) {
+      if (memorySettings.remotePolicy === 'disabled') {
+        return {
+          memories: [], retrievedMemoryIds: [], injectedMemoryIds: [],
+          candidateCount: 0, evaluatedCount: 0, batchesEvaluated: 0,
+          stopReason: 'no-candidates' as const,
+        }
+      }
+      return localMemory.recallAdaptive!(query, scope, {
+        sharePolicies: ['allow-remote'],
+        sensitivities: memorySettings.remotePolicy === 'allow-private'
+          ? ['normal', 'private']
+          : ['normal'],
+      })
+    },
   }
 }
 

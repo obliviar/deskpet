@@ -52,6 +52,41 @@ export interface MemoryRecallOptions {
   asOf?: number
 }
 
+/** Local policy for one-pass candidate ranking followed by adaptive selection. */
+export interface AdaptiveMemoryRecallOptions extends MemoryRecallOptions {
+  /** Candidates inspected in the first quality-evaluation batch. Defaults to 4. */
+  initialBatchSize?: number
+  /** Candidates inspected by each continuation batch. Defaults to 4. */
+  continuationBatchSize?: number
+  /** Maximum ranked, de-duplicated candidates retained for evaluation. Defaults to 20. */
+  candidateLimit?: number
+  /** Hard upper bound for memories injected into the prompt. Defaults to 10. */
+  maxInjected?: number
+  /** Maximum number of evaluated batches, including the first. Defaults to 3. */
+  maxBatches?: number
+  /** Soft prompt budget measured in normalized memory-content characters. Defaults to 2400. */
+  maxCharacters?: number
+  /** Minimum accepted fraction in a batch before broad recall stops. Defaults to 0.15. */
+  minMarginalGain?: number
+}
+
+export type AdaptiveMemoryRecallStopReason = 'no-candidates' | 'coverage-satisfied'
+  | 'score-drop' | 'marginal-gain' | 'character-budget' | 'max-injected'
+  | 'max-batches' | 'candidates-exhausted'
+
+/** Result includes retrieval/injection separation for audit and unbiased usage accounting. */
+export interface AdaptiveMemoryRecallResult {
+  memories: MemoryFragment[]
+  /** Candidate IDs whose quality was evaluated, whether or not they were injected. */
+  retrievedMemoryIds: string[]
+  /** IDs actually injected into the model prompt and counted as accessed. */
+  injectedMemoryIds: string[]
+  candidateCount: number
+  evaluatedCount: number
+  batchesEvaluated: number
+  stopReason: AdaptiveMemoryRecallStopReason
+}
+
 /** Isolation boundary for long-term memories. */
 export interface MemoryScope {
   /** Stable owner identifier. Server callers must derive this from authentication. */
@@ -98,6 +133,12 @@ export interface AgentMemoryPort {
     topK?: number,
     options?: MemoryRecallOptions,
   ) => Promise<MemoryFragment[]>
+  /** Optional adaptive recall. Older memory adapters may omit it and use recall(). */
+  recallAdaptive?: (
+    query: string,
+    scope: MemoryScope,
+    options?: AdaptiveMemoryRecallOptions,
+  ) => Promise<AdaptiveMemoryRecallResult>
   /** Persist one already-sanitized fact. */
   remember: (content: string, scope: MemoryScope, metadata?: Record<string, unknown>) => Promise<void>
   /** Extract and persist durable facts from a completed conversation turn. */

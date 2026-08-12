@@ -3,6 +3,9 @@ export type { ContextMessage } from './types/context'
 export type { StreamEvent, StreamOptions } from './types/llm'
 export type { ToolDefinition, ToolResult, ToolHandler, ToolExecutionContext } from './types/tool'
 export type {
+  AdaptiveMemoryRecallOptions,
+  AdaptiveMemoryRecallResult,
+  AdaptiveMemoryRecallStopReason,
   MemoryCapture,
   MemoryFragment,
   MemoryOrigin,

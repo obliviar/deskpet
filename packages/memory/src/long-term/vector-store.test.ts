@@ -171,6 +171,153 @@ describe('persistent vector store', () => {
     expect(listed.find(item => item.content.startsWith('public'))?.accessCount).toBe(1)
   })
 
+  it('adaptively injects a narrow fact and counts only the selected memory', async () => {
+    const store = createVectorStore()
+    const scope = { ownerId: 'adaptive-narrow', agentId: 'deskpet' }
+    await store.remember('用户姓名/名字：小秦', scope, { kind: 'identity', importance: 1 })
+    await store.remember('用户当前项目：DeskPet', scope, { kind: 'project', importance: 1 })
+    await store.remember('用户喜欢的饮品：乌龙茶', scope, { kind: 'preference', importance: 1 })
+
+    const result = await store.recallAdaptive('我叫什么名字？', scope)
+    expect(result.memories).toHaveLength(1)
+    expect(result.memories[0]?.content).toContain('小秦')
+    expect(result.injectedMemoryIds).toEqual(result.memories.map(item => item.id))
+    expect(result.retrievedMemoryIds).toContain(result.memories[0]!.id)
+    expect(result.stopReason).toBe('coverage-satisfied')
+
+    const listed = await store.list(scope)
+    expect(listed.find(item => item.content.includes('小秦'))?.accessCount).toBe(1)
+    expect(listed.find(item => item.content.includes('DeskPet'))?.accessCount).toBe(0)
+    expect(listed.find(item => item.content.includes('乌龙茶'))?.accessCount).toBe(0)
+  })
+
+  it('adaptively expands beyond five memories for a broad preference summary', async () => {
+    const store = createVectorStore()
+    const scope = { ownerId: 'adaptive-broad', agentId: 'deskpet' }
+    const facts = [
+      '用户喜欢的饮品：乌龙茶',
+      '用户不喜欢的食物：香菜',
+      '用户界面偏好：深色主题',
+      '用户回答偏好：简洁中文',
+      '用户喜欢的书：三体',
+      '用户音乐偏好：爵士乐',
+      '用户工作时间偏好：晚上',
+      '用户喜欢的颜色：藏青',
+    ]
+    for (const [index, fact] of facts.entries())
+      await store.remember(fact, scope, { kind: `preference-${index}`, importance: 0.9 })
+
+    const result = await store.recallAdaptive('总结我的所有偏好', scope, {
+      initialBatchSize: 4,
+      continuationBatchSize: 4,
+      maxBatches: 3,
+      maxInjected: 10,
+    })
+    expect(result.memories.length).toBeGreaterThan(5)
+    expect(result.batchesEvaluated).toBeGreaterThan(1)
+    expect(result.injectedMemoryIds).toEqual(result.memories.map(item => item.id))
+    expect((await store.list(scope)).filter(item => item.accessCount === 1)).toHaveLength(result.memories.length)
+  })
+
+  it('ranks once even when adaptive selection evaluates multiple batches', async () => {
+    const embedder = vi.fn(async (text: string) => createTestVector(text))
+    const store = createVectorStore({ embedder, embeddingModel: 'adaptive-once', minScore: 0.1, minSemanticScore: 0.1 })
+    const scope = { ownerId: 'adaptive-once', agentId: 'deskpet' }
+    const facts = [
+      '用户喜欢饮品一', '用户喜欢饮品二', '用户喜欢饮品三', '用户喜欢饮品四',
+      '用户喜欢饮品五', '用户喜欢饮品六', '用户喜欢饮品七', '用户喜欢饮品八',
+    ]
+    for (const [index, fact] of facts.entries())
+      await store.remember(fact, scope, { kind: `adaptive-${index}` })
+    const callsAfterWrites = embedder.mock.calls.length
+
+    const result = await store.recallAdaptive('总结我的所有偏好', scope, {
+      initialBatchSize: 2,
+      continuationBatchSize: 2,
+      maxBatches: 4,
+    })
+
+    expect(result.batchesEvaluated).toBeGreaterThan(1)
+    expect(embedder.mock.calls.length - callsAfterWrites).toBe(1)
+  })
+
+  it('applies adaptive privacy filtering before evaluation and usage accounting', async () => {
+    const store = createVectorStore({
+      embeddingModel: 'adaptive-privacy',
+      minScore: 0.1,
+      minSemanticScore: 0.1,
+      embedder: sharedEmbedder,
+    })
+    const scope = { ownerId: 'adaptive-privacy', agentId: 'deskpet' }
+    await store.remember('private shared preference', scope, {
+      kind: 'private-preference', sensitivity: 'private', sharePolicy: 'local-only', importance: 1,
+    })
+    await store.remember('public shared preference', scope, {
+      kind: 'public-preference', sensitivity: 'normal', sharePolicy: 'allow-remote', importance: 1,
+    })
+
+    const result = await store.recallAdaptive('shared preference', scope, {
+      sharePolicies: ['allow-remote'], sensitivities: ['normal'],
+    })
+    expect(result.memories.map(item => item.content)).toEqual(['public shared preference'])
+    expect(result.retrievedMemoryIds).toEqual(result.injectedMemoryIds)
+    const listed = await store.list(scope)
+    expect(listed.find(item => item.content.startsWith('private'))?.accessCount).toBe(0)
+    expect(listed.find(item => item.content.startsWith('public'))?.accessCount).toBe(1)
+  })
+
+  it('injects nothing when adaptive recall has no relevant memory', async () => {
+    const store = createVectorStore({
+      minScore: 0.1,
+      minSemanticScore: 0.5,
+      minLexicalScore: 0.2,
+      embedder: relevanceEmbedder,
+    })
+    const scope = { ownerId: 'adaptive-none', agentId: 'deskpet' }
+    await store.remember('用户喜欢咖啡', scope)
+
+    const result = await store.recallAdaptive('量子纠缠如何定义', scope)
+    expect(result).toMatchObject({
+      memories: [], candidateCount: 0, evaluatedCount: 0,
+      batchesEvaluated: 0, stopReason: 'no-candidates',
+    })
+    expect((await store.list(scope))[0]?.accessCount).toBe(0)
+  })
+
+  it('can summarize broad personal memory without requiring a field keyword', async () => {
+    const store = createVectorStore()
+    const scope = { ownerId: 'adaptive-personal-summary', agentId: 'deskpet' }
+    await store.remember('用户姓名/名字：小秦', scope, { importance: 0.9 })
+    await store.remember('用户当前项目：DeskPet', scope, { importance: 0.8 })
+    await store.remember('用户喜欢乌龙茶', scope, { importance: 0.7 })
+
+    const broad = await store.recallAdaptive('总结你记得的关于我的信息', scope)
+    expect(broad.memories.length).toBeGreaterThan(1)
+
+    const unrelated = await store.recallAdaptive('总结这篇量子物理文章', scope)
+    expect(unrelated.memories).toEqual([])
+  })
+
+  it('can expand across historical versions for a broad change query', async () => {
+    const store = createVectorStore({ minScore: 0.1, minSemanticScore: 0.1 })
+    const scope = { ownerId: 'adaptive-history', agentId: 'deskpet' }
+    const projects = ['晨曦日历', '星云记账', 'DeskPet', '长期记忆研究', '移动端伴侣', '知识图谱']
+    for (const [index, project] of projects.entries()) {
+      await store.remember(`用户当前项目：${project}`, scope, {
+        memoryKey: 'project.current', cardinality: 'single', confidence: 0.95,
+        kind: 'project', validFrom: Date.parse(`${2020 + index}-01-01T00:00:00Z`),
+      })
+    }
+
+    const result = await store.recallAdaptive('总结过去几年我的项目变化', scope, {
+      temporalMode: 'historical', maxInjected: 10,
+    })
+    expect(result.memories.length).toBeGreaterThan(1)
+    expect(result.memories.some(item => item.status === 'superseded')).toBe(true)
+    expect(result.memories.some(item => item.status === 'active')).toBe(true)
+    expect(result.batchesEvaluated).toBeGreaterThan(1)
+  })
+
   it('deduplicates conservative semantic paraphrases', async () => {
     const store = createVectorStore({ storagePath: temporaryFile(), embedder: sharedEmbedder })
     const scope = { ownerId: 'local', agentId: 'deskpet' }
@@ -347,4 +494,11 @@ async function temporalEmbedder(text: string): Promise<number[]> {
   if (text.includes('上海') || text.includes('当前') || text.includes('现在'))
     return [0, 1, 0]
   return [0, 0, 1]
+}
+
+function createTestVector(text: string): number[] {
+  let hash = 0
+  for (const char of text)
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0
+  return [1, (hash % 17) / 17, (hash % 31) / 31]
 }

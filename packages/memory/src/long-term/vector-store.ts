@@ -1,4 +1,6 @@
 import type {
+  AdaptiveMemoryRecallOptions,
+  AdaptiveMemoryRecallResult,
   MemoryFragment,
   MemoryOrigin,
   MemoryRecallOptions,
@@ -19,6 +21,7 @@ import {
   sharesLocalSemanticConcept,
 } from './local-embedding'
 import { planTemporalQuery } from './temporal-query'
+import { isBroadPersonalMemoryQuery, selectAdaptiveRecall } from './adaptive-recall'
 
 export interface MemoryPersistence {
   load: () => string | undefined
@@ -91,6 +94,20 @@ interface SecondaryIndexes {
   activeByToken: Map<string, Set<string>>
 }
 
+interface RankedMemoryEntry {
+  item: IndexedMemory
+  score: number
+  semanticScore: number
+  lexicalScore: number
+  temporalScore: number
+}
+
+interface RankedMemoryPool {
+  entries: RankedMemoryEntry[]
+  changed: Map<string, IndexedMemory>
+  now: number
+}
+
 export function createVectorStore(options: VectorStoreOptions = {}) {
   const {
     apiKey,
@@ -128,6 +145,102 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     return result
   }
 
+  async function rankMemoryCandidates(
+    query: string,
+    scope: MemoryScope,
+    candidateLimit: number,
+    recallOptions?: MemoryRecallOptions,
+  ): Promise<RankedMemoryPool> {
+    const normalizedScope = normalizeScope(scope)
+    const changed = new Map(markExpired(index, normalizedScope, secondary).map(item => [item.id, item]))
+    const now = Date.now()
+    const temporalPlan = planTemporalQuery(query, recallOptions)
+    const candidates = index.filter(item => matchesScope(item.scope, normalizedScope)
+      && isTemporalCandidate(item, temporalPlan.mode, temporalPlan.asOf, now)
+      && isRecallAllowed(item, recallOptions))
+    if (candidates.length === 0 || !query.trim())
+      return { entries: [], changed, now }
+
+    for (const item of candidates) {
+      if (item.embeddingModel !== embeddingModel || item.embedding.length === 0) {
+        item.embedding = await embed(item.content)
+        item.embeddingModel = embeddingModel
+        item.updatedAt = Date.now()
+        changed.set(item.id, item)
+      }
+    }
+
+    const queryEmbedding = await embed(query)
+    const queryConcepts = embeddingModel === LOCAL_EMBEDDING_MODEL
+      ? new Set(localSemanticConcepts(query))
+      : undefined
+    const hasQueryConcepts = (queryConcepts?.size ?? 0) > 0
+    const broadPersonalQuery = isBroadPersonalMemoryQuery(query)
+    const queryStrongTokens = strongLexicalTokens(query)
+    const lexicalScores = bm25Scores(query, candidates.map(item => item.content))
+    const scored = candidates
+      .map((item, itemIndex) => {
+        const semantic = clampScore(cosineSimilarity(queryEmbedding, item.embedding))
+        const lexical = lexicalScores[itemIndex] ?? 0
+        const importance = clampScore(item.importance)
+        const recency = recencyScore(item, now)
+        const frequency = Math.min(1, Math.log1p(item.accessCount) / Math.log(21))
+        const temporal = temporalAlignment(item, temporalPlan.mode)
+        const score = clampScore(
+          semantic * 0.4
+          + lexical * 0.2
+          + importance * 0.14
+          + recency * 0.08
+          + frequency * 0.04
+          + temporal * 0.14,
+        )
+        const strongLexicalOverlap = hasStrongLexicalOverlap(queryStrongTokens, item.content)
+        const sharedConcept = hasQueryConcepts
+          ? sharesLocalSemanticConcept(item.content, queryConcepts!)
+          : false
+        const lexicalRelevant = lexical >= minLexicalScore
+          && strongLexicalOverlap
+          && (!hasQueryConcepts || sharedConcept)
+        const semanticRelevant = semantic >= minSemanticScore
+          && (embeddingModel !== LOCAL_EMBEDDING_MODEL
+            || sharedConcept
+            || (!hasQueryConcepts
+              && (strongLexicalOverlap || semantic >= Math.max(0.34, minSemanticScore))))
+        // A user can explicitly ask for a broad account of what the agent
+        // remembers without naming any one semantic field. Only this tightly
+        // scoped personal-memory intent may enter on quality priors alone.
+        const broadRelevant = broadPersonalQuery && !hasQueryConcepts
+        const relevant = lexicalRelevant || semanticRelevant || broadRelevant
+        return {
+          item,
+          score,
+          semanticScore: semantic,
+          lexicalScore: lexical,
+          temporalScore: temporal,
+          relevant,
+        }
+      })
+      .filter(entry => entry.relevant && entry.score >= minScore)
+      .sort((a, b) => b.score - a.score)
+
+    return {
+      entries: selectDiverse(scored, clampInteger(candidateLimit, 1, 100)),
+      changed,
+      now,
+    }
+  }
+
+  function commitRecallUsage(pool: RankedMemoryPool, selectedIds: ReadonlySet<string>): void {
+    for (const entry of pool.entries) {
+      if (!selectedIds.has(entry.item.id))
+        continue
+      entry.item.accessCount += 1
+      entry.item.lastAccessedAt = pool.now
+      pool.changed.set(entry.item.id, entry.item)
+    }
+    persistChanges(persistence, index, [...pool.changed.values()])
+  }
+
   return {
     async list(scope: MemoryScope, limit = 100): Promise<MemoryFragment[]> {
       const normalizedScope = normalizeScope(scope)
@@ -146,77 +259,42 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       topK = 5,
       recallOptions?: MemoryRecallOptions,
     ): Promise<MemoryFragment[]> {
-      const normalizedScope = normalizeScope(scope)
-      const changed = new Map(markExpired(index, normalizedScope, secondary).map(item => [item.id, item]))
-      const now = Date.now()
-      const temporalPlan = planTemporalQuery(query, recallOptions)
-      const candidates = index.filter(item => matchesScope(item.scope, normalizedScope)
-        && isTemporalCandidate(item, temporalPlan.mode, temporalPlan.asOf, now)
-        && isRecallAllowed(item, recallOptions))
-      if (candidates.length === 0 || !query.trim()) {
-        persistChanges(persistence, index, [...changed.values()])
-        return []
+      const pool = await rankMemoryCandidates(query, scope, clampInteger(topK, 1, 20), recallOptions)
+      const selectedIds = new Set(pool.entries.map(entry => entry.item.id))
+      commitRecallUsage(pool, selectedIds)
+      return pool.entries.map(({ item, score }) => toMemoryFragment(item, score))
+    },
+
+    async recallAdaptive(
+      query: string,
+      scope: MemoryScope,
+      recallOptions: AdaptiveMemoryRecallOptions = {},
+    ): Promise<AdaptiveMemoryRecallResult> {
+      const candidateLimit = clampInteger(recallOptions.candidateLimit ?? 20, 1, 100)
+      const pool = await rankMemoryCandidates(query, scope, candidateLimit, recallOptions)
+      const selection = selectAdaptiveRecall(
+        query,
+        pool.entries.map(entry => ({
+          memory: toMemoryFragment(entry.item, entry.score),
+          score: entry.score,
+          semanticScore: entry.semanticScore,
+          lexicalScore: entry.lexicalScore,
+        })),
+        recallOptions,
+      )
+      const selectedIds = new Set(selection.selectedMemoryIds)
+      commitRecallUsage(pool, selectedIds)
+      return {
+        memories: pool.entries
+          .filter(entry => selectedIds.has(entry.item.id))
+          .map(entry => toMemoryFragment(entry.item, entry.score)),
+        retrievedMemoryIds: selection.evaluatedMemoryIds,
+        injectedMemoryIds: selection.selectedMemoryIds,
+        candidateCount: pool.entries.length,
+        evaluatedCount: selection.evaluatedMemoryIds.length,
+        batchesEvaluated: selection.batchesEvaluated,
+        stopReason: selection.stopReason,
       }
-
-      for (const item of candidates) {
-        if (item.embeddingModel !== embeddingModel || item.embedding.length === 0) {
-          item.embedding = await embed(item.content)
-          item.embeddingModel = embeddingModel
-          item.updatedAt = Date.now()
-          changed.set(item.id, item)
-        }
-      }
-
-      const queryEmbedding = await embed(query)
-      const queryConcepts = embeddingModel === LOCAL_EMBEDDING_MODEL
-        ? new Set(localSemanticConcepts(query))
-        : undefined
-      const hasQueryConcepts = (queryConcepts?.size ?? 0) > 0
-      const queryStrongTokens = strongLexicalTokens(query)
-      const lexicalScores = bm25Scores(query, candidates.map(item => item.content))
-      const scored = candidates
-        .map((item, itemIndex) => {
-          const semantic = clampScore(cosineSimilarity(queryEmbedding, item.embedding))
-          const lexical = lexicalScores[itemIndex] ?? 0
-          const importance = clampScore(item.importance)
-          const recency = recencyScore(item, now)
-          const frequency = Math.min(1, Math.log1p(item.accessCount) / Math.log(21))
-          const temporal = temporalAlignment(item, temporalPlan.mode)
-          const score = clampScore(
-            semantic * 0.4
-            + lexical * 0.2
-            + importance * 0.14
-            + recency * 0.08
-            + frequency * 0.04
-            + temporal * 0.14,
-          )
-          const strongLexicalOverlap = hasStrongLexicalOverlap(queryStrongTokens, item.content)
-          const sharedConcept = hasQueryConcepts
-            ? sharesLocalSemanticConcept(item.content, queryConcepts!)
-            : false
-          const lexicalRelevant = lexical >= minLexicalScore
-            && strongLexicalOverlap
-            && (!hasQueryConcepts || sharedConcept)
-          const semanticRelevant = semantic >= minSemanticScore
-            && (embeddingModel !== LOCAL_EMBEDDING_MODEL
-              || sharedConcept
-              || (!hasQueryConcepts
-                && (strongLexicalOverlap || semantic >= Math.max(0.34, minSemanticScore))))
-          const relevant = lexicalRelevant || semanticRelevant
-          return { item, score, relevant }
-        })
-        .filter(entry => entry.relevant && entry.score >= minScore)
-        .sort((a, b) => b.score - a.score)
-
-      const selected = selectDiverse(scored, clampInteger(topK, 1, 20))
-      for (const { item } of selected) {
-        item.accessCount += 1
-        item.lastAccessedAt = now
-        changed.set(item.id, item)
-      }
-      persistChanges(persistence, index, [...changed.values()])
-
-      return selected.map(({ item, score }) => toMemoryFragment(item, score))
     },
 
     async remember(content: string, scope: MemoryScope, metadata?: Record<string, unknown>): Promise<void> {
@@ -508,8 +586,8 @@ function toMemoryFragment(item: IndexedMemory, score?: number): MemoryFragment {
   }
 }
 
-function selectDiverse(scored: Array<{ item: IndexedMemory; score: number }>, topK: number) {
-  const selected: Array<{ item: IndexedMemory; score: number }> = []
+function selectDiverse<T extends { item: IndexedMemory; score: number }>(scored: T[], topK: number): T[] {
+  const selected: T[] = []
   for (const entry of scored) {
     if (selected.some(current => jaccard(tokenize(entry.item.content), tokenize(current.item.content)) > 0.9))
       continue

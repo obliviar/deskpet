@@ -50,7 +50,7 @@ export interface AgentSendOptions {
   attachments?: { type: 'image'; data: string; mimeType: string }[]
   /** Transport input metadata. */
   input?: { type: 'text' | 'voice' | 'image' }
-  /** How many memories to recall for this turn. */
+  /** Fixed legacy recall size. Omit it to use adaptive batched recall. */
   memoryTopK?: number
 }
 
@@ -207,7 +207,9 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
     let memories
     if (deps.memory) {
       try {
-        memories = await deps.memory.recall(userMessage, memoryScope, options?.memoryTopK ?? 5)
+        memories = options?.memoryTopK !== undefined || !deps.memory.recallAdaptive
+          ? await deps.memory.recall(userMessage, memoryScope, options?.memoryTopK ?? 5)
+          : (await deps.memory.recallAdaptive(userMessage, memoryScope)).memories
       }
       catch (err) {
         console.error('[deskpet] memory recall failed:', err)

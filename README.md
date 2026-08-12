@@ -53,7 +53,7 @@ pnpm dev:electron
 
 DeskPet 同时保留短期会话和长期记忆：
 
-> V4 第一阶段数据底座已经加入源码，但尚未接管桌面端运行。V3 仍是当前正式读写格式；V4 目前提供独立的 Episode、Candidate、Fact、EvidenceLink、FactVersion、RetrievalEvent 模型、事务 Repository、独立加密快照和只读 V3→V4 迁移。自动 V3 事实在缺少原始消息正文时会进入 V4 `quarantined`，不会被误认为已验证。完成双写和质量门槛前，程序不会自动切换或覆盖现有 `memories.enc`。
+> V4 第二阶段安全双写已经启用，但尚未接管召回。V3 仍是唯一正式读写与回滚来源；每次 V3 成功提交后，V4 旁路同步 Episode、Candidate、Fact、EvidenceLink、FactVersion 和 RetrievalEvent。启动时用恢复了增量日志的完整 V3 视图对账，未变化的快照按 SHA-256 水位跳过。V4 失败只保留待重试队列并记录诊断，不回滚或关闭 V3。自动 V3 事实在缺少原始用户消息时仍为 `quarantined`；只有捕获到安全的用户原话或用户手动添加后才具有直接证据。完成质量门槛与灰度验证前，程序不会让 V4 参与回答。
 
 | 类型 | 保存内容 | 用途 | 文件 |
 | --- | --- | --- | --- |
@@ -87,6 +87,11 @@ flowchart TD
     L --> N
     M --> N
     N --> O[增量写入加密日志并周期生成快照]
+    O --> P[V3 成功提交后旁路写入 V4]
+    A --> Q[安全用户原话写入 V4 Episode]
+    Q --> P
+    F3 --> R[记录候选与实际注入的 RetrievalEvent]
+    R --> P
 ```
 
 召回或写入失败不会中断主对话。初始化或解密失败时，程序不会创建空文件覆盖旧数据，而是关闭长期记忆并在管理窗口显示错误。
@@ -98,6 +103,35 @@ flowchart TD
 默认策略为候选池最多 20 条、每批 4 条、最多 3 批、最多注入 10 条，并使用约 2400 个规范化正文字符的软预算。停止依据包括目标字段覆盖、排名分数骤降、后续批次信息增益、重复度、注入数量和正文预算。隐私与时间过滤发生在候选排名之前；只有最终进入提示词的记忆会增加召回次数，被评估但未注入的候选不会影响未来排名。
 
 Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时使用旧的固定数量行为，未传入时使用自适应召回。
+
+### V4 安全双写与回滚边界
+
+- V3 持久化成功后才通知 V4；V4 回调、事务或加密文件失败不会让 V3 操作失败。
+- V4 将新增、重复合并、替代、冲突、来源解除、过期、手动更新、恢复、删除和清空保存为事实状态及版本历史。
+- 删除在 V4 中使用 `deleted` 墓碑并停用证据，不再参与未来召回，同时保留审计链。
+- 捕获到原始用户消息时，候选事实会连接到原生 Episode 和直接 Evidence；整段消息必须通过密钥/指令安全检查，并独立执行隐私推断。
+- 自适应召回分别记录已评估事实与实际注入事实，查询正文只保存 SHA-256 哈希。
+- 启动对账使用线性映射索引；5000 条模拟 V3 记录首次对账约 393 ms，未变化重启约 46 ms（测试机器结果，不是性能保证）。
+- 当前 V4 仍是影子写入与审计层，聊天提示词继续只使用经过验证的 V3 召回结果。
+
+### 长期优化计划表
+
+状态只在实现完成并通过对应测试后更新：
+
+| 状态 | 阶段 | 优化成果 / 验收门槛 |
+| --- | --- | --- |
+| ✅ | 基线与 V3 基础能力 | 加密、增量日志、来源同步、生命周期、冲突、隐私和记忆管理已上线 |
+| ✅ | V4 第一阶段数据底座 | 独立模型、事务 Repository、严格校验、加密快照和只读 V3→V4 迁移已完成 |
+| ✅ | 自适应分批召回 | 动态批次、覆盖/增益/分数停止、数量和字符预算已上线 |
+| ✅ | V4 第二阶段安全双写 | 提交后双写、原始证据、版本历史、删除墓碑、召回事件、启动对账和故障隔离已完成；V4 尚不参与召回 |
+| ⬜ | 双写差异审计 | 逐操作比较 V3/V4 语义状态，目标一致率至少 99.9%，异常可重放 |
+| ⬜ | 高质量写入门控 | 候选持久价值、证据完整度、歧义与验证评分；低质量候选不进入活动事实 |
+| ⬜ | 时间与冲突演化 | 完整处理补充、纠正、替代、冲突和历史时间查询 |
+| ⬜ | 分层巩固与遗忘 | 日/周/月摘要、稳定事实、事件层和可恢复冷归档 |
+| ⬜ | 大规模多层检索 | 热/冷索引、向量+BM25+时间+字段检索及精排 |
+| ⬜ | 反馈学习和可解释管理 | 使用 RetrievalEvent 改进排序，并在界面显示来源、版本、可信度与召回原因 |
+| ⬜ | 长周期可靠性与隐私 | 备份恢复、文件锁、故障注入、隐私泄漏评测和一年尺度模拟 |
+| ⬜ | V4 灰度切换与一年验收 | 质量门槛达标后小比例召回，可立即回退 V3，最终完成一年记忆验收 |
 
 ### 事实提取
 
@@ -192,7 +226,7 @@ Windows 打包版主要数据位于：
 ├─ memories.enc.journal  # 独立认证加密的增量操作日志
 ├─ memories.enc.pre-v3.backup # 首次 V3 迁移前的加密备份
 ├─ memory-key.json       # DPAPI 保护后的随机主密钥
-├─ memory-v4.enc         # 第一阶段只读迁移生成的 V4 加密影子快照
+├─ memory-v4.enc         # 第二阶段双写、证据与召回审计的 V4 加密影子快照
 ├─ memory-v4-key.json    # V4 独立的 DPAPI 保护密钥
 ├─ memory-settings.json  # 提取、语义、OCR 和分享设置
 ├─ sessions.enc          # AES-256-GCM 加密短期聊天历史
@@ -259,6 +293,7 @@ deskpet/
 - `packages/memory/src/long-term/local-embedding.ts`：本地哈希向量
 - `packages/memory/src/long-term/vector-store.ts`：混合排序、冲突、生命周期与迁移
 - `packages/memory/src/long-term/encrypted-persistence.ts`：AES-256-GCM 文件适配器
+- `packages/memory/src/v4/dual-write/v4-shadow-writer.ts`：V3 提交后双写、证据连接、版本和召回审计
 - `packages/core/src/runtime/agent-runtime.ts`：召回、附件和来源 ID
 - `apps/deskpet-electron/src/main/semantic-memory.ts`：本地中文语义模型
 - `apps/deskpet-electron/src/main/image-memory.ts`：显式图片 OCR
@@ -281,7 +316,7 @@ pnpm --filter @deskpet/memory test
 pnpm --filter @deskpet/electron exec tsc --noEmit -p tsconfig.node.json
 pnpm --filter @deskpet/electron exec vue-tsc --noEmit -p tsconfig.web.json
 
-# Electron 记忆冷迁移、幂等、损坏降级与渲染启动烟雾测试
+# Electron 记忆冷迁移、双写对账、重启保留、损坏降级与渲染启动烟雾测试
 pnpm --filter @deskpet/electron test:smoke
 
 # 构建和生成 Windows ZIP
@@ -297,5 +332,6 @@ pnpm --filter @deskpet/electron package
 - 本地语义模型和 OCR 语言数据需要首次联网下载，未内置到安装 ZIP。
 - 短期会话与长期记忆均已加密；DPAPI 密钥与数据文件必须一起备份。
 - 当前桌面端固定为一个本地用户和一个 Agent 作用域。
+- V4 目前只做影子双写和审计，尚未承担聊天召回；高质量写入门控和差异审计仍是下一阶段。
 - 尚无多进程文件锁、正文原地编辑和分层的日/周/月会话摘要。
 - OCR 只保留可识别文字，无法完整理解没有文字的图片语义。

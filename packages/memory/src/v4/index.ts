@@ -18,3 +18,15 @@ export type {
   V3MigrationCommitResult,
   V3ToV4MigrationOptions,
 } from './migration/v3-to-v4'
+export {
+  adaptiveResultToShadowRetrieval,
+  createV4ShadowWriter,
+} from './dual-write/v4-shadow-writer'
+export type {
+  V4CapturedMemory,
+  V4ShadowCapture,
+  V4ShadowReconciliationResult,
+  V4ShadowRetrieval,
+  V4ShadowWriter,
+  V4ShadowWriterOptions,
+} from './dual-write/v4-shadow-writer'

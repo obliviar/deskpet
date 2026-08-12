@@ -15,7 +15,7 @@ const SHARE_POLICIES = ['allow-remote', 'local-only', 'ask'] as const
 const SENSITIVITIES = ['normal', 'private', 'secret'] as const
 const CARDINALITIES = ['single', 'multiple', 'set'] as const
 const POLARITIES = ['positive', 'negative', 'unknown'] as const
-const WRITE_ACTIONS = ['ADD', 'MERGE_EVIDENCE', 'REFINE', 'SUPERSEDE', 'CONFLICT', 'NOOP', 'QUARANTINE'] as const
+const WRITE_ACTIONS = ['ADD', 'MERGE_EVIDENCE', 'REFINE', 'SUPERSEDE', 'CONFLICT', 'NOOP', 'QUARANTINE', 'DELETE', 'RESTORE'] as const
 const CANDIDATE_STATUSES = ['pending', 'accepted', 'rejected', 'quarantined'] as const
 const FACT_STATUSES = ['active', 'superseded', 'conflicted', 'quarantined', 'expired', 'orphaned', 'archived', 'deleted'] as const
 const VERIFICATION_STATES = ['verified', 'pending', 'legacy-unverified', 'rejected'] as const
@@ -43,6 +43,15 @@ export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV
   const retrievalEvents = requireArray(value.retrievalEvents, 'retrievalEvents')
   const manifests = requireArray(value.migrationManifests, 'migrationManifests')
   const legacyImports = requireArray(value.legacyImports, 'legacyImports')
+  if (value.dualWriteState !== undefined) {
+    const dualWrite = requireRecord(value.dualWriteState, 'dualWriteState')
+    const sourceHash = requireString(dualWrite.sourcePayloadSha256, 'dualWriteState.sourcePayloadSha256')
+    if (!/^[a-f0-9]{64}$/u.test(sourceHash))
+      throw new Error('Memory V4 dual-write state has an invalid source hash')
+    requireNonNegativeInteger(dualWrite.sourceItemCount, 'dualWriteState.sourceItemCount')
+    requireTimestamp(dualWrite.reconciledAt, 'dualWriteState.reconciledAt')
+    requireString(dualWrite.writerVersion, 'dualWriteState.writerVersion')
+  }
 
   const episodeIds = uniqueIds(episodes, 'episode')
   uniqueIds(candidates, 'candidate')

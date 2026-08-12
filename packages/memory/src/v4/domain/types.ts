@@ -41,7 +41,7 @@ export type CandidateStatus = 'pending' | 'accepted' | 'rejected' | 'quarantined
 export type MemoryCardinalityV4 = 'single' | 'multiple' | 'set'
 export type MemoryPolarityV4 = 'positive' | 'negative' | 'unknown'
 export type MemoryWriteActionV4 = 'ADD' | 'MERGE_EVIDENCE' | 'REFINE' | 'SUPERSEDE'
-  | 'CONFLICT' | 'NOOP' | 'QUARANTINE'
+  | 'CONFLICT' | 'NOOP' | 'QUARANTINE' | 'DELETE' | 'RESTORE'
 
 export interface MemoryCandidateV4 {
   id: string
@@ -179,6 +179,13 @@ export interface MemoryMigrationManifestV4 {
   warnings: string[]
 }
 
+export interface MemoryV4DualWriteState {
+  sourcePayloadSha256: string
+  sourceItemCount: number
+  reconciledAt: number
+  writerVersion: string
+}
+
 export interface MemoryV4Snapshot {
   schemaVersion: typeof MEMORY_V4_SCHEMA_VERSION
   revision: number
@@ -192,4 +199,6 @@ export interface MemoryV4Snapshot {
   retrievalEvents: RetrievalEventV4[]
   migrationManifests: MemoryMigrationManifestV4[]
   legacyImports: LegacyV3ImportRecord[]
+  /** Last complete V3 source view reconciled into the stage-two shadow. */
+  dualWriteState?: MemoryV4DualWriteState
 }

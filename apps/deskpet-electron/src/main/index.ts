@@ -11,6 +11,7 @@ import {
   createMemoryV4Repository,
   createMemoryWriter,
   createSmartMemoryExtractor,
+  createV4ShadowWriter,
   createVectorStore,
   extractMemoryCandidates,
   inferMemoryPrivacy,
@@ -18,7 +19,7 @@ import {
   LOCAL_EMBEDDING_MODEL,
   migrateV3SourceIntoV4,
 } from '@deskpet/memory'
-import type { MemoryCandidate, MemoryExtractor } from '@deskpet/memory'
+import type { MemoryCandidate, MemoryExtractor, V4ShadowWriter } from '@deskpet/memory'
 import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '@deskpet/tools'
 
 import { createPersistence } from './persist'
@@ -228,6 +229,9 @@ let memorySettings = normalizeMemorySettings(persist.loadJson<Partial<MemorySett
 let memory: ReturnType<typeof createMemoryWriter> | undefined
 let memoryInitializationError = ''
 let memoryLegacyMigrated = false
+let memoryV4Shadow: V4ShadowWriter | undefined
+let memoryV4Error = ''
+let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
 const localMemoryScope = { ownerId: 'local-user', agentId: 'deskpet' }
 const memoryStoragePath = join(userDataDir, 'memories.enc')
 const memoryKeyPath = join(userDataDir, 'memory-key.json')
@@ -286,9 +290,18 @@ function createConfiguredMemoryExtractor(): MemoryExtractor {
 }
 
 function initializeMemory(): void {
+  try {
+    memoryV4Shadow?.flush()
+  }
+  catch (error) {
+    writeBootLog(`Memory V4 shadow flush before reinitialize failed: ${errorMessage(error)}`)
+  }
   memory = undefined
+  memoryV4Shadow = undefined
   memoryInitializationError = ''
   memoryLegacyMigrated = false
+  memoryV4Error = ''
+  memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
   if (!config.memoryEnabled)
     return
   try {
@@ -308,8 +321,18 @@ function initializeMemory(): void {
         ? `${SEMANTIC_MEMORY_MODEL}@${SEMANTIC_MEMORY_REVISION}`
         : LOCAL_EMBEDDING_MODEL,
       ...(semanticActive ? { embedder: semanticMemory.embed } : {}),
+      onCommittedChange: commit => memoryV4Shadow?.enqueueCommit(commit),
+      onCommitObserverError: error => writeBootLog(`Memory V4 commit enqueue failed: ${errorMessage(error)}`),
     })
-    memory = createMemoryWriter({ store, extractor: createConfiguredMemoryExtractor() })
+    memory = createMemoryWriter({
+      store,
+      extractor: createConfiguredMemoryExtractor(),
+      onCaptured: (capture) => {
+        memoryV4Shadow?.enqueueCapture(capture)
+        memoryV4Shadow?.flush()
+      },
+      onCaptureObserverError: error => writeBootLog(`Memory V4 capture enqueue failed: ${errorMessage(error)}`),
+    })
     memoryLegacyMigrated = persistence.wasLegacyMigrated()
     writeBootLog(`long-term memory initialized (${semanticActive ? 'semantic' : 'local-hash'})`)
     try {
@@ -320,23 +343,55 @@ function initializeMemory(): void {
         unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
       })
       const v4Repository = createMemoryV4Repository({ persistence: v4Persistence })
-      const migration = migrateV3SourceIntoV4(
-        { load: persistence.loadReadOnly, storagePath: persistence.encryptedPath },
-        v4Repository,
-        { refreshMigrationOnlyTarget: true },
-      )
-      writeBootLog(`Memory V4 shadow ${migration.migrated ? 'migrated' : 'verified'}: ${migration.factCount} facts, ${migration.warningCount} warnings`)
+      const snapshot = v4Repository.snapshot()
+      if (isStageOneV4Shadow(snapshot)) {
+        const migration = migrateV3SourceIntoV4(
+          { load: persistence.loadReadOnly, storagePath: persistence.encryptedPath },
+          v4Repository,
+          { refreshMigrationOnlyTarget: true },
+        )
+        writeBootLog(`Memory V4 shadow ${migration.migrated ? 'migrated' : 'verified'}: ${migration.factCount} facts, ${migration.warningCount} warnings`)
+      }
+      memoryV4Shadow = createV4ShadowWriter({
+        repository: v4Repository,
+        onError: (error) => {
+          memoryV4Error = errorMessage(error)
+          writeBootLog(`Memory V4 shadow async flush failed: ${memoryV4Error}`)
+        },
+      })
+      const recoveredV3 = persistence.loadReadOnly()
+      if (recoveredV3) {
+        memoryV4Reconciliation = memoryV4Shadow.reconcileV3Payload(recoveredV3)
+        writeBootLog(`Memory V4 dual-write ready: ${memoryV4Reconciliation.mirroredCount}/${memoryV4Reconciliation.sourceCount} facts reconciled, ${memoryV4Reconciliation.deletedCount} tombstoned`)
+      }
     }
     catch (error) {
-      // V4 remains a shadow copy in stage one. Its failure must never disable
+      // V4 remains a shadow copy in stage two. Its failure must never disable
       // the verified V3 runtime or overwrite the V3 source.
-      writeBootLog(`Memory V4 shadow migration failed: ${errorMessage(error)}`)
+      memoryV4Shadow = undefined
+      memoryV4Error = errorMessage(error)
+      writeBootLog(`Memory V4 shadow initialization failed: ${memoryV4Error}`)
     }
   }
   catch (error) {
     memoryInitializationError = errorMessage(error)
     writeBootLog(`long-term memory disabled after initialization error: ${memoryInitializationError}`)
   }
+}
+
+function isStageOneV4Shadow(snapshot: ReturnType<ReturnType<typeof createMemoryV4Repository>['snapshot']>): boolean {
+  const empty = snapshot.dualWriteState === undefined
+    && snapshot.facts.length === 0
+    && snapshot.episodes.length === 0
+    && snapshot.migrationManifests.length === 0
+  const migrationOnly = snapshot.dualWriteState === undefined
+    && snapshot.candidates.length === 0
+    && snapshot.retrievalEvents.length === 0
+    && snapshot.migrationManifests.length <= 1
+    && snapshot.facts.length === snapshot.legacyImports.length
+    && snapshot.facts.every(fact => fact.extractorVersion === 'v3-import')
+    && snapshot.episodes.every(episode => episode.provenance !== 'native-v4')
+  return empty || migrationOnly
 }
 
 function memoryForRemoteRuntime() {
@@ -348,12 +403,21 @@ function memoryForRemoteRuntime() {
     async recall(query: string, scope: Parameters<typeof localMemory.recall>[1], topK = 5) {
       if (memorySettings.remotePolicy === 'disabled')
         return []
-      return localMemory.recall(query, scope, topK, {
+      const recalled = await localMemory.recall(query, scope, topK, {
         sharePolicies: ['allow-remote'],
         sensitivities: memorySettings.remotePolicy === 'allow-private'
           ? ['normal', 'private']
           : ['normal'],
       })
+      memoryV4Shadow?.enqueueRetrieval({
+        query,
+        scope,
+        retrievedMemoryIds: recalled.map(item => item.id),
+        injectedMemoryIds: recalled.map(item => item.id),
+        queryType: 'fixed',
+        answerModel: apiConfig.model,
+      })
+      return recalled
     },
     async recallAdaptive(query: string, scope: Parameters<typeof localMemory.recall>[1]) {
       if (memorySettings.remotePolicy === 'disabled') {
@@ -363,12 +427,21 @@ function memoryForRemoteRuntime() {
           stopReason: 'no-candidates' as const,
         }
       }
-      return localMemory.recallAdaptive!(query, scope, {
+      const recalled = await localMemory.recallAdaptive!(query, scope, {
         sharePolicies: ['allow-remote'],
         sensitivities: memorySettings.remotePolicy === 'allow-private'
           ? ['normal', 'private']
           : ['normal'],
       })
+      memoryV4Shadow?.enqueueRetrieval({
+        query,
+        scope,
+        retrievedMemoryIds: recalled.retrievedMemoryIds,
+        injectedMemoryIds: recalled.injectedMemoryIds,
+        queryType: 'adaptive',
+        answerModel: apiConfig.model,
+      })
+      return recalled
     },
   }
 }
@@ -523,6 +596,13 @@ function setupIPC() {
     encrypted: !!memory,
     error: memoryInitializationError,
     legacyMigrated: memoryLegacyMigrated,
+    v4: {
+      enabled: !!memoryV4Shadow,
+      storagePath: memoryV4StoragePath,
+      pendingWrites: memoryV4Shadow?.pendingCount() ?? 0,
+      reconciliation: memoryV4Reconciliation,
+      error: memoryV4Error,
+    },
     settings: memorySettings,
     semantic: {
       installed: semanticMemory.isInstalled(),
@@ -541,6 +621,13 @@ function setupIPC() {
     storagePath: memoryStoragePath,
     encrypted: !!memory,
     error: memoryInitializationError,
+    v4: {
+      enabled: !!memoryV4Shadow,
+      storagePath: memoryV4StoragePath,
+      pendingWrites: memoryV4Shadow?.pendingCount() ?? 0,
+      reconciliation: memoryV4Reconciliation,
+      error: memoryV4Error,
+    },
     settings: memorySettings,
     semantic: {
       installed: semanticMemory.isInstalled(),
@@ -721,6 +808,12 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  try {
+    memoryV4Shadow?.flush()
+  }
+  catch (error) {
+    writeBootLog(`Memory V4 shadow final flush failed: ${errorMessage(error)}`)
+  }
   saveSessions()
   persist.saveAllImmediately()
 })

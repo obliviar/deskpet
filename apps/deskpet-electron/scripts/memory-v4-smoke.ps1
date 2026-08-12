@@ -81,6 +81,9 @@ try {
   if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow migrated: 2 facts, 1 warnings' -Quiet)) {
     throw 'The first launch did not migrate two V3 facts into the V4 shadow.'
   }
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 dual-write ready: 2/2 facts reconciled, 0 tombstoned' -Quiet)) {
+    throw 'The first launch did not reconcile the migrated facts into the V4 dual-write shadow.'
+  }
   if (Test-Path -LiteralPath (Join-Path $dataPath 'memories.json')) {
     throw 'The verified V3 encryption migration left the legacy plaintext file behind.'
   }
@@ -91,8 +94,8 @@ try {
   }
 
   Invoke-SmokeLaunch
-  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow verified: 2 facts, 1 warnings' -Quiet)) {
-    throw 'The second launch did not verify the existing idempotent V4 shadow.'
+  if ((Select-String -Path $logPath -Pattern 'Memory V4 dual-write ready: 2/2 facts reconciled, 0 tombstoned').Count -ne 2) {
+    throw 'The second launch did not preserve and idempotently reconcile the existing V4 dual-write shadow.'
   }
 
   $v3Path = Join-Path $dataPath 'memories.enc'
@@ -103,14 +106,14 @@ try {
   if ($v3HashBefore -ne $v3HashAfter) {
     throw 'V3 changed while the intentionally damaged V4 shadow was rejected.'
   }
-  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow migration failed' -Quiet)) {
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow initialization failed' -Quiet)) {
     throw 'The damaged V4 shadow did not enter the expected non-fatal fallback path.'
   }
   if ((Select-String -Path $logPath -Pattern 'renderer finished loading').Count -ne 3) {
     throw 'The Electron renderer did not finish loading on all three launches.'
   }
 
-  Write-Output 'Memory V4 Electron smoke test passed: migration, idempotence, encrypted artifacts, renderer startup, and V3-safe V4 failure fallback.'
+  Write-Output 'Memory V4 Electron smoke test passed: migration, dual-write reconciliation, restart preservation, encrypted artifacts, renderer startup, and V3-safe V4 failure fallback.'
 }
 finally {
   Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_MEMORY -ErrorAction SilentlyContinue

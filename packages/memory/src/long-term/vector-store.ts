@@ -50,11 +50,21 @@ export interface VectorStoreOptions {
   minLexicalScore?: number
   maxMemories?: number
   embedder?: (text: string) => Promise<number[]>
+  /**
+   * Optional post-commit observer used by additive shadow stores. It runs only
+   * after the V3 persistence operation succeeds. Observer failures are
+   * isolated and never roll back or reject the working V3 operation.
+   */
+  onCommittedChange?: (commit: V3MemoryCommit) => void
+  onCommitObserverError?: (error: unknown, commit: V3MemoryCommit) => void
 }
 
 type MemoryCardinality = 'single' | 'multiple'
 
-interface IndexedMemory extends MemoryFragment {
+export type V3MemoryCommitReason = 'recall' | 'expiry' | 'remember' | 'forget'
+  | 'update' | 'restore' | 'unlink-sources' | 'clear'
+
+export interface V3MemoryRecord extends MemoryFragment {
   status: MemoryStatus
   origin: MemoryOrigin
   importance: number
@@ -75,6 +85,16 @@ interface IndexedMemory extends MemoryFragment {
   createdAt: number
   updatedAt: number
 }
+
+export interface V3MemoryCommit {
+  reason: V3MemoryCommitReason
+  /** Detached JSON copies matching the records durably written to V3. */
+  upserts: V3MemoryRecord[]
+  deletedIds: string[]
+  committedAt: number
+}
+
+type IndexedMemory = V3MemoryRecord
 
 interface PersistedIndexV3 {
   version: 3
@@ -119,6 +139,8 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     minLexicalScore = 0.08,
     maxMemories = 20_000,
     embedder,
+    onCommittedChange,
+    onCommitObserverError,
   } = options
 
   const persistence = options.persistence ?? createFilePersistence(storagePath)
@@ -238,14 +260,30 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       entry.item.lastAccessedAt = pool.now
       pool.changed.set(entry.item.id, entry.item)
     }
-    persistChanges(persistence, index, [...pool.changed.values()])
+    persistChanges(
+      persistence,
+      index,
+      [...pool.changed.values()],
+      [],
+      'recall',
+      onCommittedChange,
+      onCommitObserverError,
+    )
   }
 
   return {
     async list(scope: MemoryScope, limit = 100): Promise<MemoryFragment[]> {
       const normalizedScope = normalizeScope(scope)
       const expired = markExpired(index, normalizedScope, secondary)
-      persistChanges(persistence, index, expired)
+      persistChanges(
+        persistence,
+        index,
+        expired,
+        [],
+        'expiry',
+        onCommittedChange,
+        onCommitObserverError,
+      )
       return index
         .filter(item => matchesScope(item.scope, normalizedScope))
         .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -297,10 +335,14 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       }
     },
 
-    async remember(content: string, scope: MemoryScope, metadata?: Record<string, unknown>): Promise<void> {
+    async remember(
+      content: string,
+      scope: MemoryScope,
+      metadata?: Record<string, unknown>,
+    ): Promise<V3MemoryRecord | undefined> {
       const normalizedContent = normalizeContent(content)
       if (!normalizedContent)
-        return
+        return undefined
       const normalizedScope = normalizeScope(scope)
       const now = Date.now()
       const memoryKey = optionalString(metadata?.memoryKey)
@@ -380,8 +422,16 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         }
         duplicate.updatedAt = now
         addActiveIndexes(secondary, duplicate)
-        persistChanges(persistence, index, [...changedConflicts, duplicate])
-        return
+        persistChanges(
+          persistence,
+          index,
+          [...changedConflicts, duplicate],
+          [],
+          'remember',
+          onCommittedChange,
+          onCommitObserverError,
+        )
+        return cloneCommittedRecords([duplicate])[0]
       }
 
       embedding ??= await embed(normalizedContent)
@@ -414,7 +464,16 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       const pruned = pruneScope(index, normalizedScope, maxMemories)
       for (const item of pruned)
         removeMemoryIndexes(secondary, item)
-      persistChanges(persistence, index, [...changedConflicts, newItem], pruned.map(item => item.id))
+      persistChanges(
+        persistence,
+        index,
+        [...changedConflicts, newItem],
+        pruned.map(item => item.id),
+        'remember',
+        onCommittedChange,
+        onCommitObserverError,
+      )
+      return cloneCommittedRecords([newItem])[0]
     },
 
     async forget(id: string, scope: MemoryScope): Promise<void> {
@@ -423,7 +482,15 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       if (itemIndex >= 0) {
         removeMemoryIndexes(secondary, index[itemIndex]!)
         index.splice(itemIndex, 1)
-        persistChanges(persistence, index, [], [id])
+        persistChanges(
+          persistence,
+          index,
+          [],
+          [id],
+          'forget',
+          onCommittedChange,
+          onCommitObserverError,
+        )
       }
     },
 
@@ -457,7 +524,15 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       }
       item.updatedAt = now
       addActiveIndexes(secondary, item)
-      persistChanges(persistence, index, [item])
+      persistChanges(
+        persistence,
+        index,
+        [item],
+        [],
+        'update',
+        onCommittedChange,
+        onCommitObserverError,
+      )
       return true
     },
 
@@ -489,7 +564,15 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       delete item.invalidatedAt
       item.updatedAt = now
       addActiveIndexes(secondary, item)
-      persistChanges(persistence, index, [...changedConflicts, item])
+      persistChanges(
+        persistence,
+        index,
+        [...changedConflicts, item],
+        [],
+        'restore',
+        onCommittedChange,
+        onCommitObserverError,
+      )
       return true
     },
 
@@ -520,7 +603,15 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         addActiveIndexes(secondary, item)
         changedItems.push(item)
       }
-      persistChanges(persistence, index, changedItems)
+      persistChanges(
+        persistence,
+        index,
+        changedItems,
+        [],
+        'unlink-sources',
+        onCommittedChange,
+        onCommitObserverError,
+      )
       return { updated, orphaned }
     },
 
@@ -534,7 +625,15 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           index.splice(i, 1)
         }
       }
-      persistChanges(persistence, index, [], deletedIds)
+      persistChanges(
+        persistence,
+        index,
+        [],
+        deletedIds,
+        'clear',
+        onCommittedChange,
+        onCommitObserverError,
+      )
     },
 
     async count(scope: MemoryScope): Promise<number> {
@@ -1047,24 +1146,52 @@ function persistChanges(
   index: IndexedMemory[],
   upserts: IndexedMemory[],
   deletes: string[] = [],
+  reason?: V3MemoryCommitReason,
+  onCommittedChange?: (commit: V3MemoryCommit) => void,
+  onCommitObserverError?: (error: unknown, commit: V3MemoryCommit) => void,
 ): void {
-  if (!persistence || (upserts.length === 0 && deletes.length === 0))
+  if (upserts.length === 0 && deletes.length === 0)
     return
-  if (!persistence.appendDelta) {
-    persistIndex(persistence, index)
-    return
-  }
   const deleteIds = new Set(deletes)
   const uniqueUpserts = new Map<string, IndexedMemory>()
   for (const item of upserts) {
     if (!deleteIds.has(item.id))
       uniqueUpserts.set(item.id, item)
   }
-  persistence.appendDelta({
-    indexVersion: 3,
-    upserts: [...uniqueUpserts.values()],
-    deletes: [...deleteIds],
-  })
+  if (persistence) {
+    if (!persistence.appendDelta)
+      persistIndex(persistence, index)
+    else {
+      persistence.appendDelta({
+        indexVersion: 3,
+        upserts: [...uniqueUpserts.values()],
+        deletes: [...deleteIds],
+      })
+    }
+  }
+  if (!reason || !onCommittedChange)
+    return
+  const commit: V3MemoryCommit = {
+    reason,
+    upserts: cloneCommittedRecords([...uniqueUpserts.values()]),
+    deletedIds: [...deleteIds],
+    committedAt: Date.now(),
+  }
+  try {
+    onCommittedChange(commit)
+  }
+  catch (error) {
+    try {
+      onCommitObserverError?.(error, commit)
+    }
+    catch {
+      // A diagnostic hook is part of the shadow path and must not escape either.
+    }
+  }
+}
+
+function cloneCommittedRecords(items: IndexedMemory[]): V3MemoryRecord[] {
+  return JSON.parse(JSON.stringify(items)) as V3MemoryRecord[]
 }
 
 function migrateLegacyItem(value: unknown): IndexedMemory | undefined {

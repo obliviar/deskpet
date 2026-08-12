@@ -66,6 +66,8 @@ export interface EncryptedMemoryPersistence extends MemoryPersistence {
   journalPath: string
   legacyPath?: string
   wasLegacyMigrated: () => boolean
+  /** Load a recovered view without compacting, repairing or migrating files. */
+  loadReadOnly: () => string | undefined
 }
 
 /**
@@ -88,15 +90,20 @@ export function createEncryptedFilePersistence(
   let journalEntries = 0
   let nextSequence = 1
 
+  function getExistingKey(): Buffer {
+    if (!existsSync(options.keyPath))
+      throw new Error('Protected long-term memory key does not exist')
+    const envelope = parseJson<ProtectedKeyEnvelope>(readFileSync(options.keyPath, 'utf-8'), 'memory key')
+    if (envelope.version !== 1 || typeof envelope.protectedKey !== 'string')
+      throw new Error('Unsupported or invalid protected memory key')
+    const key = options.unprotectKey(Buffer.from(envelope.protectedKey, 'base64'))
+    assertMasterKey(key)
+    return key
+  }
+
   function getOrCreateKey(): Buffer {
-    if (existsSync(options.keyPath)) {
-      const envelope = parseJson<ProtectedKeyEnvelope>(readFileSync(options.keyPath, 'utf-8'), 'memory key')
-      if (envelope.version !== 1 || typeof envelope.protectedKey !== 'string')
-        throw new Error('Unsupported or invalid protected memory key')
-      const key = options.unprotectKey(Buffer.from(envelope.protectedKey, 'base64'))
-      assertMasterKey(key)
-      return key
-    }
+    if (existsSync(options.keyPath))
+      return getExistingKey()
 
     const key = randomBytes(KEY_SIZE)
     const protectedKey = options.protectKey(key)
@@ -109,8 +116,7 @@ export function createEncryptedFilePersistence(
     return key
   }
 
-  function decryptStoredPayload(): string {
-    const key = getOrCreateKey()
+  function decryptStoredPayload(key = getExistingKey()): string {
     const encrypted = readFileSync(options.encryptedPath, 'utf-8')
     return decryptPayload(encrypted, key)
   }
@@ -128,8 +134,8 @@ export function createEncryptedFilePersistence(
 
   function loadCurrent(): string | undefined {
     if (existsSync(options.encryptedPath)) {
-      const key = getOrCreateKey()
-      const snapshot = decryptStoredPayload()
+      const key = getExistingKey()
+      const snapshot = decryptStoredPayload(key)
       if (!existsSync(journalPath)) {
         cachedIndex = tryParseMemoryIndex(snapshot)
         cachedPayload = snapshot
@@ -158,6 +164,21 @@ export function createEncryptedFilePersistence(
     unlinkSync(options.legacyPath)
     legacyMigrated = true
     return verified
+  }
+
+  function loadReadOnly(): string | undefined {
+    if (existsSync(options.encryptedPath)) {
+      const key = getExistingKey()
+      const snapshot = decryptStoredPayload(key)
+      if (!existsSync(journalPath))
+        return snapshot
+      return serializeMemoryIndex(replayJournal(snapshot, journalPath, key, false).index)
+    }
+    if (existsSync(journalPath))
+      throw new Error('Long-term memory journal exists without an encrypted snapshot')
+    return options.legacyPath && existsSync(options.legacyPath)
+      ? readFileSync(options.legacyPath, 'utf-8')
+      : undefined
   }
 
   function appendDelta(delta: MemoryPersistenceDelta): void {
@@ -194,6 +215,7 @@ export function createEncryptedFilePersistence(
     journalPath,
     legacyPath: options.legacyPath,
     wasLegacyMigrated: () => legacyMigrated,
+    loadReadOnly,
     backupBeforeMigration(): void {
       if (existsSync(backupPath))
         return
@@ -213,7 +235,7 @@ export function createEncryptedFilePersistence(
   }
 }
 
-function replayJournal(snapshot: string, journalPath: string, key: Buffer): {
+function replayJournal(snapshot: string, journalPath: string, key: Buffer, repairTail = true): {
   index: MutableMemoryIndex
   entries: number
   nextSequence: number
@@ -222,7 +244,7 @@ function replayJournal(snapshot: string, journalPath: string, key: Buffer): {
   const raw = readFileSync(journalPath, 'utf-8')
   const lastNewline = raw.lastIndexOf('\n')
   const complete = lastNewline >= 0 ? raw.slice(0, lastNewline + 1) : ''
-  if (complete !== raw)
+  if (repairTail && complete !== raw)
     atomicWrite(journalPath, complete)
 
   let expectedSequence = 1

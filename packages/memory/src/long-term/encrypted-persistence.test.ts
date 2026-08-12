@@ -95,6 +95,34 @@ describe('encrypted memory persistence', () => {
     expect(JSON.parse(recovered.load()!).items.map((item: { id: string }) => item.id)).toEqual(['m1', 'm2'])
     expect(readFileSync(paths.journalPath, 'utf-8')).not.toContain('partial')
   })
+
+  it('loads a recovered view without modifying an incomplete source journal', () => {
+    const paths = temporaryPaths()
+    const persistence = createPersistence(paths)
+    persistence.save('{"version":3,"items":[]}')
+    persistence.appendDelta?.({
+      indexVersion: 3,
+      upserts: [{ id: 'memory-readonly', content: 'kept' }],
+      deletes: [],
+    })
+    appendFileSync(paths.journalPath, '{incomplete-encrypted-frame', 'utf-8')
+    const before = readFileSync(paths.journalPath, 'utf-8')
+
+    const recovered = JSON.parse(persistence.loadReadOnly()!) as { items: Array<{ id: string }> }
+
+    expect(recovered.items.map(item => item.id)).toEqual(['memory-readonly'])
+    expect(readFileSync(paths.journalPath, 'utf-8')).toBe(before)
+  })
+
+  it('does not create a replacement key when an encrypted source key is missing', () => {
+    const paths = temporaryPaths()
+    const persistence = createPersistence(paths)
+    persistence.save('{"version":3,"items":[]}')
+    rmSync(paths.keyPath)
+
+    expect(() => persistence.loadReadOnly()).toThrow('does not exist')
+    expect(existsSync(paths.keyPath)).toBe(false)
+  })
 })
 
 function temporaryPaths() {

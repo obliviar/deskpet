@@ -53,6 +53,8 @@ pnpm dev:electron
 
 DeskPet 同时保留短期会话和长期记忆：
 
+> V4 第一阶段数据底座已经加入源码，但尚未接管桌面端运行。V3 仍是当前正式读写格式；V4 目前提供独立的 Episode、Candidate、Fact、EvidenceLink、FactVersion、RetrievalEvent 模型、事务 Repository、独立加密快照和只读 V3→V4 迁移。自动 V3 事实在缺少原始消息正文时会进入 V4 `quarantined`，不会被误认为已验证。完成双写和质量门槛前，程序不会自动切换或覆盖现有 `memories.enc`。
+
 | 类型 | 保存内容 | 用途 | 文件 |
 | --- | --- | --- | --- |
 | 短期会话 | 用户和助手的原始消息 | 保持当前对话连续性，默认最多 200 条 | `sessions.enc` |
@@ -177,6 +179,8 @@ Windows 打包版主要数据位于：
 ├─ memories.enc.journal  # 独立认证加密的增量操作日志
 ├─ memories.enc.pre-v3.backup # 首次 V3 迁移前的加密备份
 ├─ memory-key.json       # DPAPI 保护后的随机主密钥
+├─ memory-v4.enc         # 第一阶段只读迁移生成的 V4 加密影子快照
+├─ memory-v4-key.json    # V4 独立的 DPAPI 保护密钥
 ├─ memory-settings.json  # 提取、语义、OCR 和分享设置
 ├─ sessions.enc          # AES-256-GCM 加密短期聊天历史
 ├─ session-key.json      # DPAPI 保护后的会话主密钥

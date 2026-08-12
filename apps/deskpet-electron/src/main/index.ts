@@ -7,6 +7,8 @@ import { createAgentRuntime, createSessionManager, createChatHooks } from '@desk
 import { createOpenAILlm } from '@deskpet/llm-openai'
 import {
   createEncryptedFilePersistence,
+  createEncryptedV4Persistence,
+  createMemoryV4Repository,
   createMemoryWriter,
   createSmartMemoryExtractor,
   createVectorStore,
@@ -14,6 +16,7 @@ import {
   inferMemoryPrivacy,
   isSafeMemoryContent,
   LOCAL_EMBEDDING_MODEL,
+  migrateV3SourceIntoV4,
 } from '@deskpet/memory'
 import type { MemoryCandidate, MemoryExtractor } from '@deskpet/memory'
 import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '@deskpet/tools'
@@ -222,6 +225,8 @@ const localMemoryScope = { ownerId: 'local-user', agentId: 'deskpet' }
 const memoryStoragePath = join(userDataDir, 'memories.enc')
 const memoryKeyPath = join(userDataDir, 'memory-key.json')
 const legacyMemoryStoragePath = join(userDataDir, 'memories.json')
+const memoryV4StoragePath = join(userDataDir, 'memory-v4.enc')
+const memoryV4KeyPath = join(userDataDir, 'memory-v4-key.json')
 let semanticModelProgress: { status: string; progress?: number; file?: string; error?: string } = { status: 'idle' }
 let imageMemoryProgress: { status: string; progress?: number } = { status: 'idle' }
 const semanticMemory = createSemanticMemoryService(join(userDataDir, 'models', 'memory'), (progress) => {
@@ -300,6 +305,26 @@ function initializeMemory(): void {
     memory = createMemoryWriter({ store, extractor: createConfiguredMemoryExtractor() })
     memoryLegacyMigrated = persistence.wasLegacyMigrated()
     writeBootLog(`long-term memory initialized (${semanticActive ? 'semantic' : 'local-hash'})`)
+    try {
+      const v4Persistence = createEncryptedV4Persistence({
+        encryptedPath: memoryV4StoragePath,
+        keyPath: memoryV4KeyPath,
+        protectKey: key => safeStorage.encryptString(key.toString('base64')),
+        unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
+      })
+      const v4Repository = createMemoryV4Repository({ persistence: v4Persistence })
+      const migration = migrateV3SourceIntoV4(
+        { load: persistence.loadReadOnly, storagePath: persistence.encryptedPath },
+        v4Repository,
+        { refreshMigrationOnlyTarget: true },
+      )
+      writeBootLog(`Memory V4 shadow ${migration.migrated ? 'migrated' : 'verified'}: ${migration.factCount} facts, ${migration.warningCount} warnings`)
+    }
+    catch (error) {
+      // V4 remains a shadow copy in stage one. Its failure must never disable
+      // the verified V3 runtime or overwrite the V3 source.
+      writeBootLog(`Memory V4 shadow migration failed: ${errorMessage(error)}`)
+    }
   }
   catch (error) {
     memoryInitializationError = errorMessage(error)

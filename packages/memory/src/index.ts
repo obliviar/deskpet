@@ -21,3 +21,7 @@ export type { SmartExtractorConfig, SmartMemoryExtractorOptions } from './long-t
 export type { MemoryCandidate } from './long-term/memory-extractor'
 export { planTemporalQuery } from './long-term/temporal-query'
 export type { TemporalQueryPlan } from './long-term/temporal-query'
+
+// V4 is additive during stage one. The desktop runtime continues using the
+// stable V3 port until migration, rollback and quality gates pass.
+export * from './v4'

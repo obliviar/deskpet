@@ -35,8 +35,15 @@ let mainWindow: BrowserWindow | null = null
 
 const bootLogPath = process.env.DESKPET_BOOT_LOG?.trim()
 function writeBootLog(message: string) {
-  if (bootLogPath)
+  if (!bootLogPath)
+    return
+  try {
+    mkdirSync(dirname(bootLogPath), { recursive: true })
     appendFileSync(bootLogPath, `[${new Date().toISOString()}] ${message}\n`, 'utf-8')
+  }
+  catch {
+    // Diagnostics must not be able to crash the desktop app.
+  }
 }
 process.on('uncaughtException', error => writeBootLog(`uncaughtException: ${error.stack || error.message}`))
 process.on('unhandledRejection', error => writeBootLog(`unhandledRejection: ${String(error)}`))
@@ -654,7 +661,16 @@ function createWindow() {
     },
   })
 
-  mainWindow.webContents.on('did-finish-load', () => writeBootLog('renderer finished loading'))
+  mainWindow.webContents.on('did-finish-load', () => {
+    writeBootLog('renderer finished loading')
+    // Deterministic, API-free packaged/startup smoke test. It is inactive in
+    // normal launches and lets CI/debug runs verify the renderer plus memory
+    // initialization without leaving Electron processes behind.
+    if (process.env.DESKPET_SMOKE_TEST === 'true') {
+      writeBootLog('smoke test completed')
+      setTimeout(() => app.quit(), 100)
+    }
+  })
   mainWindow.webContents.on('did-fail-load', (_event, code, description) => {
     writeBootLog(`renderer failed to load: ${code} ${description}`)
   })

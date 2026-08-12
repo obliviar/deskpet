@@ -103,6 +103,25 @@ describe('V3 to V4 migration', () => {
     expect(migrated.facts[0]?.verificationState).toBe('legacy-unverified')
   })
 
+  it('uses conservative privacy defaults for missing or damaged V3 fields', () => {
+    const payload = JSON.stringify({
+      version: 3,
+      items: [{
+        id: 'privacy-unknown', content: '用户的敏感偏好', status: 'active', origin: 'automatic',
+        scope: { ownerId: 'owner', agentId: 'agent' }, sourceMessageIds: [],
+        sourceAttachmentIds: [], embedding: [], embeddingModel: 'local-hash-v2',
+        sharePolicy: 'unexpected', sensitivity: 'unexpected', createdAt: 1000, updatedAt: 1001,
+      }],
+    })
+    const migrated = migrateV3PayloadToV4(payload, { now: () => MIGRATION_TIME })
+    expect(migrated.facts[0]).toMatchObject({ sharePolicy: 'local-only', sensitivity: 'private' })
+    expect(migrated.episodes[0]).toMatchObject({ sharePolicy: 'local-only', sensitivity: 'private' })
+    expect(migrated.migrationManifests[0]?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('restricted to local-only'),
+      expect.stringContaining('classified as private'),
+    ]))
+  })
+
   it('produces stable record ids for the same payload', () => {
     const first = migrateV3PayloadToV4(v3Payload(), { now: () => MIGRATION_TIME })
     const second = migrateV3PayloadToV4(v3Payload(), { now: () => MIGRATION_TIME + 1 })

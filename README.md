@@ -268,6 +268,9 @@ pnpm --filter @deskpet/memory test
 pnpm --filter @deskpet/electron exec tsc --noEmit -p tsconfig.node.json
 pnpm --filter @deskpet/electron exec vue-tsc --noEmit -p tsconfig.web.json
 
+# Electron 记忆冷迁移、幂等、损坏降级与渲染启动烟雾测试
+pnpm --filter @deskpet/electron test:smoke
+
 # 构建和生成 Windows ZIP
 pnpm --filter @deskpet/electron build
 pnpm --filter @deskpet/electron package

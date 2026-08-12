@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { MemoryV4Persistence } from './memory-v4-repository'
 
@@ -126,8 +126,16 @@ function assertMasterKey(key: Buffer): void {
 function atomicWrite(path: string, payload: string): void {
   mkdirSync(dirname(path), { recursive: true })
   const temporaryPath = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
-  writeFileSync(temporaryPath, payload, { encoding: 'utf-8', mode: 0o600 })
-  renameSync(temporaryPath, path)
+  try {
+    writeFileSync(temporaryPath, payload, { encoding: 'utf-8', mode: 0o600 })
+    renameSync(temporaryPath, path)
+  }
+  catch (error) {
+    // A failed replacement must leave neither a partial target nor plaintext-
+    // adjacent temporary ciphertext behind.
+    rmSync(temporaryPath, { force: true })
+    throw error
+  }
 }
 
 function parseJson<T>(payload: string, label: string): T {

@@ -134,6 +134,11 @@ export function migrateV3PayloadToV4(
     const sourceEpisodeIds: string[] = []
     const evidenceLinks: EvidenceLinkV4[] = []
 
+    if (item.sharePolicy !== 'allow-remote' && item.sharePolicy !== 'local-only' && item.sharePolicy !== 'ask')
+      warnings.push(`V3 memory ${item.id} had no valid share policy and was restricted to local-only.`)
+    if (item.sensitivity !== 'normal' && item.sensitivity !== 'private' && item.sensitivity !== 'secret')
+      warnings.push(`V3 memory ${item.id} had no valid sensitivity and was classified as private.`)
+
     const legacyEpisode: MemoryEpisodeV4 = {
       id: legacyEpisodeId,
       scope,
@@ -404,11 +409,11 @@ function normalizeOrigin(value: unknown): MemoryFactV4['origin'] {
 }
 
 function normalizeSharePolicy(value: unknown): MemoryFactV4['sharePolicy'] {
-  return value === 'local-only' || value === 'ask' ? value : 'allow-remote'
+  return value === 'allow-remote' || value === 'ask' ? value : 'local-only'
 }
 
 function normalizeSensitivity(value: unknown): MemoryFactV4['sensitivity'] {
-  return value === 'private' || value === 'secret' ? value : 'normal'
+  return value === 'normal' || value === 'secret' ? value : 'private'
 }
 
 function normalizeCardinality(value: unknown): MemoryFactV4['cardinality'] {

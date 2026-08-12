@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "test:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/memory-v4-smoke.ps1",
     "preview": "electron-vite preview",
     "package": "electron-vite build && electron-builder --win zip",
     "typecheck": "echo \"skipped (vue-tsc not available)\""

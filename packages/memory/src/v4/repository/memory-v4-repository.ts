@@ -23,6 +23,8 @@ export interface MemoryV4Repository {
 }
 
 export function createEmptyMemoryV4Snapshot(now = Date.now()): MemoryV4Snapshot {
+  if (!Number.isFinite(now) || now <= 0)
+    throw new Error('Memory V4 snapshot requires a positive creation timestamp')
   return {
     schemaVersion: MEMORY_V4_SCHEMA_VERSION,
     revision: 0,
@@ -45,10 +47,13 @@ export function createMemoryV4Repository(options: MemoryV4RepositoryOptions = {}
   let current = persisted === undefined
     ? createEmptyMemoryV4Snapshot(now())
     : parseMemoryV4Snapshot(persisted)
+  let transactionOpen = false
 
   function requireWritable(): void {
     if (options.readOnly)
       throw new Error('Memory V4 repository is read-only')
+    if (transactionOpen)
+      throw new Error('Memory V4 repository transaction is already active')
   }
 
   function commit(next: MemoryV4Snapshot): void {
@@ -57,7 +62,10 @@ export function createMemoryV4Repository(options: MemoryV4RepositoryOptions = {}
     // Persist before publishing the new in-memory state. If persistence fails,
     // readers continue to observe the previous complete revision.
     options.persistence?.save(payload)
-    current = next
+    // Publish a detached copy. A mutator may return part of its draft; retaining
+    // that same object here would allow later caller mutations to bypass a
+    // transaction and persistence entirely.
+    current = JSON.parse(payload) as MemoryV4Snapshot
   }
 
   return {
@@ -67,23 +75,43 @@ export function createMemoryV4Repository(options: MemoryV4RepositoryOptions = {}
     transaction<T>(mutator: (draft: MemoryV4Snapshot) => T): T {
       requireWritable()
       const draft = jsonClone(current)
-      const result = mutator(draft)
-      draft.schemaVersion = MEMORY_V4_SCHEMA_VERSION
-      draft.revision = current.revision + 1
-      draft.createdAt = current.createdAt
-      draft.updatedAt = Math.max(now(), current.updatedAt)
-      commit(draft)
-      return result
+      transactionOpen = true
+      try {
+        const result = mutator(draft)
+        if (isThenable(result)) {
+          // Consume a possible rejection from an accidentally async callback;
+          // its isolated draft is discarded and never published.
+          void Promise.resolve(result).catch(() => undefined)
+          throw new Error('Memory V4 transactions must use a synchronous mutator')
+        }
+        draft.schemaVersion = MEMORY_V4_SCHEMA_VERSION
+        draft.revision = current.revision + 1
+        draft.createdAt = current.createdAt
+        draft.updatedAt = Math.max(now(), current.updatedAt)
+        commit(draft)
+        return result
+      }
+      finally {
+        transactionOpen = false
+      }
     },
     replace(snapshot: MemoryV4Snapshot): void {
       requireWritable()
+      // Validate before cloning so non-JSON numeric values such as NaN cannot
+      // be silently converted to null by JSON serialization.
+      assertMemoryV4Snapshot(snapshot)
       const next = jsonClone(snapshot)
-      assertMemoryV4Snapshot(next)
       if (next.revision < current.revision)
         throw new Error('Memory V4 repository refuses to replace data with an older revision')
       commit(next)
     },
   }
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (typeof value === 'object' && value !== null) || typeof value === 'function'
+    ? typeof (value as { then?: unknown }).then === 'function'
+    : false
 }
 
 export function parseMemoryV4Snapshot(payload: string): MemoryV4Snapshot {

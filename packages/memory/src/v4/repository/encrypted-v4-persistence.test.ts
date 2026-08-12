@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -28,6 +28,25 @@ describe('encrypted Memory V4 persistence', () => {
     expect(ciphertext).not.toContain('event-secret')
     expect(ciphertext).not.toContain('hash-secret')
     expect(createMemoryV4Repository({ persistence }).snapshot()).toEqual(repository.snapshot())
+  })
+
+  it('atomically replaces an existing encrypted snapshot', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'deskpet-v4-replace-'))
+    const encryptedPath = join(directory, 'memory-v4.enc')
+    const keyPath = join(directory, 'memory-v4-key.json')
+    const persistence = createEncryptedV4Persistence({
+      encryptedPath, keyPath,
+      protectKey: key => Buffer.from(key),
+      unprotectKey: key => Buffer.from(key),
+    })
+
+    persistence.save('{"revision":1,"secret":"first"}')
+    const firstCiphertext = readFileSync(encryptedPath, 'utf-8')
+    persistence.save('{"revision":2,"secret":"second"}')
+
+    expect(persistence.load()).toBe('{"revision":2,"secret":"second"}')
+    expect(readFileSync(encryptedPath, 'utf-8')).not.toBe(firstCiphertext)
+    expect(readdirSync(directory).filter(name => name.endsWith('.tmp'))).toEqual([])
   })
 
   it('rejects a tampered encrypted snapshot', () => {
@@ -62,5 +81,44 @@ describe('encrypted Memory V4 persistence', () => {
 
     expect(() => persistence.load()).toThrow('does not exist')
     expect(existsSync(keyPath)).toBe(false)
+  })
+
+  it('rejects a wrong or malformed protected key', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'deskpet-v4-wrong-key-'))
+    const encryptedPath = join(directory, 'memory-v4.enc')
+    const keyPath = join(directory, 'memory-v4-key.json')
+    const identity = createEncryptedV4Persistence({
+      encryptedPath, keyPath,
+      protectKey: key => Buffer.from(key),
+      unprotectKey: key => Buffer.from(key),
+    })
+    identity.save('{"secret":"value"}')
+
+    const wrong = createEncryptedV4Persistence({
+      encryptedPath, keyPath,
+      protectKey: key => Buffer.from(key),
+      unprotectKey: key => Buffer.from(key.map(byte => byte ^ 0xff)),
+    })
+    expect(() => wrong.load()).toThrow('Unable to decrypt Memory V4')
+
+    writeFileSync(keyPath, JSON.stringify({
+      version: 1, schema: 'deskpet-memory-v4-key', protectedKey: 'AQ==',
+    }), 'utf-8')
+    expect(() => identity.load()).toThrow('exactly 32 bytes')
+  })
+
+  it('cleans up temporary files when atomic replacement fails', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'deskpet-v4-atomic-fail-'))
+    const encryptedPath = join(directory, 'cannot-replace-directory')
+    const keyPath = join(directory, 'memory-v4-key.json')
+    mkdirSync(encryptedPath)
+    const persistence = createEncryptedV4Persistence({
+      encryptedPath, keyPath,
+      protectKey: key => Buffer.from(key),
+      unprotectKey: key => Buffer.from(key),
+    })
+
+    expect(() => persistence.save('{"test":true}')).toThrow()
+    expect(readdirSync(directory).filter(name => name.endsWith('.tmp'))).toEqual([])
   })
 })

@@ -40,8 +40,10 @@ export interface MemoryEpisodeV4 {
 export type CandidateStatus = 'pending' | 'accepted' | 'rejected' | 'quarantined'
 export type MemoryCardinalityV4 = 'single' | 'multiple' | 'set'
 export type MemoryPolarityV4 = 'positive' | 'negative' | 'unknown'
+export type MemoryModalityV4 = 'asserted' | 'planned' | 'hypothetical' | 'reported' | 'inferred' | 'unknown'
+export type MemoryObjectTypeV4 = 'string' | 'number' | 'boolean' | 'date' | 'entity' | 'json'
 export type MemoryWriteActionV4 = 'ADD' | 'MERGE_EVIDENCE' | 'REFINE' | 'SUPERSEDE'
-  | 'CONFLICT' | 'NOOP' | 'QUARANTINE' | 'DELETE' | 'RESTORE'
+  | 'CONFLICT' | 'NOOP' | 'QUARANTINE' | 'SUPPRESS' | 'DELETE' | 'PURGE' | 'RESTORE'
 
 export interface MemoryCandidateV4 {
   id: string
@@ -50,8 +52,12 @@ export interface MemoryCandidateV4 {
   subjectId: string
   predicate: string
   object: JsonValue
+  objectType: MemoryObjectTypeV4
+  normalizedValue: JsonValue
   canonicalText: string
   polarity: MemoryPolarityV4
+  modality: MemoryModalityV4
+  condition?: string
   cardinality: MemoryCardinalityV4
   validFrom?: number
   validTo?: number
@@ -63,12 +69,14 @@ export interface MemoryCandidateV4 {
   status: CandidateStatus
   extractorVersion: string
   verifierVersion?: string
+  policyVersion?: string
+  decisionReasonCodes?: string[]
   createdAt: number
   updatedAt: number
 }
 
 export type MemoryFactStatusV4 = 'active' | 'superseded' | 'conflicted' | 'quarantined'
-  | 'expired' | 'orphaned' | 'archived' | 'deleted'
+  | 'expired' | 'orphaned' | 'archived' | 'suppressed' | 'deleted'
 export type MemoryVerificationStateV4 = 'verified' | 'pending' | 'legacy-unverified' | 'rejected'
 
 export interface MemoryFactV4 {
@@ -77,10 +85,14 @@ export interface MemoryFactV4 {
   subjectId: string
   predicate: string
   object: JsonValue
+  objectType: MemoryObjectTypeV4
+  normalizedValue: JsonValue
   canonicalText: string
   memoryKey: string
   cardinality: MemoryCardinalityV4
   polarity: MemoryPolarityV4
+  modality: MemoryModalityV4
+  condition?: string
   status: MemoryFactStatusV4
   validFrom?: number
   validTo?: number
@@ -128,13 +140,59 @@ export interface MemoryFactVersionV4 {
   factId: string
   version: number
   operation: MemoryWriteActionV4 | 'MIGRATE_V3'
+  subjectId: string
+  predicate: string
+  object: JsonValue
+  objectType: MemoryObjectTypeV4
+  normalizedValue: JsonValue
   canonicalText: string
+  polarity: MemoryPolarityV4
+  modality: MemoryModalityV4
+  condition?: string
   status: MemoryFactStatusV4
   validFrom?: number
   validTo?: number
   evidenceLinkIds: string[]
   recordedAt: number
+  /** Transaction time at which this version stopped being the latest version. */
+  transactionClosedAt?: number
   reason: string
+}
+
+export type MemoryDerivedArtifactKindV4 = 'summary' | 'graph-edge' | 'embedding' | 'retrieval-cache'
+export type MemoryDerivedArtifactStatusV4 = 'current' | 'stale' | 'deleted'
+
+/** Rebuildable data derived from facts/episodes. It is never the source of truth. */
+export interface MemoryDerivedArtifactV4 {
+  id: string
+  scope: MemoryV4Scope
+  kind: MemoryDerivedArtifactKindV4
+  status: MemoryDerivedArtifactStatusV4
+  sourceEpisodeIds: string[]
+  sourceFactIds: string[]
+  content?: string
+  contentHash?: string
+  createdAt: number
+  updatedAt: number
+  invalidatedAt?: number
+  builderVersion: string
+}
+
+export type MemoryDomainEventTypeV4 = 'EPISODE_RECORDED' | 'FACT_CREATED' | 'FACT_VERSIONED'
+  | 'EVIDENCE_LINKED' | 'EVIDENCE_UNLINKED' | 'FACT_SUPPRESSED' | 'FACT_DELETED'
+  | 'FACT_PURGED' | 'FACT_RESTORED' | 'DERIVED_ARTIFACT_STALE' | 'V3_RECONCILED'
+
+/** Append-only, idempotent lifecycle ledger. Payload contains identifiers, not plaintext evidence. */
+export interface MemoryDomainEventV4 {
+  id: string
+  idempotencyKey: string
+  type: MemoryDomainEventTypeV4
+  scope: MemoryV4Scope
+  factId?: string
+  episodeId?: string
+  createdAt: number
+  actor: 'system' | 'user' | 'migration'
+  payload?: JsonObject
 }
 
 export interface RetrievalEventV4 {
@@ -196,6 +254,8 @@ export interface MemoryV4Snapshot {
   facts: MemoryFactV4[]
   evidenceLinks: EvidenceLinkV4[]
   factVersions: MemoryFactVersionV4[]
+  derivedArtifacts: MemoryDerivedArtifactV4[]
+  domainEvents: MemoryDomainEventV4[]
   retrievalEvents: RetrievalEventV4[]
   migrationManifests: MemoryMigrationManifestV4[]
   legacyImports: LegacyV3ImportRecord[]

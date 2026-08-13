@@ -84,10 +84,13 @@ try {
   if (-not (Select-String -Path $logPath -Pattern 'Memory V4 dual-write ready: 2/2 facts reconciled, 0 tombstoned' -Quiet)) {
     throw 'The first launch did not reconcile the migrated facts into the V4 dual-write shadow.'
   }
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 diff audit: 100.0000% exact, 0 issues' -Quiet)) {
+    throw 'The first launch did not pass the complete V3/V4 consistency audit.'
+  }
   if (Test-Path -LiteralPath (Join-Path $dataPath 'memories.json')) {
     throw 'The verified V3 encryption migration left the legacy plaintext file behind.'
   }
-  foreach ($file in @('memories.enc', 'memory-key.json', 'memory-v4.enc', 'memory-v4-key.json')) {
+  foreach ($file in @('memories.enc', 'memory-key.json', 'memory-v4.enc', 'memory-v4-key.json', 'memory-v4.enc.journal')) {
     if (-not (Test-Path -LiteralPath (Join-Path $dataPath $file))) {
       throw "Expected encrypted memory artifact is missing: $file"
     }
@@ -96,6 +99,30 @@ try {
   Invoke-SmokeLaunch
   if ((Select-String -Path $logPath -Pattern 'Memory V4 dual-write ready: 2/2 facts reconciled, 0 tombstoned').Count -ne 2) {
     throw 'The second launch did not preserve and idempotently reconcile the existing V4 dual-write shadow.'
+  }
+  if ((Select-String -Path $logPath -Pattern 'Memory V4 diff audit: 100.0000% exact, 0 issues').Count -ne 2) {
+    throw 'The restart did not preserve complete V3/V4 audit consistency.'
+  }
+
+  $env:DESKPET_SMOKE_PURGE_ID = 'smoke-manual-name'
+  Invoke-SmokeLaunch
+  Remove-Item Env:DESKPET_SMOKE_PURGE_ID -ErrorAction SilentlyContinue
+  if (-not (Select-String -Path $logPath -Pattern 'Memory purge completed: smoke-manual-name, V3 removed=True' -Quiet)) {
+    throw 'The strong-confirm purge path did not remove the selected V3 memory.'
+  }
+  if (-not (Select-String -Path $logPath -Pattern 'smoke purge report: .*"residualCount":0.*"checkpointCompacted":true.*"backupsScrubbed":true' -Quiet)) {
+    throw 'The strong-confirm purge path did not produce a zero-residual durability report.'
+  }
+  if (Test-Path -LiteralPath (Join-Path $dataPath 'memory-v4.enc.journal')) {
+    throw 'The irreversible purge left a recoverable V4 journal behind.'
+  }
+
+  Invoke-SmokeLaunch
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 dual-write ready: 1/1 facts reconciled, 0 tombstoned' -Quiet)) {
+    throw 'The post-purge restart did not preserve the single remaining V3 fact.'
+  }
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 diff audit: 100.0000% exact, 0 issues' -Quiet)) {
+    throw 'The post-purge restart did not preserve V3/V4 audit consistency.'
   }
 
   $v3Path = Join-Path $dataPath 'memories.enc'
@@ -109,14 +136,14 @@ try {
   if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow initialization failed' -Quiet)) {
     throw 'The damaged V4 shadow did not enter the expected non-fatal fallback path.'
   }
-  if ((Select-String -Path $logPath -Pattern 'renderer finished loading').Count -ne 3) {
-    throw 'The Electron renderer did not finish loading on all three launches.'
+  if ((Select-String -Path $logPath -Pattern 'renderer finished loading').Count -ne 5) {
+    throw 'The Electron renderer did not finish loading on all five launches.'
   }
 
-  Write-Output 'Memory V4 Electron smoke test passed: migration, dual-write reconciliation, restart preservation, encrypted artifacts, renderer startup, and V3-safe V4 failure fallback.'
+  Write-Output 'Memory V4 Electron smoke test passed: migration, journal replay, 100% diff audit, strong-confirm zero-residual purge, post-purge restart, encrypted artifacts, renderer startup, and V3-safe V4 failure fallback.'
 }
 finally {
-  Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_MEMORY -ErrorAction SilentlyContinue
+  Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_SMOKE_PURGE_ID,Env:DESKPET_MEMORY -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath $testRoot) {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'

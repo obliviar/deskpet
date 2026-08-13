@@ -123,6 +123,25 @@ describe('encrypted memory persistence', () => {
     expect(() => persistence.loadReadOnly()).toThrow('does not exist')
     expect(existsSync(paths.keyPath)).toBe(false)
   })
+
+  it('compacts a purge and overwrites its managed backup with the sanitized payload', () => {
+    const paths = temporaryPaths()
+    const persistence = createPersistence(paths)
+    persistence.save('{"version":3,"items":[{"id":"secret-memory","content":"remove-me"}]}')
+    persistence.backupBeforeMigration?.()
+    persistence.appendDelta?.({ indexVersion: 3, upserts: [], deletes: ['secret-memory'] })
+    persistence.compact()
+    persistence.scrubBackups()
+
+    expect(existsSync(paths.journalPath)).toBe(false)
+    expect(JSON.parse(persistence.load()!).items).toEqual([])
+    const backupReader = createPersistence({
+      ...paths,
+      encryptedPath: `${paths.encryptedPath}.pre-v3.backup`,
+      journalPath: `${paths.encryptedPath}.pre-v3.backup.journal`,
+    })
+    expect(JSON.parse(backupReader.load()!).items).toEqual([])
+  })
 })
 
 function temporaryPaths() {

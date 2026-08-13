@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { MemoryV4Persistence } from './memory-v4-repository'
 
@@ -27,6 +27,16 @@ export interface EncryptedV4PersistenceOptions {
   keyPath: string
   protectKey: (key: Buffer) => Buffer
   unprotectKey: (protectedKey: Buffer) => Buffer
+  /** Optional rolling encrypted backup retained next to the authoritative snapshot. */
+  backupPath?: string
+  readOnly?: boolean
+}
+
+export interface EncryptedV4CheckpointPersistence extends MemoryV4Persistence {
+  loadCheckpoint: () => string | undefined
+  writeCheckpoint: (payload: string, rotateBackup?: boolean) => void
+  encryptFrame: (payload: string) => string
+  decryptFrame: (payload: string) => string
 }
 
 /**
@@ -35,7 +45,7 @@ export interface EncryptedV4PersistenceOptions {
  */
 export function createEncryptedV4Persistence(
   options: EncryptedV4PersistenceOptions,
-): MemoryV4Persistence {
+): EncryptedV4CheckpointPersistence {
   function getExistingKey(): Buffer {
     if (!existsSync(options.keyPath))
       throw new Error('Protected Memory V4 key does not exist')
@@ -69,17 +79,52 @@ export function createEncryptedV4Persistence(
     return decryptPayload(envelope, getExistingKey())
   }
 
+  function writeCheckpoint(payload: string, rotateBackup = true): void {
+    if (options.readOnly)
+      throw new Error('Encrypted Memory V4 persistence is read-only')
+    const key = getOrCreateKey()
+    const encrypted = encryptPayload(payload, key)
+    // Verify encryption before replacing the only complete snapshot.
+    if (decryptPayload(encrypted, key) !== payload)
+      throw new Error('Memory V4 encryption verification failed')
+    if (rotateBackup && options.backupPath && existsSync(options.encryptedPath)) {
+      const current = readFileSync(options.encryptedPath, 'utf-8')
+      // Never rotate a corrupt snapshot into the only backup.
+      decryptPayload(current, key)
+      atomicCopy(options.encryptedPath, options.backupPath)
+    }
+    atomicWrite(options.encryptedPath, encrypted)
+  }
+
   return {
     storagePath: options.encryptedPath,
     load: () => existsSync(options.encryptedPath) ? decryptStoredPayload() : undefined,
-    save(payload: string): void {
-      const key = getOrCreateKey()
-      const encrypted = encryptPayload(payload, key)
-      // Verify encryption before replacing the only complete snapshot.
-      if (decryptPayload(encrypted, key) !== payload)
-        throw new Error('Memory V4 encryption verification failed')
-      atomicWrite(options.encryptedPath, encrypted)
+    loadCheckpoint: () => existsSync(options.encryptedPath) ? decryptStoredPayload() : undefined,
+    save: payload => writeCheckpoint(payload),
+    writeCheckpoint,
+    encryptFrame: payload => encryptPayload(payload, getOrCreateKey()),
+    decryptFrame: payload => decryptPayload(payload, getExistingKey()),
+    scrubBackups(): void {
+      if (options.readOnly)
+        throw new Error('Encrypted Memory V4 persistence is read-only')
+      if (!options.backupPath || !existsSync(options.encryptedPath))
+        return
+      const payload = decryptStoredPayload()
+      atomicWrite(options.backupPath, encryptPayload(payload, getExistingKey()))
     },
+  }
+}
+
+function atomicCopy(sourcePath: string, targetPath: string): void {
+  mkdirSync(dirname(targetPath), { recursive: true })
+  const temporaryPath = `${targetPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  try {
+    copyFileSync(sourcePath, temporaryPath)
+    replaceFileWithRetry(temporaryPath, targetPath)
+  }
+  catch (error) {
+    rmSync(temporaryPath, { force: true })
+    throw error
   }
 }
 
@@ -128,7 +173,7 @@ function atomicWrite(path: string, payload: string): void {
   const temporaryPath = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   try {
     writeFileSync(temporaryPath, payload, { encoding: 'utf-8', mode: 0o600 })
-    renameSync(temporaryPath, path)
+    replaceFileWithRetry(temporaryPath, path)
   }
   catch (error) {
     // A failed replacement must leave neither a partial target nor plaintext-
@@ -136,6 +181,25 @@ function atomicWrite(path: string, payload: string): void {
     rmSync(temporaryPath, { force: true })
     throw error
   }
+}
+
+function replaceFileWithRetry(temporaryPath: string, targetPath: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(temporaryPath, targetPath)
+      return
+    }
+    catch (error) {
+      if (attempt >= 5 || !isTransientWindowsFileError(error))
+        throw error
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 * 2 ** attempt)
+    }
+  }
+}
+
+function isTransientWindowsFileError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES'
 }
 
 function parseJson<T>(payload: string, label: string): T {

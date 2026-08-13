@@ -8,6 +8,10 @@ import { createOpenAILlm } from '@deskpet/llm-openai'
 import {
   createEncryptedFilePersistence,
   createEncryptedV4Persistence,
+  createJournaledV4Persistence,
+  auditV3V4Consistency,
+  createMemoryV4LifecycleService,
+  createMemoryPurgeConfirmationGate,
   createMemoryV4Repository,
   createMemoryWriter,
   createSmartMemoryExtractor,
@@ -19,7 +23,15 @@ import {
   LOCAL_EMBEDDING_MODEL,
   migrateV3SourceIntoV4,
 } from '@deskpet/memory'
-import type { MemoryCandidate, MemoryExtractor, V4ShadowWriter } from '@deskpet/memory'
+import type {
+  JournaledV4Persistence,
+  EncryptedMemoryPersistence,
+  MemoryCandidate,
+  MemoryExtractor,
+  MemoryV4LifecycleService,
+  MemoryV4Repository,
+  V4ShadowWriter,
+} from '@deskpet/memory'
 import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '@deskpet/tools'
 
 import { createPersistence } from './persist'
@@ -74,6 +86,9 @@ const config = {
   baseURL: process.env.OPENAI_BASE_URL || fileConfig.baseURL || undefined,
   model: process.env.DESKPET_MODEL || fileConfig.model || 'gpt-4o-mini',
   memoryEnabled: process.env.DESKPET_MEMORY ? process.env.DESKPET_MEMORY !== 'false' : (fileConfig.memoryEnabled !== false),
+  memoryV4ShadowEnabled: process.env.DESKPET_MEMORY_V4_SHADOW
+    ? process.env.DESKPET_MEMORY_V4_SHADOW !== 'false'
+    : (fileConfig.memoryV4ShadowEnabled !== false),
   embeddingApiKey: process.env.DESKPET_EMBEDDING_API_KEY || fileConfig.embeddingApiKey || process.env.OPENAI_API_KEY || fileConfig.apiKey || '',
   embeddingBaseURL: process.env.DESKPET_EMBEDDING_BASE_URL || fileConfig.embeddingBaseURL || process.env.OPENAI_BASE_URL || fileConfig.baseURL || undefined,
   embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || fileConfig.embeddingModel || LOCAL_EMBEDDING_MODEL,
@@ -227,19 +242,27 @@ function normalizeMemorySettings(value: Partial<MemorySettings> | undefined): Me
 
 let memorySettings = normalizeMemorySettings(persist.loadJson<Partial<MemorySettings>>('memory-settings', defaultMemorySettings))
 let memory: ReturnType<typeof createMemoryWriter> | undefined
+let memoryPersistence: EncryptedMemoryPersistence | undefined
 let memoryInitializationError = ''
 let memoryLegacyMigrated = false
 let memoryV4Shadow: V4ShadowWriter | undefined
+let memoryV4Repository: MemoryV4Repository | undefined
+let memoryV4Lifecycle: MemoryV4LifecycleService | undefined
+let memoryV4Persistence: JournaledV4Persistence | undefined
 let memoryV4Error = ''
 let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
+let memoryV4Audit: ReturnType<typeof auditV3V4Consistency> | undefined
 const localMemoryScope = { ownerId: 'local-user', agentId: 'deskpet' }
 const memoryStoragePath = join(userDataDir, 'memories.enc')
 const memoryKeyPath = join(userDataDir, 'memory-key.json')
 const legacyMemoryStoragePath = join(userDataDir, 'memories.json')
 const memoryV4StoragePath = join(userDataDir, 'memory-v4.enc')
+const memoryV4BackupPath = join(userDataDir, 'memory-v4.enc.backup')
+const memoryV4JournalPath = join(userDataDir, 'memory-v4.enc.journal')
 const memoryV4KeyPath = join(userDataDir, 'memory-v4-key.json')
 let semanticModelProgress: { status: string; progress?: number; file?: string; error?: string } = { status: 'idle' }
 let imageMemoryProgress: { status: string; progress?: number } = { status: 'idle' }
+const purgeConfirmation = createMemoryPurgeConfirmationGate()
 const semanticMemory = createSemanticMemoryService(join(userDataDir, 'models', 'memory'), (progress) => {
   semanticModelProgress = progress
   mainWindow?.webContents.send('memory:model-progress', progress)
@@ -297,11 +320,17 @@ function initializeMemory(): void {
     writeBootLog(`Memory V4 shadow flush before reinitialize failed: ${errorMessage(error)}`)
   }
   memory = undefined
+  memoryPersistence = undefined
   memoryV4Shadow = undefined
+  memoryV4Repository = undefined
+  memoryV4Lifecycle = undefined
+  memoryV4Persistence = undefined
+  purgeConfirmation.clear()
   memoryInitializationError = ''
   memoryLegacyMigrated = false
   memoryV4Error = ''
   memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
+  memoryV4Audit = undefined
   if (!config.memoryEnabled)
     return
   try {
@@ -314,6 +343,7 @@ function initializeMemory(): void {
       protectKey: key => safeStorage.encryptString(key.toString('base64')),
       unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
     })
+    memoryPersistence = persistence
     const semanticActive = memorySettings.semanticEnabled && semanticMemory.isInstalled()
     const store = createVectorStore({
       persistence,
@@ -332,18 +362,37 @@ function initializeMemory(): void {
         memoryV4Shadow?.flush()
       },
       onCaptureObserverError: error => writeBootLog(`Memory V4 capture enqueue failed: ${errorMessage(error)}`),
+      onSourcesUnlinked: (commit) => {
+        memoryV4Shadow?.enqueueSourceUnlink(commit)
+        memoryV4Shadow?.flush()
+      },
+      onSourceUnlinkObserverError: error => writeBootLog(`Memory V4 source unlink enqueue failed: ${errorMessage(error)}`),
     })
     memoryLegacyMigrated = persistence.wasLegacyMigrated()
     writeBootLog(`long-term memory initialized (${semanticActive ? 'semantic' : 'local-hash'})`)
+    if (!config.memoryV4ShadowEnabled) {
+      writeBootLog('Memory V4 shadow disabled by kill switch; V3 remains authoritative')
+      return
+    }
     try {
-      const v4Persistence = createEncryptedV4Persistence({
+      const v4Checkpoint = createEncryptedV4Persistence({
         encryptedPath: memoryV4StoragePath,
         keyPath: memoryV4KeyPath,
+        backupPath: memoryV4BackupPath,
         protectKey: key => safeStorage.encryptString(key.toString('base64')),
         unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
       })
+      const v4Persistence = createJournaledV4Persistence({
+        checkpoint: v4Checkpoint,
+        journalPath: memoryV4JournalPath,
+      })
       const v4Repository = createMemoryV4Repository({ persistence: v4Persistence })
+      memoryV4Repository = v4Repository
+      memoryV4Lifecycle = createMemoryV4LifecycleService(v4Repository)
+      memoryV4Persistence = v4Persistence
       const snapshot = v4Repository.snapshot()
+      if (snapshot.facts.some(fact => fact.metadata?.purgeCompletedAt !== undefined))
+        v4Persistence.scrubBackups()
       if (isStageOneV4Shadow(snapshot)) {
         const migration = migrateV3SourceIntoV4(
           { load: persistence.loadReadOnly, storagePath: persistence.encryptedPath },
@@ -362,7 +411,9 @@ function initializeMemory(): void {
       const recoveredV3 = persistence.loadReadOnly()
       if (recoveredV3) {
         memoryV4Reconciliation = memoryV4Shadow.reconcileV3Payload(recoveredV3)
+        memoryV4Audit = auditV3V4Consistency(recoveredV3, v4Repository.snapshot())
         writeBootLog(`Memory V4 dual-write ready: ${memoryV4Reconciliation.mirroredCount}/${memoryV4Reconciliation.sourceCount} facts reconciled, ${memoryV4Reconciliation.deletedCount} tombstoned`)
+        writeBootLog(`Memory V4 diff audit: ${(memoryV4Audit.consistency * 100).toFixed(4)}% exact, ${memoryV4Audit.issues.length} issues`)
       }
     }
     catch (error) {
@@ -483,6 +534,119 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function auditPurgedMemory(memoryId: string, factId: string, originalContent: string): string[] {
+  const residual: string[] = []
+  const snapshot = memoryV4Repository?.snapshot()
+  if (!snapshot)
+    return ['V4 快照不可用']
+  const fact = snapshot.facts.find(entry => entry.id === factId)
+  if (!fact || fact.status !== 'deleted' || fact.canonicalText !== '[purged]')
+    residual.push('V4 事实未成为已清除墓碑')
+  const serialized = JSON.stringify(snapshot)
+  if (originalContent && serialized.includes(originalContent))
+    residual.push('V4 当前快照仍含原正文')
+  if (snapshot.factVersions.some(version => version.factId === factId && version.canonicalText !== '[purged]'))
+    residual.push('V4 历史版本仍含正文')
+  const episodeIds = new Set(snapshot.evidenceLinks.filter(link => link.factId === factId).map(link => link.episodeId))
+  if (snapshot.episodes.some(episode => episodeIds.has(episode.id)
+    && (episode.contentState !== 'deleted' || episode.content !== undefined || episode.contentHash !== undefined)))
+    residual.push('V4 独占证据仍可恢复')
+  if (snapshot.legacyImports.some(legacy => legacy.factId === factId && JSON.stringify(legacy.raw).includes(originalContent)))
+    residual.push('V4 旧版导入副本仍含正文')
+  if (snapshot.facts.some(entry => entry.metadata?.v3SourceId === memoryId && entry.id !== factId && entry.status !== 'deleted'))
+    residual.push('V4 存在同源活动事实')
+  return residual
+}
+
+async function prepareMemoryPurge(id: unknown) {
+  if (!memory?.purge || !memoryV4Repository || !memoryV4Lifecycle || !memoryV4Persistence)
+    return { ok: false as const, error: '彻底清除仅在 V4 安全生命周期与加密日志正常工作时开放。' }
+  const normalizedId = typeof id === 'string' ? id.trim() : ''
+  const item = normalizedId ? (await memory.list(localMemoryScope, 100_000)).find(entry => entry.id === normalizedId) : undefined
+  if (!item)
+    return { ok: false as const, error: '没有找到该记忆。' }
+  const challenge = purgeConfirmation.prepare(normalizedId)
+  return {
+    ok: true as const,
+    ...challenge,
+    warning: '此操作不可恢复，将删除该记忆正文、历史版本、独占证据、索引日志和受管备份中的可恢复副本。',
+  }
+}
+
+async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase?: unknown }) {
+  if (!memory?.purge || !memoryV4Repository || !memoryV4Lifecycle || !memoryV4Persistence)
+    return { ok: false as const, error: '彻底清除当前不可用。' }
+  const id = typeof input?.id === 'string' ? input.id.trim() : ''
+  const token = typeof input?.token === 'string' ? input.token : ''
+  const phrase = typeof input?.phrase === 'string' ? input.phrase.trim() : ''
+  if (!purgeConfirmation.consume(id, token, phrase))
+    return { ok: false as const, error: '确认已失效或确认短语不正确，请重新发起。' }
+
+  memoryV4Shadow?.flush()
+  const snapshot = memoryV4Repository.snapshot()
+  const fact = snapshot.facts.find(entry => entry.metadata?.v3SourceId === id)
+  if (!fact)
+    return { ok: false as const, error: 'V4 中没有对应事实，为避免部分删除已停止操作。' }
+  const episodeIds = new Set(snapshot.evidenceLinks.filter(link => link.factId === fact.id).map(link => link.episodeId))
+  const sharedEvidenceCount = snapshot.evidenceLinks.filter(link => episodeIds.has(link.episodeId)
+    && link.factId !== fact.id && link.active).length
+  if (sharedEvidenceCount > 0) {
+    return {
+      ok: false as const,
+      error: `该记忆与其他事实共享 ${sharedEvidenceCount} 条原始证据。为避免残留或误删，请先删除关联来源/事实，再重新彻底清除。`,
+    }
+  }
+  const originalContent = fact.canonicalText
+  let lifecycle
+  let removedV3 = false
+  try {
+    lifecycle = memoryV4Lifecycle.deleteFact(fact.id, localMemoryScope, 'purge', {
+      reason: 'User confirmed irreversible purge in memory manager.',
+      idempotencyKey: `desktop-purge:${id}:${token}`,
+    })
+    // Make the V4 privacy deletion durable and remove recoverable managed V4
+    // copies before deleting the authoritative V3 record.
+    memoryV4Persistence.scrubBackups()
+    removedV3 = await memory.purge(id, localMemoryScope)
+    memoryV4Shadow!.flush()
+    const recoveredV3 = memoryPersistence?.loadReadOnly()
+    if (recoveredV3) {
+      memoryV4Reconciliation = memoryV4Shadow!.reconcileV3Payload(recoveredV3)
+      memoryV4Audit = auditV3V4Consistency(recoveredV3, memoryV4Repository.snapshot())
+    }
+    memoryV4Persistence.scrubBackups()
+  }
+  catch (error) {
+    writeBootLog(`Memory purge partially failed for ${id}: ${errorMessage(error)}`)
+    return {
+      ok: false as const,
+      partial: true,
+      error: `彻底清除未能完成全部存储层：${errorMessage(error)}。V4 中已执行的隐私清除不会自动恢复，请修复存储后重试。`,
+    }
+  }
+  const residual = auditPurgedMemory(id, fact.id, originalContent)
+  if ((await memory.list(localMemoryScope, 20_000)).some(item => item.id === id))
+    residual.push('V3 当前索引仍含该记忆')
+  if (residual.length > 0)
+    return { ok: false as const, error: `清除后残留审计失败：${residual.join('；')}`, residual }
+  writeBootLog(`Memory purge completed: ${id}, V3 removed=${removedV3}, V4 version=${lifecycle.version}, residual=0`)
+  return {
+    ok: true as const,
+    count: await memory.count(localMemoryScope),
+    report: {
+      v3Removed: removedV3,
+      v4FactId: fact.id,
+      v4Version: lifecycle.version,
+      purgedEpisodes: lifecycle.purgedEpisodes,
+      invalidatedEvidence: lifecycle.invalidatedEvidence,
+      invalidatedDerivedArtifacts: lifecycle.invalidatedDerivedArtifacts,
+      residualCount: 0,
+      checkpointCompacted: true,
+      backupsScrubbed: true,
+    },
+  }
+}
+
 // ── IPC ─────────────────────────────────────────────────
 function setupIPC() {
   ipcMain.handle('chat:send', async (_event, message: string, attachments?: { type: 'image'; data: string; mimeType: string }[]) => {
@@ -600,8 +764,11 @@ function setupIPC() {
       enabled: !!memoryV4Shadow,
       storagePath: memoryV4StoragePath,
       pendingWrites: memoryV4Shadow?.pendingCount() ?? 0,
+      journalPendingEntries: memoryV4Persistence?.pendingEntries() ?? 0,
       reconciliation: memoryV4Reconciliation,
       error: memoryV4Error,
+      killSwitchEnabled: !config.memoryV4ShadowEnabled,
+      audit: memoryV4Audit,
     },
     settings: memorySettings,
     semantic: {
@@ -625,8 +792,11 @@ function setupIPC() {
       enabled: !!memoryV4Shadow,
       storagePath: memoryV4StoragePath,
       pendingWrites: memoryV4Shadow?.pendingCount() ?? 0,
+      journalPendingEntries: memoryV4Persistence?.pendingEntries() ?? 0,
       reconciliation: memoryV4Reconciliation,
       error: memoryV4Error,
+      killSwitchEnabled: !config.memoryV4ShadowEnabled,
+      audit: memoryV4Audit,
     },
     settings: memorySettings,
     semantic: {
@@ -665,12 +835,22 @@ function setupIPC() {
     return { ok: true, count: await memory.count(localMemoryScope) }
   })
 
+  ipcMain.handle('memory:purge-prepare', async (_event, id: string) => prepareMemoryPurge(id))
+
+  ipcMain.handle('memory:purge-confirm', async (_event, input: { id?: unknown; token?: unknown; phrase?: unknown }) => confirmMemoryPurge(input))
+
   ipcMain.handle('memory:update', async (_event, id: string, patch: Record<string, unknown>) => {
     if (!memory)
       return { ok: false, error: '长期记忆已关闭。' }
     if (typeof id !== 'string' || !id.trim() || !patch || typeof patch !== 'object')
       return { ok: false, error: '无效的记忆更新。' }
     const allowed: Record<string, unknown> = {}
+    if (typeof patch.content === 'string') {
+      const content = patch.content.trim()
+      if (!isSafeMemoryContent(content))
+        return { ok: false, error: '编辑后的内容为空，或包含指令注入、密钥、密码等不安全信息。' }
+      allowed.content = content
+    }
     if (typeof patch.importance === 'number')
       allowed.importance = patch.importance
     if (patch.expiresAt === null || typeof patch.expiresAt === 'number')
@@ -680,7 +860,8 @@ function setupIPC() {
     if (patch.sensitivity === 'normal' || patch.sensitivity === 'private' || patch.sensitivity === 'secret')
       allowed.sensitivity = patch.sensitivity
     if (patch.status === 'active' || patch.status === 'superseded' || patch.status === 'expired'
-      || patch.status === 'conflicted' || patch.status === 'orphaned')
+      || patch.status === 'conflicted' || patch.status === 'orphaned'
+      || patch.status === 'suppressed' || patch.status === 'deleted')
       allowed.status = patch.status
     const updated = await memory.update(id, localMemoryScope, allowed)
     return updated ? { ok: true } : { ok: false, error: '没有找到该记忆。' }
@@ -769,8 +950,27 @@ function createWindow() {
     // normal launches and lets CI/debug runs verify the renderer plus memory
     // initialization without leaving Electron processes behind.
     if (process.env.DESKPET_SMOKE_TEST === 'true') {
-      writeBootLog('smoke test completed')
-      setTimeout(() => app.quit(), 100)
+      const purgeId = process.env.DESKPET_SMOKE_PURGE_ID?.trim()
+      if (purgeId) {
+        void (async () => {
+          const prepared = await prepareMemoryPurge(purgeId)
+          if (!prepared.ok)
+            throw new Error(prepared.error)
+          const result = await confirmMemoryPurge({ id: purgeId, token: prepared.token, phrase: prepared.phrase })
+          if (!result.ok)
+            throw new Error(result.error)
+          writeBootLog(`smoke purge report: ${JSON.stringify(result.report)}`)
+          writeBootLog('smoke test completed')
+          setTimeout(() => app.quit(), 100)
+        })().catch((error) => {
+          writeBootLog(`smoke purge failed: ${errorMessage(error)}`)
+          app.exit(2)
+        })
+      }
+      else {
+        writeBootLog('smoke test completed')
+        setTimeout(() => app.quit(), 100)
+      }
     }
   })
   mainWindow.webContents.on('did-fail-load', (_event, code, description) => {

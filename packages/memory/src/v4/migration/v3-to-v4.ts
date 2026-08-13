@@ -249,10 +249,13 @@ export function migrateV3PayloadToV4(
       subjectId: `owner:${scope.ownerId}`,
       predicate,
       object: item.content,
+      objectType: 'string',
+      normalizedValue: item.content.normalize('NFKC').trim(),
       canonicalText: item.content,
       memoryKey,
       cardinality: normalizeCardinality(item.metadata?.cardinality),
       polarity: inferPolarity(item.content),
+      modality: 'asserted',
       status: factStatus,
       ...(optionalTimestamp(item.validFrom) ? { validFrom: optionalTimestamp(item.validFrom) } : {}),
       ...(optionalTimestamp(item.validTo) ? { validTo: optionalTimestamp(item.validTo) } : {}),
@@ -287,7 +290,14 @@ export function migrateV3PayloadToV4(
       factId,
       version: 1,
       operation: 'MIGRATE_V3',
+      subjectId: fact.subjectId,
+      predicate: fact.predicate,
+      object: fact.object,
+      objectType: fact.objectType,
+      normalizedValue: fact.normalizedValue,
       canonicalText: fact.canonicalText,
+      polarity: fact.polarity,
+      modality: fact.modality,
       status: fact.status,
       ...(fact.validFrom ? { validFrom: fact.validFrom } : {}),
       ...(fact.validTo ? { validTo: fact.validTo } : {}),
@@ -359,7 +369,7 @@ function parseV3Snapshot(payload: string): V3Snapshot {
     if (typeof item.createdAt !== 'number' || typeof item.updatedAt !== 'number')
       throw new Error(`V3 memory item ${item.id} has invalid timestamps`)
     if (typeof item.status !== 'string'
-      || !['active', 'superseded', 'expired', 'conflicted', 'orphaned'].includes(item.status))
+      || !['active', 'superseded', 'expired', 'conflicted', 'orphaned', 'suppressed', 'deleted'].includes(item.status))
       throw new Error(`V3 memory item ${item.id} has an invalid status`)
     return asJsonObject(item, `V3 memory item ${item.id}`) as unknown as V3MemoryItem
   })
@@ -372,7 +382,11 @@ function isEmptyV4Target(snapshot: MemoryV4Snapshot): boolean {
     && snapshot.facts.length === 0
     && snapshot.evidenceLinks.length === 0
     && snapshot.factVersions.length === 0
+    && snapshot.derivedArtifacts.length === 0
+    && snapshot.domainEvents.length === 0
     && snapshot.retrievalEvents.length === 0
+    && snapshot.derivedArtifacts.length === 0
+    && snapshot.domainEvents.length === 0
     && snapshot.migrationManifests.length === 0
     && snapshot.legacyImports.length === 0
 }
@@ -400,6 +414,7 @@ function sha256(value: string): string {
 
 function normalizeStatus(value: string): MemoryFactStatusV4 {
   return value === 'superseded' || value === 'conflicted' || value === 'expired' || value === 'orphaned'
+    || value === 'suppressed' || value === 'deleted'
     ? value
     : 'active'
 }

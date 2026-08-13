@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createVectorStore } from './vector-store'
-import type { MemoryPersistenceDelta } from './vector-store'
+import type { MemoryPersistenceDelta, V3MemoryCommit } from './vector-store'
 
 const temporaryDirectories: string[] = []
 
@@ -14,6 +14,42 @@ afterEach(() => {
 })
 
 describe('persistent vector store', () => {
+  it('persists content edits as update commits and keeps suppressed memories out of recall', async () => {
+    const commits: V3MemoryCommit[] = []
+    const store = createVectorStore({ onCommittedChange: commit => commits.push(commit) })
+    const scope = { ownerId: 'owner', agentId: 'agent' }
+    const remembered = await store.remember('用户喜欢旧内容', scope, { origin: 'manual' })
+    expect(remembered).toBeDefined()
+    expect(await store.update(remembered!.id, scope, { content: '用户喜欢新内容', status: 'suppressed' })).toBe(true)
+    expect((await store.list(scope))[0]).toMatchObject({ content: '用户喜欢新内容', status: 'suppressed' })
+    expect(await store.recall('新内容', scope, 5)).toEqual([])
+    expect(commits.at(-1)).toMatchObject({ reason: 'update' })
+    expect(commits.at(-1)!.upserts[0]).toMatchObject({ content: '用户喜欢新内容', status: 'suppressed' })
+    expect(await store.restore(remembered!.id, scope)).toBe(true)
+    expect((await store.recall('新内容', scope, 5))[0]?.content).toBe('用户喜欢新内容')
+  })
+
+  it('keeps the previous content and indexes intact when re-embedding an edit fails', async () => {
+    let rejectEdit = false
+    const store = createVectorStore({
+      minScore: 0,
+      embedder: async (text) => {
+        if (rejectEdit && text.includes('新内容'))
+          throw new Error('simulated embedding failure')
+        return text.includes('旧内容') ? [1, 0] : [0, 1]
+      },
+    })
+    const scope = { ownerId: 'owner', agentId: 'agent' }
+    const remembered = await store.remember('用户喜欢旧内容', scope, { origin: 'manual' })
+    rejectEdit = true
+
+    await expect(store.update(remembered!.id, scope, { content: '用户喜欢新内容' }))
+      .rejects.toThrow('simulated embedding failure')
+    expect((await store.list(scope))[0]?.content).toBe('用户喜欢旧内容')
+    rejectEdit = false
+    expect((await store.recall('旧内容', scope, 1))[0]?.content).toBe('用户喜欢旧内容')
+  })
+
   it('creates an empty storage file immediately', () => {
     const storagePath = temporaryFile()
 
@@ -370,6 +406,45 @@ describe('persistent vector store', () => {
     expect((await store.recall('2024 年我住在哪里', scope))[0]?.content).toContain('北京')
   })
 
+  it('stores a newly discovered closed historical interval without replacing the current fact', async () => {
+    const store = createVectorStore({ minScore: 0.1, minSemanticScore: 0.1 })
+    const scope = { ownerId: 'late-history', agentId: 'deskpet' }
+    const boundary = Date.parse('2025-01-01T00:00:00Z')
+    await store.remember('用户所在地：上海', scope, {
+      memoryKey: 'profile.location', cardinality: 'single', confidence: 0.95,
+      kind: 'identity', validFrom: boundary,
+    })
+    await store.remember('用户所在地：北京', scope, {
+      memoryKey: 'profile.location', cardinality: 'single', confidence: 0.95,
+      kind: 'identity', validFrom: Date.parse('2024-01-01T00:00:00Z'), validTo: boundary,
+      temporalQualifier: 'historical', memoryWriteAction: 'ADD',
+    })
+
+    const versions = await store.list(scope)
+    expect(versions.find(item => item.content.includes('上海'))?.status).toBe('active')
+    expect(versions.find(item => item.content.includes('北京'))).toMatchObject({
+      status: 'superseded', validTo: boundary,
+    })
+    expect((await store.recall('用户当前所在地', scope))[0]?.content).toContain('上海')
+    expect((await store.recall('2024 年我住在哪里', scope))[0]?.content).toContain('北京')
+  })
+
+  it('recalls the correct monthly fact version from a natural-language date', async () => {
+    const store = createVectorStore({ minScore: 0.1, minSemanticScore: 0.1 })
+    const scope = { ownerId: 'monthly-history', agentId: 'deskpet' }
+    const cities = ['北京', '上海', '南京']
+    for (const [month, city] of cities.entries()) {
+      await store.remember(`用户所在地：${city}`, scope, {
+        memoryKey: 'profile.location', cardinality: 'single', confidence: 0.95,
+        kind: 'identity', validFrom: Date.UTC(2025, month, 1),
+      })
+    }
+
+    expect((await store.recall('2025年1月我住在哪里', scope))[0]?.content).toContain('北京')
+    expect((await store.recall('2025年2月份我住在哪里', scope))[0]?.content).toContain('上海')
+    expect((await store.recall('2025-03-20 我住在哪里', scope))[0]?.content).toContain('南京')
+  })
+
   it('retains the newest write when capacity timestamps are identical', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
     const store = createVectorStore({
@@ -449,6 +524,43 @@ describe('persistent vector store', () => {
     expect((await store.recall('习惯白天还是夜里办公', scope, 3))[0]?.content).toContain('晚上')
     expect((await store.recall('做菜时不要加哪样东西', scope, 3))[0]?.content).toContain('香菜')
     expect(await store.recall('量子纠缠如何定义', scope, 3)).toEqual([])
+  })
+
+  it('recalls durable personal fields through colloquial cross-wording aliases', async () => {
+    const store = createVectorStore()
+    const scope = { ownerId: 'local-semantic-v3', agentId: 'deskpet' }
+    const facts = [
+      ['用户所在地：杭州滨江', 'identity'],
+      ['用户职业：产品设计', 'identity'],
+      ['用户当前项目：长期记忆毕业论文', 'project'],
+      ['用户伴侣姓名：陈曦', 'relationship'],
+      ['用户过敏信息：花生', 'health'],
+      ['用户就读院校：浙江大学', 'identity'],
+      ['用户常用编程语言：Rust', 'identity'],
+      ['用户生日：腊月初八', 'identity'],
+      ['用户喜欢的颜色：墨绿色', 'preference'],
+    ] as const
+    for (const [content, kind] of facts)
+      await store.remember(content, scope, { kind })
+
+    expect((await store.recall('现在定居在哪里', scope, 1))[0]?.content).toContain('杭州滨江')
+    expect((await store.recall('靠什么工作谋生', scope, 1))[0]?.content).toContain('产品设计')
+    expect((await store.recall('手头在准备什么', scope, 1))[0]?.content).toContain('毕业论文')
+    expect((await store.recall('另一半叫什么', scope, 1))[0]?.content).toContain('陈曦')
+    expect((await store.recall('哪些食材要避开', scope, 1))[0]?.content).toContain('花生')
+    expect((await store.recall('本科在哪读的', scope, 1))[0]?.content).toContain('浙江大学')
+    expect((await store.recall('写代码的技术栈', scope, 1))[0]?.content).toContain('Rust')
+    expect((await store.recall('哪天庆生', scope, 1))[0]?.content).toContain('腊月初八')
+    expect((await store.recall('选衣服的色系', scope, 1))[0]?.content).toContain('墨绿色')
+    expect(await store.recall('明天会不会下雨', scope, 1)).toEqual([])
+  })
+
+  it('upgrades an explicitly configured legacy local hash model without remote API use', async () => {
+    const store = createVectorStore({ embeddingModel: 'local-hash-v2' })
+    const scope = { ownerId: 'legacy-local-hash', agentId: 'deskpet' }
+    await store.remember('用户所在地：苏州', scope, { kind: 'identity' })
+
+    expect((await store.recall('现在定居在哪里', scope, 1))[0]?.content).toContain('苏州')
   })
 
   it('deduplicates equivalent fact wording without merging opposite preferences', async () => {

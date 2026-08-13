@@ -92,8 +92,9 @@ describe('Memory V4 structural and isolation invariants', () => {
         id: `fact-${index}`,
         scope: { ownerId: 'owner', agentId: 'agent' },
         subjectId: 'owner:owner', predicate: 'history.item', object: index,
+        objectType: 'number', normalizedValue: index,
         canonicalText: `history-${index}`, memoryKey: `history.${index}`,
-        cardinality: 'multiple', polarity: 'unknown', status: 'archived',
+        cardinality: 'multiple', polarity: 'unknown', modality: 'asserted', status: 'archived',
         recordedAt: 1000 + index, updatedAt: 1000 + index, evidenceLinkIds: [],
         extractionScore: 1, verificationScore: 1, evidenceScore: 1,
         utilityScore: 0.5, importance: 0.5, accessCount: 0, userConfirmed: false,
@@ -104,7 +105,9 @@ describe('Memory V4 structural and isolation invariants', () => {
       })
       snapshot.factVersions.push({
         id: `version-${index}`, factId: `fact-${index}`, version: 1,
-        operation: 'ADD', canonicalText: `history-${index}`, status: 'archived',
+        operation: 'ADD', subjectId: 'owner:owner', predicate: 'history.item', object: index,
+        objectType: 'number', normalizedValue: index, canonicalText: `history-${index}`,
+        polarity: 'unknown', modality: 'asserted', status: 'archived',
         evidenceLinkIds: [], recordedAt: 1000 + index, reason: 'stress history',
       })
     }

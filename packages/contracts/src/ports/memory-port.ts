@@ -37,6 +37,7 @@ export interface MemoryFragment {
 }
 
 export type MemoryStatus = 'active' | 'superseded' | 'expired' | 'conflicted' | 'orphaned'
+  | 'suppressed' | 'deleted'
 export type MemoryOrigin = 'automatic' | 'manual' | 'image'
 export type MemorySharePolicy = 'allow-remote' | 'local-only' | 'ask'
 export type MemorySensitivity = 'normal' | 'private' | 'secret'
@@ -111,6 +112,8 @@ export interface MemoryCapture {
 }
 
 export interface MemoryUpdate {
+  /** Replace the user-visible fact text. Persistent stores must retain an auditable version. */
+  content?: string
   importance?: number
   expiresAt?: number | null
   sharePolicy?: MemorySharePolicy
@@ -145,6 +148,8 @@ export interface AgentMemoryPort {
   capture: (turn: MemoryCapture, scope: MemoryScope) => Promise<number>
   /** Remove a memory by id, constrained to its owner scope. */
   forget: (id: string, scope: MemoryScope) => Promise<void>
+  /** Irreversibly remove a memory and compact managed persistence. */
+  purge?: (id: string, scope: MemoryScope) => Promise<boolean>
   /** Update user-managed lifecycle, privacy and importance fields. */
   update: (id: string, scope: MemoryScope, patch: MemoryUpdate) => Promise<boolean>
   /** Restore an inactive memory to the active set. */

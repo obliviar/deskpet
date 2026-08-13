@@ -43,6 +43,52 @@ describe('extractMemoryCandidates', () => {
     }
   })
 
+  it('covers high-value colloquial durable facts with stable metadata', () => {
+    const cases: Array<[string, string]> = [
+      ['大家一般喊我小鹿', '用户希望的称呼：小鹿'],
+      ['常住地在杭州滨江', '用户所在地：杭州滨江'],
+      ['职业方面，我做产品设计', '用户职业：产品设计'],
+      ['饮料里我通常会选无糖美式', '用户常喝饮品：无糖美式'],
+      ['周末早上会固定跑步', '用户固定安排：周末跑步'],
+      ['每个月十五号交房租', '用户缴房租日期：每月十五号'],
+      ['最近在筹备一篇毕业论文', '用户当前项目：一篇毕业论文'],
+      ['明年的打算是学会日语', '用户目标：学会日语'],
+      ['家里有只金毛，叫可乐', '用户宠物名字：可乐'],
+      ['我对象叫陈曦', '用户伴侣姓名：陈曦'],
+      ['花生会让我起疹子，得完全避开', '用户过敏信息：花生'],
+      ['回答尽量控制在三句话以内', '用户回答偏好：三句话'],
+      ['我是左撇子', '用户惯用手：左撇子'],
+      ['买衣服时我会优先选墨绿色', '用户喜欢的颜色：墨绿色'],
+      ['本科就读于浙江大学', '用户就读院校：浙江大学'],
+      ['日常写代码主要用 Rust', '用户常用编程语言：Rust'],
+      ['On weekends I usually go hiking', 'User weekend routine：hiking'],
+      ['Peanuts give me a serious allergic reaction', 'User allergy：Peanuts'],
+      ['Oolong tea is my usual drink', 'User usual drink：Oolong tea'],
+      ['Shanghai has been home for the last two years', 'User location：Shanghai'],
+    ]
+    for (const [userMessage, expected] of cases) {
+      expect(extractMemoryCandidates({ userMessage, assistantMessage: '' })
+        .map(item => item.content)).toContain(expected)
+    }
+  })
+
+  it('extracts explicit corrections without keeping the denied current value', () => {
+    const name = extractMemoryCandidates({
+      userMessage: '我的名字不是小李，而是小王。',
+      assistantMessage: '',
+    })
+    expect(name.map(item => item.content)).toEqual(['用户姓名/名字：小王'])
+    expect(name[0]?.metadata).toMatchObject({ memoryKey: 'profile.name', cardinality: 'single' })
+
+    const location = extractMemoryCandidates({
+      userMessage: '我以前住北京，现在住深圳。',
+      assistantMessage: '',
+    })
+    expect(location.map(item => item.content)).toEqual(['用户所在地：北京', '用户所在地：深圳'])
+    expect(location[0]?.metadata).toMatchObject({ memoryKey: 'profile.location', temporalQualifier: 'historical' })
+    expect(location[1]?.metadata).toMatchObject({ memoryKey: 'profile.location', temporalQualifier: 'current' })
+  })
+
   it('splits parallel facts into atomic memories', () => {
     expect(extractMemoryCandidates({
       userMessage: '我喜欢爵士乐，也喜欢黑咖啡。',
@@ -61,6 +107,21 @@ describe('extractMemoryCandidates', () => {
       '你刚才说我喜欢咖啡，但那不是真的',
       '我不叫王五',
       '我以前喜欢香菜，现在不喜欢了',
+    ]
+    for (const userMessage of inputs)
+      expect(extractMemoryCandidates({ userMessage, assistantMessage: '' })).toEqual([])
+  })
+
+  it('rejects reported, example, translated and transient personal-looking text', () => {
+    const inputs = [
+      '我喜欢今天的天气。',
+      '我喜欢你刚才的回答。',
+      '他说我的妻子叫小美。',
+      '举个例子：我的电脑是 MacBook。',
+      '这两分钟我在做网络测速。',
+      '小王说“我的目标是跑马拉松”。',
+      '翻译这句：I live in Paris.',
+      '角色扮演时我叫夜影。',
     ]
     for (const userMessage of inputs)
       expect(extractMemoryCandidates({ userMessage, assistantMessage: '' })).toEqual([])

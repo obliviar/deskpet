@@ -31,7 +31,7 @@ interface MemoryItem {
   metadata?: Record<string, unknown>
   createdAt: number
   updatedAt?: number
-  status?: 'active' | 'superseded' | 'expired' | 'conflicted' | 'orphaned'
+  status?: 'active' | 'superseded' | 'expired' | 'conflicted' | 'orphaned' | 'suppressed' | 'deleted'
   origin?: 'automatic' | 'manual' | 'image'
   importance?: number
   confidence?: number
@@ -96,6 +96,12 @@ const memoryMutating = ref(false)
 const memoryStatusMessage = ref('')
 const memoryStatusError = ref(false)
 const pendingDeleteMemoryId = ref<string | null>(null)
+const pendingPurgeMemoryId = ref<string | null>(null)
+const purgeToken = ref('')
+const purgePhrase = ref('')
+const purgeWarning = ref('')
+const editingMemoryId = ref<string | null>(null)
+const editingMemoryContent = ref('')
 const confirmClearMemories = ref(false)
 const memorySettings = ref<MemorySettings>({
   extractionMode: 'rules',
@@ -295,6 +301,7 @@ async function openMemoryManager() {
   memoryStatusMessage.value = ''
   memoryStatusError.value = false
   pendingDeleteMemoryId.value = null
+  cancelPurgeMemory()
   confirmClearMemories.value = false
   showMemoryManager.value = true
   await refreshMemoryList()
@@ -406,6 +413,33 @@ async function updateMemory(item: MemoryItem, patch: Record<string, unknown>) {
   }
 }
 
+function beginEditMemory(item: MemoryItem) {
+  editingMemoryId.value = item.id
+  editingMemoryContent.value = item.content
+}
+
+function cancelEditMemory() {
+  editingMemoryId.value = null
+  editingMemoryContent.value = ''
+}
+
+async function saveEditedMemory(item: MemoryItem) {
+  const content = editingMemoryContent.value.trim()
+  if (!content || content === item.content) {
+    cancelEditMemory()
+    return
+  }
+  await updateMemory(item, { content })
+  if (!memoryStatusError.value)
+    cancelEditMemory()
+}
+
+async function suppressMemory(item: MemoryItem) {
+  await updateMemory(item, { status: 'suppressed' })
+  if (!memoryStatusError.value)
+    memoryStatusMessage.value = '记忆已停用，不再参与普通召回；可随时恢复。'
+}
+
 async function updateMemorySensitivity(item: MemoryItem) {
   await updateMemory(item, {
     sensitivity: item.sensitivity,
@@ -487,6 +521,65 @@ async function deleteMemory(id: string) {
   }
 }
 
+async function preparePurgeMemory(id: string) {
+  if (memoryMutating.value) return
+  memoryStatusMessage.value = ''
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:purge-prepare', id)
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '无法发起彻底清除。'
+      return
+    }
+    pendingPurgeMemoryId.value = id
+    purgeToken.value = result.token
+    purgePhrase.value = ''
+    purgeWarning.value = result.warning
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '无法发起彻底清除。'
+  }
+}
+
+function cancelPurgeMemory() {
+  pendingPurgeMemoryId.value = null
+  purgeToken.value = ''
+  purgePhrase.value = ''
+  purgeWarning.value = ''
+}
+
+async function confirmPurgeMemory(id: string) {
+  if (memoryMutating.value || pendingPurgeMemoryId.value !== id || purgePhrase.value.trim() !== '彻底清除') return
+  memoryMutating.value = true
+  memoryStatusMessage.value = ''
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:purge-confirm', {
+      id,
+      token: purgeToken.value,
+      phrase: purgePhrase.value,
+    })
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '彻底清除失败。'
+      return
+    }
+    const report = result.report
+    memoryStatusMessage.value = `彻底清除完成：V3 已移除，V4 清理 ${report?.purgedEpisodes ?? 0} 条独占证据，残留 ${report?.residualCount ?? 0}。`
+    cancelPurgeMemory()
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '彻底清除失败。'
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
 async function clearAllMemories() {
   if (!confirmClearMemories.value) {
     confirmClearMemories.value = true
@@ -504,7 +597,7 @@ async function clearAllMemories() {
       return
     }
     confirmClearMemories.value = false
-    memoryStatusMessage.value = '所有长期记忆已清空。'
+    memoryStatusMessage.value = 'V3 记忆已普通清空；V4 保留审计墓碑。不可恢复删除请逐条使用“彻底清除”。'
     await refreshMemoryList()
   }
   catch (error) {
@@ -548,6 +641,8 @@ function memoryStatusLabel(item: MemoryItem): string {
     expired: '已过期',
     conflicted: '待确认冲突',
     orphaned: '来源已删除',
+    suppressed: '已停用',
+    deleted: '已删除',
   } as Record<string, string>)[item.status || 'active'] || '有效'
 }
 
@@ -1011,7 +1106,14 @@ async function doReset() {
                   <span>{{ formatMemoryDate(item) }}</span>
                   <span v-if="item.accessCount">召回 {{ item.accessCount }} 次</span>
                 </div>
-                <div class="memory-content">{{ item.content }}</div>
+                <div v-if="editingMemoryId !== item.id" class="memory-content">{{ item.content }}</div>
+                <div v-else class="memory-edit-row">
+                  <textarea v-model="editingMemoryContent" class="settings-input memory-input" maxlength="1000" />
+                  <div>
+                    <button class="memory-restore-btn" :disabled="memoryMutating || !editingMemoryContent.trim()" @click="saveEditedMemory(item)">保存新版本</button>
+                    <button class="memory-delete-btn" :disabled="memoryMutating" @click="cancelEditMemory">取消</button>
+                  </div>
+                </div>
                 <div class="memory-item-controls">
                   <label>重要度
                     <select v-model.number="item.importance" :disabled="memoryMutating" @change="updateMemory(item, { importance: item.importance })">
@@ -1038,22 +1140,36 @@ async function doReset() {
                 </div>
               </div>
               <div class="memory-item-actions">
+                <button v-if="editingMemoryId !== item.id && item.status !== 'deleted'" class="memory-restore-btn" :disabled="memoryMutating" @click="beginEditMemory(item)">编辑正文</button>
+                <button v-if="(!item.status || item.status === 'active')" class="memory-restore-btn" :disabled="memoryMutating" @click="suppressMemory(item)">停止使用</button>
                 <button v-if="item.status && item.status !== 'active'" class="memory-restore-btn" :disabled="memoryMutating" @click="restoreMemory(item)">恢复</button>
                 <button
                   :class="['memory-delete-btn', { confirm: pendingDeleteMemoryId === item.id }]"
                   :disabled="memoryMutating"
                   @click="deleteMemory(item.id)"
                 >
-                  {{ pendingDeleteMemoryId === item.id ? '确认永久删除' : '永久删除' }}
+                  {{ pendingDeleteMemoryId === item.id ? '确认普通删除' : '普通删除' }}
                 </button>
+                <button class="memory-purge-btn" :disabled="memoryMutating" @click="preparePurgeMemory(item.id)">彻底清除…</button>
+              </div>
+              <div v-if="pendingPurgeMemoryId === item.id" class="memory-purge-confirm">
+                <strong>不可恢复操作</strong>
+                <span>{{ purgeWarning }}</span>
+                <label>输入“彻底清除”确认
+                  <input v-model="purgePhrase" class="settings-input" type="text" autocomplete="off" @keydown.enter="confirmPurgeMemory(item.id)" />
+                </label>
+                <div>
+                  <button class="danger-btn" :disabled="memoryMutating || purgePhrase.trim() !== '彻底清除'" @click="confirmPurgeMemory(item.id)">清除正文、版本、证据和受管备份</button>
+                  <button class="memory-restore-btn" :disabled="memoryMutating" @click="cancelPurgeMemory">取消</button>
+                </div>
               </div>
             </div>
           </div>
 
           <div class="memory-footer">
-            <span>记忆加密写入 <code>memories.enc</code>；自动记忆的聊天来源被删除后会变为“来源已删除”，可恢复或永久删除。</span>
+            <span>记忆加密写入 <code>memories.enc</code>；普通删除保留 V4 审计墓碑，“彻底清除”才会移除可恢复正文、版本、独占证据和受管备份。</span>
             <button class="danger-btn" :disabled="memoryMutating || memoryItems.length === 0" @click="clearAllMemories">
-              {{ confirmClearMemories ? '再次点击确认清空' : '清空全部记忆' }}
+              {{ confirmClearMemories ? '再次确认普通清空' : '普通清空全部（保留审计）' }}
             </button>
           </div>
         </template>
@@ -1198,14 +1314,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .memory-state.active { background: rgba(45,125,70,0.13); color: var(--accent); }
 .memory-state.conflicted { background: rgba(217,119,87,0.15); color: #d97757; }
 .memory-content { color: var(--text); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.memory-edit-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: start; }
+.memory-edit-row > div { display: flex; flex-direction: column; gap: 6px; }
 .memory-item-controls { display: grid; grid-template-columns: 0.65fr 1fr 1.2fr; gap: 7px; margin-top: 9px; }
 .memory-item-controls select { display: block; margin-top: 4px; padding: 5px 6px; font-size: 9px; }
 .memory-item-actions { display: flex; flex-direction: column; flex-shrink: 0; gap: 6px; }
 .memory-restore-btn { padding: 6px 9px; border: 1px solid var(--accent); border-radius: 7px; background: transparent; color: var(--accent); cursor: pointer; font: inherit; font-size: 11px; }
-.memory-delete-btn, .danger-btn { border: 1px solid rgba(231,76,60,0.45); border-radius: 7px; background: transparent; color: #e76f61; cursor: pointer; font-family: inherit; font-size: 11px; }
+.memory-delete-btn, .memory-purge-btn, .danger-btn { border: 1px solid rgba(231,76,60,0.45); border-radius: 7px; background: transparent; color: #e76f61; cursor: pointer; font-family: inherit; font-size: 11px; }
 .memory-delete-btn { flex-shrink: 0; padding: 6px 9px; }
+.memory-purge-btn { flex-shrink: 0; padding: 6px 9px; border-style: dashed; }
 .memory-delete-btn.confirm, .danger-btn:hover { background: rgba(231,76,60,0.14); border-color: #e76f61; }
-.memory-delete-btn:disabled, .danger-btn:disabled { opacity: 0.45; cursor: default; }
+.memory-delete-btn:disabled, .memory-purge-btn:disabled, .danger-btn:disabled { opacity: 0.45; cursor: default; }
+.memory-purge-confirm { grid-column: 1 / -1; display: grid; gap: 8px; margin-top: 10px; padding: 12px; border: 1px solid rgba(231,76,60,0.45); border-radius: 8px; background: rgba(231,76,60,0.08); color: var(--text); font-size: 12px; }
+.memory-purge-confirm > div { display: flex; gap: 8px; flex-wrap: wrap; }
+.memory-purge-confirm .danger-btn, .memory-purge-confirm .memory-restore-btn { padding: 7px 10px; }
 .memory-footer { display: flex; align-items: center; gap: 12px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
 .memory-footer > span { flex: 1; color: var(--text-muted); font-size: 10px; }
 .danger-btn { padding: 7px 10px; }

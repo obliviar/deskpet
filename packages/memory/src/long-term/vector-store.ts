@@ -11,11 +11,12 @@ import type {
   MemoryTemporalMode,
   MemoryUpdate,
 } from '@deskpet/contracts'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import OpenAI from 'openai'
 import {
   createLocalEmbedding,
+  LEGACY_LOCAL_EMBEDDING_MODELS,
   localSemanticConcepts,
   LOCAL_EMBEDDING_MODEL,
   sharesLocalSemanticConcept,
@@ -30,6 +31,10 @@ export interface MemoryPersistence {
   appendDelta?: (delta: MemoryPersistenceDelta) => void
   /** Preserve the current physical payload before an automatic schema upgrade. */
   backupBeforeMigration?: () => void
+  /** Fold the journal into the current encrypted snapshot. */
+  compact?: () => void
+  /** Replace managed backups with the current effective payload after purge. */
+  scrubBackups?: () => void
   storagePath?: string
 }
 
@@ -62,7 +67,7 @@ export interface VectorStoreOptions {
 type MemoryCardinality = 'single' | 'multiple'
 
 export type V3MemoryCommitReason = 'recall' | 'expiry' | 'remember' | 'forget'
-  | 'update' | 'restore' | 'unlink-sources' | 'clear'
+  | 'update' | 'restore' | 'unlink-sources' | 'clear' | 'purge'
 
 export interface V3MemoryRecord extends MemoryFragment {
   status: MemoryStatus
@@ -129,19 +134,25 @@ interface RankedMemoryPool {
 }
 
 export function createVectorStore(options: VectorStoreOptions = {}) {
+  const configuredEmbeddingModel = options.embeddingModel ?? LOCAL_EMBEDDING_MODEL
+  // Treat old local-hash configuration values as aliases for the current local
+  // model. This rebuilds persisted vectors lazily and prevents a legacy config
+  // from being mistaken for a remote OpenAI-compatible embedding model.
+  const embeddingModel = LEGACY_LOCAL_EMBEDDING_MODELS.has(configuredEmbeddingModel)
+    ? LOCAL_EMBEDDING_MODEL
+    : configuredEmbeddingModel
   const {
     apiKey,
     baseURL,
-    embeddingModel = LOCAL_EMBEDDING_MODEL,
     storagePath,
-    minScore = embeddingModel === LOCAL_EMBEDDING_MODEL ? 0.12 : 0.3,
-    minSemanticScore = embeddingModel === LOCAL_EMBEDDING_MODEL ? 0.2 : 0.32,
-    minLexicalScore = 0.08,
     maxMemories = 20_000,
     embedder,
     onCommittedChange,
     onCommitObserverError,
   } = options
+  const minScore = options.minScore ?? (embeddingModel === LOCAL_EMBEDDING_MODEL ? 0.12 : 0.3)
+  const minSemanticScore = options.minSemanticScore ?? (embeddingModel === LOCAL_EMBEDDING_MODEL ? 0.2 : 0.32)
+  const minLexicalScore = options.minLexicalScore ?? 0.08
 
   const persistence = options.persistence ?? createFilePersistence(storagePath)
   const remoteClient = !embedder && embeddingModel !== LOCAL_EMBEDDING_MODEL
@@ -272,6 +283,21 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
   }
 
   return {
+    async inspectWriteMatches(
+      content: string,
+      scope: MemoryScope,
+      memoryKey?: string,
+    ): Promise<{ exact?: V3MemoryRecord; activeByMemoryKey: V3MemoryRecord[] }> {
+      const normalizedScope = normalizeScope(scope)
+      const exact = findExactMemory(secondary, normalizedScope, normalizeContent(content))
+      const activeByMemoryKey = memoryKey
+        ? findActiveByMemoryKey(secondary, normalizedScope, memoryKey)
+        : []
+      return {
+        ...(exact ? { exact: cloneCommittedRecords([exact])[0] } : {}),
+        activeByMemoryKey: cloneCommittedRecords(activeByMemoryKey),
+      }
+    },
     async list(scope: MemoryScope, limit = 100): Promise<MemoryFragment[]> {
       const normalizedScope = normalizeScope(scope)
       const expired = markExpired(index, normalizedScope, secondary)
@@ -351,9 +377,16 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       const requestedValidFrom = optionalTimestamp(metadata?.validFrom)
       const effectiveValidFrom = requestedValidFrom ?? (memoryKey && cardinality === 'single' ? now : undefined)
       const requestedValidTo = optionalTimestamp(metadata?.validTo)
+      const closedHistoricalInterval = requestedValidTo !== undefined && requestedValidTo <= now
       const sourceMessageIds = stringArray(metadata?.sourceMessageIds)
       const sourceAttachmentIds = stringArray(metadata?.sourceAttachmentIds)
-      let duplicate = findExactMemory(secondary, normalizedScope, normalizedContent)
+      const matchedMemoryId = optionalString(metadata?.memoryMatchedId)
+      const matchedRefinement = metadata?.memoryWriteAction === 'REFINE' && matchedMemoryId
+        ? secondary.byId.get(matchedMemoryId)
+        : undefined
+      let duplicate = matchedRefinement && matchesExactScope(matchedRefinement.scope, normalizedScope)
+        ? matchedRefinement
+        : findExactMemory(secondary, normalizedScope, normalizedContent)
       let embedding: number[] | undefined
       if (!duplicate) {
         embedding = await embed(normalizedContent)
@@ -366,14 +399,14 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           metadata,
         )
       }
-      const conflicts = memoryKey && cardinality === 'single'
+      const conflicts = memoryKey && cardinality === 'single' && !closedHistoricalInterval
         ? findActiveByMemoryKey(secondary, normalizedScope, memoryKey)
           .filter(item => item.status === 'active'
           && item.id !== duplicate?.id
           && normalizeContent(item.content).toLocaleLowerCase() !== normalizedContent.toLocaleLowerCase())
         : []
 
-      let status = normalizeStatus(metadata?.status) ?? 'active'
+      let status = normalizeStatus(metadata?.status) ?? (closedHistoricalInterval ? 'superseded' : 'active')
       let supersedes: string | undefined
       const changedConflicts: IndexedMemory[] = []
       if (conflicts.length > 0) {
@@ -394,7 +427,16 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       }
 
       if (duplicate) {
+        const refineContent = metadata?.memoryWriteAction === 'REFINE'
+          && normalizeContent(duplicate.content).toLocaleLowerCase() !== normalizedContent.toLocaleLowerCase()
         removeActiveIndexes(secondary, duplicate)
+        if (refineContent) {
+          removeSetValue(secondary.exact, exactContentKey(duplicate.scope, duplicate.content), duplicate.id)
+          duplicate.content = normalizedContent
+          duplicate.embedding = embedding ?? await embed(normalizedContent)
+          duplicate.embeddingModel = embeddingModel
+          addSetValue(secondary.exact, exactContentKey(duplicate.scope, duplicate.content), duplicate.id)
+        }
         duplicate.metadata = mergeMetadata(duplicate.metadata, metadata)
         duplicate.sourceMessageIds = unionStrings(duplicate.sourceMessageIds, sourceMessageIds)
         duplicate.sourceAttachmentIds = unionStrings(duplicate.sourceAttachmentIds, sourceAttachmentIds)
@@ -494,13 +536,40 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       }
     },
 
+    async purge(id: string, scope: MemoryScope): Promise<boolean> {
+      const normalizedScope = normalizeScope(scope)
+      const itemIndex = index.findIndex(item => item.id === id && matchesScope(item.scope, normalizedScope))
+      if (itemIndex < 0) {
+        persistence?.compact?.()
+        persistence?.scrubBackups?.()
+        return false
+      }
+      removeMemoryIndexes(secondary, index[itemIndex]!)
+      index.splice(itemIndex, 1)
+      persistChanges(persistence, index, [], [id], 'purge', onCommittedChange, onCommitObserverError)
+      persistence?.compact?.()
+      persistence?.scrubBackups?.()
+      return true
+    },
+
     async update(id: string, scope: MemoryScope, patch: MemoryUpdate): Promise<boolean> {
       const normalizedScope = normalizeScope(scope)
       const item = index.find(entry => entry.id === id && matchesScope(entry.scope, normalizedScope))
       if (!item)
         return false
+      const updatedContent = patch.content === undefined ? undefined : normalizeContent(patch.content)
+      if (patch.content !== undefined && !updatedContent)
+        return false
+      const updatedEmbedding = updatedContent !== undefined && updatedContent !== item.content
+        ? await embed(updatedContent)
+        : undefined
       const now = Date.now()
       removeActiveIndexes(secondary, item)
+      if (updatedContent !== undefined && updatedEmbedding) {
+        item.content = updatedContent
+        item.embedding = updatedEmbedding
+        item.embeddingModel = embeddingModel
+      }
       if (patch.importance !== undefined)
         item.importance = clampNumber(patch.importance, 0, 1, item.importance)
       if (patch.expiresAt === null)
@@ -519,6 +588,9 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         }
         else if (patch.status === 'superseded') {
           item.validTo = temporalCloseBoundary(item, now)
+          item.invalidatedAt = now
+        }
+        else if (patch.status === 'suppressed' || patch.status === 'deleted') {
           item.invalidatedAt = now
         }
       }
@@ -652,10 +724,35 @@ export function createFilePersistence(storagePath?: string): MemoryPersistence |
     save(payload) {
       mkdirSync(dirname(storagePath), { recursive: true })
       const temporaryPath = `${storagePath}.${process.pid}.tmp`
-      writeFileSync(temporaryPath, payload, 'utf-8')
-      renameSync(temporaryPath, storagePath)
+      try {
+        writeFileSync(temporaryPath, payload, 'utf-8')
+        replaceFileWithRetry(temporaryPath, storagePath)
+      }
+      catch (error) {
+        rmSync(temporaryPath, { force: true })
+        throw error
+      }
     },
   }
+}
+
+function replaceFileWithRetry(temporaryPath: string, targetPath: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(temporaryPath, targetPath)
+      return
+    }
+    catch (error) {
+      if (attempt >= 5 || !isTransientWindowsFileError(error))
+        throw error
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 * 2 ** attempt)
+    }
+  }
+}
+
+function isTransientWindowsFileError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES'
 }
 
 function toMemoryFragment(item: IndexedMemory, score?: number): MemoryFragment {
@@ -1281,7 +1378,8 @@ function normalizeStatus(value: unknown): MemoryStatus | undefined {
 }
 
 function isMemoryStatus(value: unknown): value is MemoryStatus {
-  return value === 'active' || value === 'superseded' || value === 'expired' || value === 'conflicted' || value === 'orphaned'
+  return value === 'active' || value === 'superseded' || value === 'expired' || value === 'conflicted'
+    || value === 'orphaned' || value === 'suppressed' || value === 'deleted'
 }
 
 function normalizeOrigin(value: unknown): MemoryOrigin {

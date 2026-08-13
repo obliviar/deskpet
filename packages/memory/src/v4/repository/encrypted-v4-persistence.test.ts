@@ -49,6 +49,28 @@ describe('encrypted Memory V4 persistence', () => {
     expect(readdirSync(directory).filter(name => name.endsWith('.tmp'))).toEqual([])
   })
 
+  it('rotates only an authenticated previous snapshot into the encrypted backup', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'deskpet-v4-backup-'))
+    const encryptedPath = join(directory, 'memory-v4.enc')
+    const backupPath = join(directory, 'memory-v4.enc.backup')
+    const keyPath = join(directory, 'memory-v4-key.json')
+    const persistence = createEncryptedV4Persistence({
+      encryptedPath, backupPath, keyPath,
+      protectKey: key => Buffer.from(key), unprotectKey: key => Buffer.from(key),
+    })
+    persistence.save('{"revision":1,"secret":"first"}')
+    persistence.save('{"revision":2,"secret":"second"}')
+    const activeCiphertext = readFileSync(encryptedPath, 'utf-8')
+    const backupCiphertext = readFileSync(backupPath, 'utf-8')
+    expect(activeCiphertext).not.toContain('second')
+    expect(backupCiphertext).not.toContain('first')
+    expect(activeCiphertext).not.toBe(backupCiphertext)
+
+    writeFileSync(encryptedPath, '{corrupt', 'utf-8')
+    expect(() => persistence.save('{"revision":3}')).toThrow()
+    expect(readFileSync(backupPath, 'utf-8')).toBe(backupCiphertext)
+  })
+
   it('rejects a tampered encrypted snapshot', () => {
     const directory = mkdtempSync(join(tmpdir(), 'deskpet-v4-tamper-'))
     const encryptedPath = join(directory, 'memory-v4.enc')
@@ -120,5 +142,23 @@ describe('encrypted Memory V4 persistence', () => {
 
     expect(() => persistence.save('{"test":true}')).toThrow()
     expect(readdirSync(directory).filter(name => name.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('supports a read-only recovery mode without rewriting encrypted data', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'deskpet-v4-readonly-'))
+    const encryptedPath = join(directory, 'memory-v4.enc')
+    const keyPath = join(directory, 'memory-v4-key.json')
+    const writable = createEncryptedV4Persistence({
+      encryptedPath, keyPath, protectKey: key => Buffer.from(key), unprotectKey: key => Buffer.from(key),
+    })
+    writable.save('{"revision":1}')
+    const before = readFileSync(encryptedPath, 'utf-8')
+    const readOnly = createEncryptedV4Persistence({
+      encryptedPath, keyPath, readOnly: true,
+      protectKey: key => Buffer.from(key), unprotectKey: key => Buffer.from(key),
+    })
+    expect(readOnly.load()).toBe('{"revision":1}')
+    expect(() => readOnly.save('{"revision":2}')).toThrow('read-only')
+    expect(readFileSync(encryptedPath, 'utf-8')).toBe(before)
   })
 })

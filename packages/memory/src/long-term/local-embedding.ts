@@ -1,5 +1,6 @@
 /** Privacy-preserving local embedding used by default by the desktop app. */
-export const LOCAL_EMBEDDING_MODEL = 'local-hash-v2'
+export const LOCAL_EMBEDDING_MODEL = 'local-hash-v3'
+export const LEGACY_LOCAL_EMBEDDING_MODELS = new Set(['local-hash-v1', 'local-hash-v2'])
 
 const DEFAULT_DIMENSIONS = 384
 const CONCEPT_WEIGHT = 5
@@ -7,28 +8,31 @@ const CONCEPT_WEIGHT = 5
 const SEMANTIC_CONCEPT_PATTERNS: Array<[string, RegExp]> = [
   ['preference.any', /偏好|喜欢|偏爱|爱听|爱看|不喜欢|讨厌|常喝|常吃|prefer|preference|like|dislike|favorite|favourite/i],
   ['profile.name', /姓名|名字|称呼|叫(?:我|你)|\bname\b|\bcall\b/i],
-  ['profile.location', /所在地|住在|居住|常住|哪座城市|哪里住|based\s+in|live\s+in/i],
-  ['relationship.pet', /宠物|毛孩子|猫咪|猫|狗狗|狗|\bdog\b|\bcat\b|\bpet\b/i],
+  ['profile.location', /所在地|住在|居住|常住|定居|落脚|哪座城市|哪里住|何处生活|based\s+in|live\s+in|has\s+been\s+home/i],
+  ['profile.native-language', /母语|方言|家乡话|从小讲|native\s+language|dialect/i],
+  ['profile.shoe-size', /鞋码|几码.{0,4}鞋|鞋.{0,6}(?:尺码|号码|大小)|shoe\s+size/i],
+  ['relationship.pet', /宠物|毛孩子|猫咪|猫|狗狗|狗|兔子|兔|\bdog\b|\bcat\b|\bpet\b|\brabbit\b/i],
+  ['relationship.sibling', /哥哥|姐姐|弟弟|妹妹|兄弟姐妹|手足|sibling|brother|sister/i],
   ['preference.music', /音乐|歌曲|爵士|爱听|耳机|\bmusic\b|\bsong\b|\bjazz\b/i],
-  ['health.allergy', /过敏|必须避开|不能吃|忌口|allerg/i],
-  ['project.current', /当前项目|项目|开发|手头.{0,12}(?:忙|软件)|哪个软件|\bproject\b|develop/i],
+  ['health.allergy', /过敏|必须避开|食材.{0,10}避开|药.{0,10}(?:不能用|禁用|避开)|(?:不能用|禁用).{0,10}药|allerg|(?:food|medicine|drug).{0,20}(?:avoid|cannot\s+use)|must\s+avoid/i],
+  ['project.current', /当前项目|项目|开发|手头.{0,12}(?:忙|软件|准备|筹备|做)|正在.{0,12}(?:做|准备|开发).{0,8}(?:产品|软件)?|做的产品|哪个软件|\bproject\b|develop|working\s+on/i],
   ['routine.exercise', /固定安排|每周|锻炼|运动|徒步|游泳|瑜伽|\broutine\b|\bweekly\b|\bexercise\b/i],
   ['profile.operating-system', /电脑系统|操作系统|运行.{0,8}平台|windows|macos|linux|operating\s+system/i],
   ['preference.response-style', /回答偏好|回复|回答|篇幅|简洁|详细|\bresponse\b|\breply\b|\bconcise\b/i],
-  ['profile.programming-language', /编程语言|哪门语言|写程序|python|typescript|javascript|programming\s+language/i],
+  ['profile.programming-language', /编程语言|哪门语言|写程序|写代码|技术栈|python|typescript|javascript|rust|c\+\+|programming\s+language|tech\s+stack/i],
   ['preference.drink', /饮品|喝什么|泡什么|乌龙茶|咖啡|饮料|\bdrink\b|\bbeverage\b|\btea\b|\bcoffee\b/i],
   ['routine.work-time', /工作习惯|工作时间|夜间|晚上工作|时段.{0,8}效率|效率最高|白天.{0,8}夜|办公|work.{0,12}(?:night|day)/i],
-  ['profile.birthday', /生日|出生日期|生日祝福|\bbirthday\b/i],
+  ['profile.birthday', /生日|出生日期|生日祝福|庆生|\bbirthday\b|celebrate.{0,8}birthday/i],
   ['relationship.friend', /好友|朋友|那位朋友|\bfriend\b/i],
-  ['preference.food', /不喜欢.{0,12}(?:食物|吃)|不要(?:放|加)|香菜|\bdislike\b|\bhate\b|cilantro/i],
+  ['preference.food', /不喜欢.{0,12}(?:食物|吃)|不要(?:放|加)|吃饭|点菜|口味.{0,8}(?:禁忌|避讳)|忌口|不能吃|香菜|\bdislike\b|\bhate\b|cilantro|food.{0,12}(?:preference|restriction)/i],
   ['preference.interface-theme', /界面.{0,8}(?:主题|模式)|深色主题|黑色主题|dark\s+mode|interface\s+theme/i],
   ['plan.travel', /旅行|目的地|去哪里玩|下一趟|京都|\btravel\b|\btrip\b|\bdestination\b/i],
   ['preference.book', /喜欢的书|小说|哪部.{0,8}心头好|三体|\bbook\b|\bnovel\b/i],
-  ['profile.education', /毕业院校|高校毕业|大学|\buniversity\b|\bcollege\b/i],
-  ['preference.color', /颜色|什么色|藏青|\bcolor\b|\bcolour\b/i],
+  ['profile.education', /毕业院校|高校毕业|大学|本科|硕士|博士|就读|在哪.{0,8}读|\buniversity\b|\bcollege\b|education/i],
+  ['preference.color', /颜色|什么色|色系|衣服.{0,8}色|藏青|墨绿|\bcolor\b|\bcolour\b/i],
   ['routine.rent', /房租|房东.{0,12}收钱|每月.{0,6}号|\brent\b/i],
-  ['profile.occupation', /职业|做什么工作|教师|occupation|work\s+as|\bjob\b/i],
-  ['relationship.partner', /妻子|丈夫|伴侣|爱人|spouse|wife|husband|partner/i],
+  ['profile.occupation', /职业|做什么工作|靠什么.{0,8}(?:工作|谋生)|谋生|任职|教师|occupation|work\s+as|make.{0,8}living|\bjob\b/i],
+  ['relationship.partner', /妻子|丈夫|伴侣|爱人|对象|另一半|spouse|wife|husband|partner/i],
   ['goal.current', /目标|挑战|马拉松|\bgoal\b/i],
   ['profile.device', /电脑是|笔记本|thinkpad|\bdevice\b|\blaptop\b/i],
 ]

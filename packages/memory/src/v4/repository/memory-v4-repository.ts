@@ -5,6 +5,10 @@ import { assertMemoryV4Snapshot, jsonClone } from '../domain/validation'
 export interface MemoryV4Persistence {
   load: () => string | undefined
   save: (payload: string) => void
+  /** Fold an incremental journal into the encrypted checkpoint when supported. */
+  compact?: () => void
+  /** Replace managed rolling backups with the current effective payload. */
+  scrubBackups?: () => void
   storagePath?: string
 }
 
@@ -35,6 +39,8 @@ export function createEmptyMemoryV4Snapshot(now = Date.now()): MemoryV4Snapshot 
     facts: [],
     evidenceLinks: [],
     factVersions: [],
+    derivedArtifacts: [],
+    domainEvents: [],
     retrievalEvents: [],
     migrationManifests: [],
     legacyImports: [],
@@ -122,6 +128,67 @@ export function parseMemoryV4Snapshot(payload: string): MemoryV4Snapshot {
   catch (error) {
     throw new Error(`Unable to parse Memory V4 snapshot: ${error instanceof Error ? error.message : String(error)}`)
   }
+  upgradeStageOneSnapshot(parsed)
   assertMemoryV4Snapshot(parsed)
   return parsed
+}
+
+/** Backward-compatible, in-memory completion for snapshots written before stage-one authority fields. */
+function upgradeStageOneSnapshot(value: unknown): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    return
+  const snapshot = value as Record<string, unknown>
+  if (snapshot.schemaVersion !== MEMORY_V4_SCHEMA_VERSION)
+    return
+  snapshot.derivedArtifacts ??= []
+  snapshot.domainEvents ??= []
+  const facts = Array.isArray(snapshot.facts) ? snapshot.facts as Array<Record<string, unknown>> : []
+  const factsById = new Map(facts.map(fact => [String(fact.id), fact]))
+  for (const fact of facts) {
+    fact.objectType ??= inferObjectType(fact.object)
+    fact.normalizedValue ??= jsonClone(fact.object)
+    fact.modality ??= 'asserted'
+  }
+  const candidates = Array.isArray(snapshot.candidates) ? snapshot.candidates as Array<Record<string, unknown>> : []
+  for (const candidate of candidates) {
+    candidate.objectType ??= inferObjectType(candidate.object)
+    candidate.normalizedValue ??= jsonClone(candidate.object)
+    candidate.modality ??= 'asserted'
+  }
+  const versions = Array.isArray(snapshot.factVersions) ? snapshot.factVersions as Array<Record<string, unknown>> : []
+  for (const version of versions) {
+    const fact = factsById.get(String(version.factId))
+    const historicalText = typeof version.canonicalText === 'string' ? version.canonicalText : ''
+    version.subjectId ??= fact?.subjectId ?? 'owner:unknown'
+    version.predicate ??= fact?.predicate ?? 'memory.fact'
+    version.object ??= historicalText
+    version.objectType ??= inferObjectType(version.object)
+    version.normalizedValue ??= jsonClone(version.object)
+    version.polarity ??= fact?.polarity ?? 'unknown'
+    version.modality ??= fact?.modality ?? 'asserted'
+  }
+  const versionsByFact = new Map<string, Array<Record<string, unknown>>>()
+  for (const version of versions) {
+    const key = String(version.factId)
+    versionsByFact.set(key, [...(versionsByFact.get(key) ?? []), version])
+  }
+  for (const factVersions of versionsByFact.values()) {
+    factVersions.sort((left, right) => Number(left.version) - Number(right.version))
+    for (let index = 0; index < factVersions.length - 1; index++) {
+      const current = factVersions[index]!
+      const next = factVersions[index + 1]!
+      current.transactionClosedAt ??= Math.max(Number(current.recordedAt), Number(next.recordedAt))
+    }
+    delete factVersions.at(-1)!.transactionClosedAt
+  }
+}
+
+function inferObjectType(value: unknown): string {
+  if (typeof value === 'string')
+    return 'string'
+  if (typeof value === 'number')
+    return 'number'
+  if (typeof value === 'boolean')
+    return 'boolean'
+  return 'json'
 }

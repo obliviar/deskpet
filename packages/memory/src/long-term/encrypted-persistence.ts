@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -68,6 +69,8 @@ export interface EncryptedMemoryPersistence extends MemoryPersistence {
   wasLegacyMigrated: () => boolean
   /** Load a recovered view without compacting, repairing or migrating files. */
   loadReadOnly: () => string | undefined
+  compact: () => void
+  scrubBackups: () => void
 }
 
 /**
@@ -207,6 +210,13 @@ export function createEncryptedFilePersistence(
       save(serializeMemoryIndex(current))
   }
 
+  function compact(): void {
+    if (!cachedIndex)
+      loadCurrent()
+    if (cachedIndex)
+      save(serializeMemoryIndex(cachedIndex))
+  }
+
   return {
     storagePath: options.encryptedPath,
     encryptedPath: options.encryptedPath,
@@ -216,6 +226,17 @@ export function createEncryptedFilePersistence(
     legacyPath: options.legacyPath,
     wasLegacyMigrated: () => legacyMigrated,
     loadReadOnly,
+    compact,
+    scrubBackups(): void {
+      compact()
+      if (!existsSync(backupPath) || !cachedIndex)
+        return
+      const payload = serializeMemoryIndex(cachedIndex)
+      const key = getOrCreateKey()
+      atomicWrite(backupPath, encryptPayload(payload, key))
+      if (decryptPayload(readFileSync(backupPath, 'utf-8'), key) !== payload)
+        throw new Error('Long-term memory backup scrub verification failed')
+    },
     backupBeforeMigration(): void {
       if (existsSync(backupPath))
         return
@@ -384,8 +405,33 @@ function assertMasterKey(key: Buffer): void {
 function atomicWrite(path: string, payload: string): void {
   mkdirSync(dirname(path), { recursive: true })
   const temporaryPath = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
-  writeFileSync(temporaryPath, payload, { encoding: 'utf-8', mode: 0o600 })
-  renameSync(temporaryPath, path)
+  try {
+    writeFileSync(temporaryPath, payload, { encoding: 'utf-8', mode: 0o600 })
+    replaceFileWithRetry(temporaryPath, path)
+  }
+  catch (error) {
+    rmSync(temporaryPath, { force: true })
+    throw error
+  }
+}
+
+function replaceFileWithRetry(temporaryPath: string, targetPath: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(temporaryPath, targetPath)
+      return
+    }
+    catch (error) {
+      if (attempt >= 5 || !isTransientWindowsFileError(error))
+        throw error
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 * 2 ** attempt)
+    }
+  }
+}
+
+function isTransientWindowsFileError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES'
 }
 
 function parseJson<T>(payload: string, label: string): T {

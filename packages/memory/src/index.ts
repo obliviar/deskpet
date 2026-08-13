@@ -20,9 +20,25 @@ export {
 } from './long-term/memory-writer'
 export type {
   MemoryCaptureCommit,
+  MemorySourceUnlinkCommit,
   MemoryExtractor,
   MemoryWriterOptions,
 } from './long-term/memory-writer'
+export {
+  createLocalMemoryCandidateVerifier,
+  LOCAL_MEMORY_VERIFIER_VERSION,
+  MEMORY_WRITE_POLICY_VERSION,
+  quarantinedVerifierFailure,
+} from './long-term/memory-write-policy'
+export type {
+  LocalMemoryCandidateVerifierOptions,
+  MemoryCandidateDecisionAction,
+  MemoryCandidateDecisionStatus,
+  MemoryCandidateEvaluation,
+  MemoryCandidateVerifier,
+  MemoryCandidateVerificationContext,
+  MemoryWriteMatches,
+} from './long-term/memory-write-policy'
 export { createSmartMemoryExtractor } from './long-term/smart-memory-extractor'
 export type { SmartExtractorConfig, SmartMemoryExtractorOptions } from './long-term/smart-memory-extractor'
 export type { MemoryCandidate } from './long-term/memory-extractor'

@@ -5,6 +5,8 @@ import type {
   MemoryScope,
 } from '@deskpet/contracts'
 import type { MemoryCandidate } from '../../long-term/memory-extractor'
+import type { MemoryCandidateEvaluation } from '../../long-term/memory-write-policy'
+import type { MemorySourceUnlinkCommit } from '../../long-term/memory-writer'
 import { inferMemoryPrivacy, isSafeMemoryContent } from '../../long-term/memory-extractor'
 import type {
   V3MemoryCommit,
@@ -16,10 +18,12 @@ import type {
   JsonObject,
   MemoryEpisodeV4,
   MemoryFactStatusV4,
+  MemoryFactVersionV4,
   MemoryFactV4,
   MemoryV4Scope,
   MemoryV4Snapshot,
   MemoryWriteActionV4,
+  JsonValue,
   RetrievalEventV4,
 } from '../domain/types'
 import { normalizeMemoryV4Scope } from '../domain/validation'
@@ -34,6 +38,7 @@ export interface V4ShadowCapture {
   turn: MemoryCapture
   scope: MemoryScope
   memories: V4CapturedMemory[]
+  evaluations?: MemoryCandidateEvaluation[]
   capturedAt?: number
 }
 
@@ -65,6 +70,7 @@ export interface V4ShadowWriter {
   enqueueCommit: (commit: V3MemoryCommit) => void
   enqueueCapture: (capture: V4ShadowCapture) => void
   enqueueRetrieval: (retrieval: V4ShadowRetrieval) => void
+  enqueueSourceUnlink: (commit: MemorySourceUnlinkCommit) => void
   flush: () => void
   reconcileV3Payload: (payload: string) => V4ShadowReconciliationResult
   pendingCount: () => number
@@ -74,6 +80,7 @@ type ShadowOperation =
   | { type: 'commit'; value: V3MemoryCommit }
   | { type: 'capture'; value: V4ShadowCapture }
   | { type: 'retrieval'; value: V4ShadowRetrieval }
+  | { type: 'source-unlink'; value: MemorySourceUnlinkCommit }
 
 interface ShadowIndexes {
   factByV3Id: Map<string, MemoryFactV4>
@@ -81,6 +88,8 @@ interface ShadowIndexes {
   evidenceByFactEpisode: Map<string, EvidenceLinkV4>
   candidateById: Map<string, MemoryV4Snapshot['candidates'][number]>
   maximumVersionByFact: Map<string, number>
+  latestVersionByFact: Map<string, MemoryFactVersionV4>
+  domainEventKeys: Set<string>
 }
 
 /**
@@ -175,6 +184,14 @@ export function createV4ShadowWriter(options: V4ShadowWriterOptions): V4ShadowWr
         reconciledAt: committedAt,
         writerVersion: 'v4-shadow-stage2-v1',
       }
+      appendDomainEvent(draft, {
+        idempotencyKey: `v3-reconcile:${sourcePayloadSha256}`,
+        type: 'V3_RECONCILED',
+        scope: records[0] ? v4Scope(records[0].scope) : { ownerId: 'system', agentId: 'deskpet' },
+        createdAt: committedAt,
+        actor: 'system',
+        payload: { sourcePayloadSha256, sourceItemCount: records.length },
+      }, indexes.domainEventKeys)
     })
     return {
       changed: true,
@@ -188,6 +205,7 @@ export function createV4ShadowWriter(options: V4ShadowWriterOptions): V4ShadowWr
     enqueueCommit: commit => enqueue({ type: 'commit', value: commit }),
     enqueueCapture: capture => enqueue({ type: 'capture', value: capture }),
     enqueueRetrieval: retrieval => enqueue({ type: 'retrieval', value: retrieval }),
+    enqueueSourceUnlink: commit => enqueue({ type: 'source-unlink', value: commit }),
     flush,
     reconcileV3Payload,
     pendingCount: () => pending.length,
@@ -219,13 +237,17 @@ function applyOperation(
   if (operation.type === 'commit') {
     const committedAt = positiveTimestamp(operation.value.committedAt, fallbackNow)
     for (const sourceId of operation.value.deletedIds)
-      deleteMirroredFact(draft, indexes, sourceId, committedAt)
+      deleteMirroredFact(draft, indexes, sourceId, committedAt, operation.value.reason === 'purge')
     for (const record of operation.value.upserts)
       upsertRecord(draft, indexes, record, operation.value.reason, committedAt, false)
     return
   }
   if (operation.type === 'capture') {
     recordCapture(draft, indexes, operation.value, fallbackNow)
+    return
+  }
+  if (operation.type === 'source-unlink') {
+    recordSourceUnlink(draft, indexes, operation.value, fallbackNow)
     return
   }
   recordRetrieval(draft, indexes, operation.value, fallbackNow)
@@ -242,6 +264,11 @@ function upsertRecord(
   const scope = v4Scope(record.scope)
   const existing = indexes.factByV3Id.get(record.id)
   const factId = existing?.id ?? stableId('fact', sourceKey(scope, record.id))
+  // A completed privacy purge is irreversible. A stale V3 snapshot that
+  // reappears after a partial disk failure must be reported by reconciliation,
+  // never allowed to resurrect plaintext in V4.
+  if (existing?.canonicalText === '[purged]' || existing?.metadata?.purgeCompletedAt !== undefined)
+    return
   const previous = existing ? factVersionState(existing) : undefined
   const evidenceLinks = ensureRecordEvidence(draft, indexes, factId, scope, record, committedAt)
   const currentEvidenceIds = new Set(evidenceLinks.map(link => link.id))
@@ -252,6 +279,8 @@ function upsertRecord(
     link.invalidatedAt = Math.max(link.createdAt, committedAt)
   }
   const directEvidence = evidenceLinks.some(link => link.strength === 'direct' && link.active)
+  const policyVerified = score(record.metadata?.memoryVerificationScore, 0) >= 0.72
+    && typeof record.metadata?.memoryVerifierVersion === 'string'
   const incomingStatus = normalizeFactStatus(record.status)
   const status = record.origin !== 'manual' && incomingStatus === 'active' && !directEvidence
     ? 'quarantined'
@@ -267,35 +296,42 @@ function upsertRecord(
     subjectId: `owner:${scope.ownerId}`,
     predicate: predicateFor(record),
     object: record.content,
+    objectType: 'string',
+    normalizedValue: normalizedFactValue(record.content),
     canonicalText: record.content,
     memoryKey: record.memoryKey ?? `v3.fact.${record.id}`,
     cardinality: cardinalityFor(record),
     polarity: polarityFor(record.content),
+    modality: 'asserted',
     status,
     recordedAt: positiveTimestamp(record.createdAt, committedAt),
     updatedAt: positiveTimestamp(record.updatedAt, committedAt),
     evidenceLinkIds: [],
     extractionScore: score(record.confidence, 0.7),
-    verificationScore: record.origin === 'manual' ? 1 : 0,
+    verificationScore: record.origin === 'manual' ? 1 : score(record.metadata?.memoryVerificationScore, 0),
     evidenceScore: directEvidence ? 1 : evidenceLinks.length > 0 ? 0.4 : 0,
     utilityScore: utilityFor(record),
     importance: score(record.importance, 0.6),
     accessCount: nonNegativeInteger(record.accessCount),
     userConfirmed: record.origin === 'manual',
-    verificationState: record.origin === 'manual' ? 'verified' : 'pending',
+    verificationState: record.origin === 'manual' || policyVerified ? 'verified' : 'pending',
     supersedesFactIds: [],
     conflictsWithFactIds: [],
     sensitivity: normalizeSensitivity(record.sensitivity),
     sharePolicy: normalizeSharePolicy(record.sharePolicy),
     origin: normalizeOrigin(record.origin),
     extractorVersion: 'v3-dual-write',
-    verifierVersion: record.origin === 'manual' ? 'manual-confirmed' : 'stage2-pending',
+    verifierVersion: record.origin === 'manual'
+      ? 'manual-confirmed'
+      : stringMetadata(record.metadata?.memoryVerifierVersion) ?? 'stage2-pending',
   }
 
   fact.scope = scope
   fact.subjectId = `owner:${scope.ownerId}`
   fact.predicate = predicateFor(record)
   fact.object = record.content
+  fact.objectType = 'string'
+  fact.normalizedValue = normalizedFactValue(record.content)
   fact.canonicalText = record.content
   fact.memoryKey = record.memoryKey ?? fact.memoryKey ?? `v3.fact.${record.id}`
   fact.cardinality = cardinalityFor(record)
@@ -314,10 +350,15 @@ function upsertRecord(
   fact.accessCount = nonNegativeInteger(record.accessCount)
   assignOptionalTimestamp(fact, 'lastAccessedAt', record.lastAccessedAt)
   fact.userConfirmed = record.origin === 'manual' || fact.userConfirmed
-  fact.verificationState = record.origin === 'manual' ? 'verified' : fact.verificationState === 'legacy-unverified'
-    ? 'legacy-unverified'
-    : 'pending'
-  fact.verificationScore = record.origin === 'manual' ? 1 : fact.verificationScore
+  fact.verificationState = record.origin === 'manual' || policyVerified
+    ? 'verified'
+    : fact.verificationState === 'legacy-unverified' ? 'legacy-unverified' : 'pending'
+  fact.verificationScore = record.origin === 'manual'
+    ? 1
+    : score(record.metadata?.memoryVerificationScore, fact.verificationScore)
+  fact.verifierVersion = record.origin === 'manual'
+    ? 'manual-confirmed'
+    : stringMetadata(record.metadata?.memoryVerifierVersion) ?? fact.verifierVersion
   fact.supersedesFactIds = relatedFactId ? [relatedFactId] : fact.supersedesFactIds.filter(id => id !== fact.id)
   fact.sensitivity = normalizeSensitivity(record.sensitivity)
   fact.sharePolicy = normalizeSharePolicy(record.sharePolicy)
@@ -386,14 +427,17 @@ function ensureRecordEvidence(
   }
   if (episodes.length === 0) {
     const manual = record.origin === 'manual'
+    // A body edit is new evidence. Include the immutable content digest in the
+    // synthetic episode identity so an update cannot overwrite its predecessor.
+    const contentHash = sha256(record.content)
     episodes.push(ensureEpisode(draft, indexes, {
-      id: stableId('episode-record', sourceKey(factScope, record.id)),
+      id: stableId('episode-record', `${sourceKey(factScope, record.id)}\0${contentHash}`),
       scope: factScope,
       actor: manual ? 'user' : 'legacy-import',
       kind: manual ? 'manual-declaration' : 'legacy-memory-record',
       contentState: 'available',
       content: record.content,
-      contentHash: sha256(record.content),
+      contentHash,
       recordedAt: positiveTimestamp(record.createdAt, now),
       sourceAttachmentIds: uniqueStrings(record.sourceAttachmentIds),
       sensitivity: normalizeSensitivity(record.sensitivity),
@@ -441,7 +485,8 @@ function recordCapture(
   capture: V4ShadowCapture,
   fallbackNow: number,
 ): void {
-  if (capture.memories.length === 0 || !isSafeMemoryContent(capture.turn.userMessage))
+  const evaluations = capture.evaluations ?? []
+  if ((capture.memories.length === 0 && evaluations.length === 0) || !isSafeMemoryContent(capture.turn.userMessage))
     return
   const recordedAt = positiveTimestamp(capture.capturedAt, fallbackNow)
   const factScope = v4Scope(capture.scope)
@@ -484,15 +529,23 @@ function recordCapture(
     provenance: 'native-v4',
   })
 
+  for (const evaluation of evaluations) {
+    const record = capture.memories.find(item => item.candidate === evaluation.candidate)?.record
+      ?? capture.memories.find(item => item.candidate.content === evaluation.candidate.content)?.record
+    upsertEvaluatedCandidate(draft, indexes, evaluation, record, factScope, episode, recordedAt)
+  }
+
   for (const { candidate, record } of capture.memories) {
     const fact = indexes.factByV3Id.get(record.id)
     if (!fact)
       continue
-    const candidateId = stableId('candidate', `${fact.id}\u0000${episode.id}\u0000${candidate.content}`)
+    const candidateId = evaluatedCandidateId(fact.scope, episode.id, candidate.content)
     let memoryCandidate = indexes.candidateById.get(candidateId)
     const link = ensureDirectEvidence(draft, indexes, fact, episode, recordedAt)
     const previous = factVersionState(fact)
     if (!memoryCandidate) {
+      const evaluation = evaluations.find(item => item.candidate === candidate)
+        ?? evaluations.find(item => item.candidate.content === candidate.content)
       memoryCandidate = {
         id: candidateId,
         scope: fact.scope,
@@ -500,19 +553,26 @@ function recordCapture(
         subjectId: fact.subjectId,
         predicate: predicateFor(record),
         object: candidate.content,
+        objectType: 'string',
+        normalizedValue: normalizedFactValue(candidate.content),
         canonicalText: candidate.content,
         polarity: polarityFor(candidate.content),
+        modality: 'asserted',
         cardinality: cardinalityFor(record),
         ...(optionalTimestamp(record.validFrom) ? { validFrom: optionalTimestamp(record.validFrom) } : {}),
         ...(optionalTimestamp(record.validTo) ? { validTo: optionalTimestamp(record.validTo) } : {}),
-        extractionScore: score(record.confidence, 0.7),
-        ...(record.origin === 'manual' ? { verificationScore: 1 } : {}),
-        durabilityScore: score(record.importance, 0.6),
-        ambiguityFlags: [],
-        proposedAction: previous.status === 'quarantined' ? 'ADD' : 'MERGE_EVIDENCE',
+        extractionScore: score(evaluation?.extractionScore, score(record.confidence, 0.7)),
+        verificationScore: score(evaluation?.verificationScore, record.origin === 'manual' ? 1 : 0),
+        durabilityScore: score(evaluation?.durabilityScore, score(record.importance, 0.6)),
+        ambiguityFlags: evaluation?.ambiguityFlags ?? [],
+        proposedAction: evaluation?.action ?? (previous.status === 'quarantined' ? 'ADD' : 'MERGE_EVIDENCE'),
         status: 'accepted',
-        extractorVersion: 'v3-capture-dual-write',
-        ...(record.origin === 'manual' ? { verifierVersion: 'manual-confirmed' } : {}),
+        extractorVersion: stringMetadata(candidate.metadata.extractorVersion) ?? 'v3-capture-dual-write',
+        verifierVersion: evaluation?.verifierVersion ?? (record.origin === 'manual' ? 'manual-confirmed' : 'stage2-pending'),
+        ...(evaluation ? {
+          policyVersion: evaluation.policyVersion,
+          decisionReasonCodes: uniqueStrings(evaluation.reasonCodes),
+        } : {}),
         createdAt: recordedAt,
         updatedAt: recordedAt,
       }
@@ -526,8 +586,11 @@ function recordCapture(
     fact.evidenceLinkIds = uniqueStrings([...fact.evidenceLinkIds, link.id])
     fact.evidenceScore = 1
     fact.status = normalizeFactStatus(record.status)
-    fact.verificationState = record.origin === 'manual' ? 'verified' : 'pending'
-    fact.verificationScore = record.origin === 'manual' ? 1 : fact.verificationScore
+    const evaluation = evaluations.find(item => item.candidate === candidate)
+      ?? evaluations.find(item => item.candidate.content === candidate.content)
+    fact.verificationState = record.origin === 'manual' || evaluation?.status === 'accepted' ? 'verified' : 'pending'
+    fact.verificationScore = record.origin === 'manual' ? 1 : score(evaluation?.verificationScore, fact.verificationScore)
+    fact.verifierVersion = evaluation?.verifierVersion ?? fact.verifierVersion
     fact.updatedAt = Math.max(fact.updatedAt, recordedAt)
     fact.metadata = mergeFactMetadata(fact.metadata, {
       v3SourceId: record.id,
@@ -548,6 +611,86 @@ function recordCapture(
       )
     }
   }
+}
+
+function upsertEvaluatedCandidate(
+  draft: MemoryV4Snapshot,
+  indexes: ShadowIndexes,
+  evaluation: MemoryCandidateEvaluation,
+  record: V3MemoryRecord | undefined,
+  scope: MemoryV4Scope,
+  episode: MemoryEpisodeV4,
+  recordedAt: number,
+): void {
+  const candidate = evaluation.candidate
+  const candidateId = evaluatedCandidateId(scope, episode.id, candidate.content)
+  const existing = indexes.candidateById.get(candidateId)
+  const fact = record ? indexes.factByV3Id.get(record.id) : undefined
+  const incoming: MemoryV4Snapshot['candidates'][number] = {
+    id: candidateId,
+    scope,
+    evidenceEpisodeIds: [episode.id],
+    subjectId: `owner:${scope.ownerId}`,
+    predicate: record ? predicateFor(record) : candidatePredicate(candidate),
+    object: candidate.content,
+    objectType: 'string',
+    normalizedValue: normalizedFactValue(candidate.content),
+    canonicalText: candidate.content,
+    polarity: polarityFor(candidate.content),
+    modality: candidateModality(evaluation),
+    cardinality: candidate.metadata.cardinality === 'single' ? 'single' : 'multiple',
+    ...(optionalTimestamp(candidate.metadata.validFrom) ? { validFrom: optionalTimestamp(candidate.metadata.validFrom) } : {}),
+    ...(optionalTimestamp(candidate.metadata.validTo) ? { validTo: optionalTimestamp(candidate.metadata.validTo) } : {}),
+    extractionScore: score(evaluation.extractionScore, 0),
+    verificationScore: score(evaluation.verificationScore, 0),
+    durabilityScore: score(evaluation.durabilityScore, 0),
+    ambiguityFlags: uniqueStrings(evaluation.ambiguityFlags),
+    proposedAction: evaluation.action,
+    status: evaluation.status,
+    extractorVersion: stringMetadata(candidate.metadata.extractorVersion) ?? 'unknown-extractor',
+    verifierVersion: evaluation.verifierVersion,
+    policyVersion: evaluation.policyVersion,
+    decisionReasonCodes: uniqueStrings(evaluation.reasonCodes),
+    createdAt: existing?.createdAt ?? recordedAt,
+    updatedAt: Math.max(existing?.updatedAt ?? recordedAt, recordedAt),
+  }
+  if (existing) {
+    Object.assign(existing, incoming, {
+      evidenceEpisodeIds: uniqueStrings([...existing.evidenceEpisodeIds, episode.id]),
+      createdAt: existing.createdAt,
+    })
+  }
+  else {
+    draft.candidates.push(incoming)
+    indexes.candidateById.set(candidateId, incoming)
+  }
+  if (fact) {
+    fact.metadata = mergeFactMetadata(fact.metadata, {
+      v4CandidateIds: uniqueStrings([
+        ...jsonStringArray(fact.metadata?.v4CandidateIds),
+        candidateId,
+      ]),
+      memoryPolicyVersion: evaluation.policyVersion,
+    })
+  }
+}
+
+function candidatePredicate(candidate: MemoryCandidate): string {
+  return stringMetadata(candidate.metadata.memoryKey)
+    ?? stringMetadata(candidate.metadata.kind)
+    ?? 'memory.fact'
+}
+
+function evaluatedCandidateId(scope: MemoryV4Scope, episodeId: string, content: string): string {
+  return stableId('candidate-evaluation', `${sourceKey(scope, episodeId)}\u0000${content}`)
+}
+
+function candidateModality(evaluation: MemoryCandidateEvaluation): MemoryFactV4['modality'] {
+  if (evaluation.ambiguityFlags.includes('non-asserted:hypothetical'))
+    return 'hypothetical'
+  if (evaluation.ambiguityFlags.includes('non-asserted:reported-speech'))
+    return 'reported'
+  return 'asserted'
 }
 
 function recordRetrieval(
@@ -573,6 +716,91 @@ function recordRetrieval(
     ...(retrieval.answerModel ? { answerModel: retrieval.answerModel } : {}),
   }
   draft.retrievalEvents.push(event)
+}
+
+function recordSourceUnlink(
+  draft: MemoryV4Snapshot,
+  indexes: ShadowIndexes,
+  commit: MemorySourceUnlinkCommit,
+  fallbackNow: number,
+): void {
+  const requested = new Set(uniqueStrings(commit.messageIds))
+  if (requested.size === 0)
+    return
+  const scope = v4Scope(commit.scope)
+  const episodeIds = new Set(draft.episodes
+    .filter(episode => episode.sourceMessageId && requested.has(episode.sourceMessageId)
+      && sameV4Scope(scope, episode.scope))
+    .map(episode => episode.id))
+  if (episodeIds.size === 0)
+    return
+  const timestamp = positiveTimestamp(commit.unlinkedAt, fallbackNow)
+  let unlinkedEvidence = 0
+  let scrubbedCandidates = 0
+  let staleArtifacts = 0
+  const affectedFacts = new Set<string>()
+
+  for (const episode of draft.episodes) {
+    if (!episodeIds.has(episode.id))
+      continue
+    episode.contentState = 'deleted'
+    delete episode.content
+    delete episode.contentHash
+    episode.deletedAt = Math.max(episode.recordedAt, timestamp)
+  }
+  for (const link of draft.evidenceLinks) {
+    if (!episodeIds.has(link.episodeId) || !link.active)
+      continue
+    link.active = false
+    link.invalidatedAt = Math.max(link.createdAt, timestamp)
+    affectedFacts.add(link.factId)
+    unlinkedEvidence += 1
+  }
+  const factCandidateIds = new Set(draft.facts.flatMap(fact => jsonStringArray(fact.metadata?.v4CandidateIds)))
+  for (const candidate of draft.candidates) {
+    if (!candidate.evidenceEpisodeIds.some(id => episodeIds.has(id)))
+      continue
+    const hasAvailableEvidence = candidate.evidenceEpisodeIds.some(id => indexes.episodeById.get(id)?.contentState === 'available')
+    if (!hasAvailableEvidence && !factCandidateIds.has(candidate.id)) {
+      candidate.object = '[source-deleted]'
+      candidate.objectType = 'string'
+      candidate.normalizedValue = '[source-deleted]'
+      candidate.canonicalText = '[source-deleted]'
+      candidate.status = 'rejected'
+      candidate.proposedAction = 'NOOP'
+      candidate.ambiguityFlags = uniqueStrings([...candidate.ambiguityFlags, 'source-deleted'])
+      candidate.decisionReasonCodes = uniqueStrings([...(candidate.decisionReasonCodes ?? []), 'source-deleted'])
+      candidate.updatedAt = Math.max(candidate.updatedAt, timestamp)
+      scrubbedCandidates += 1
+    }
+  }
+  for (const factId of affectedFacts) {
+    const fact = draft.facts.find(item => item.id === factId)
+    if (!fact)
+      continue
+    const hasActiveEvidence = draft.evidenceLinks.some(link => link.factId === factId && link.active)
+    if (!hasActiveEvidence && fact.origin !== 'manual' && fact.status === 'active') {
+      fact.status = 'orphaned'
+      fact.updatedAt = Math.max(fact.updatedAt, timestamp)
+      appendFactVersion(draft, indexes, fact, 'NOOP', fact.updatedAt, 'Source chat message was deleted.')
+    }
+  }
+  for (const artifact of draft.derivedArtifacts) {
+    if (artifact.status !== 'current' || !artifact.sourceEpisodeIds.some(id => episodeIds.has(id)))
+      continue
+    artifact.status = 'stale'
+    artifact.invalidatedAt = Math.max(artifact.createdAt, timestamp)
+    artifact.updatedAt = Math.max(artifact.updatedAt, timestamp)
+    staleArtifacts += 1
+  }
+  appendDomainEvent(draft, {
+    idempotencyKey: `source-unlink:${sha256(`${sourceKey(scope, [...requested].sort().join('\u0000'))}`)}`,
+    type: 'EVIDENCE_UNLINKED',
+    scope,
+    createdAt: timestamp,
+    actor: 'user',
+    payload: { unlinkedEvidence, scrubbedCandidates, staleArtifacts },
+  }, indexes.domainEventKeys)
 }
 
 function ensureEpisode(
@@ -645,20 +873,60 @@ function appendFactVersion(
   reason: string,
 ): void {
   const nextVersion = (indexes.maximumVersionByFact.get(fact.id) ?? 0) + 1
-  draft.factVersions.push({
-    id: stableId('version', `${fact.id}\u0000${nextVersion}`),
+  const prior = indexes.latestVersionByFact.get(fact.id)
+  if (prior && prior.transactionClosedAt === undefined)
+    prior.transactionClosedAt = Math.max(prior.recordedAt, recordedAt)
+  const versionId = stableId('version', `${fact.id}\u0000${nextVersion}`)
+  const appendedVersion: MemoryFactVersionV4 = {
+    id: versionId,
     factId: fact.id,
     version: nextVersion,
     operation,
+    subjectId: fact.subjectId,
+    predicate: fact.predicate,
+    object: fact.object,
+    objectType: fact.objectType,
+    normalizedValue: fact.normalizedValue,
     canonicalText: fact.canonicalText,
+    polarity: fact.polarity,
+    modality: fact.modality,
+    ...(fact.condition ? { condition: fact.condition } : {}),
     status: fact.status,
     ...(fact.validFrom ? { validFrom: fact.validFrom } : {}),
     ...(fact.validTo ? { validTo: fact.validTo } : {}),
     evidenceLinkIds: [...fact.evidenceLinkIds],
     recordedAt,
     reason,
-  })
+  }
+  draft.factVersions.push(appendedVersion)
+  indexes.latestVersionByFact.set(fact.id, appendedVersion)
+  appendDomainEvent(draft, {
+    idempotencyKey: `fact-version:${versionId}`,
+      type: nextVersion === 1 ? 'FACT_CREATED' : operation === 'DELETE' ? 'FACT_DELETED'
+      : operation === 'PURGE' ? 'FACT_PURGED' : operation === 'SUPPRESS' ? 'FACT_SUPPRESSED'
+        : operation === 'RESTORE' ? 'FACT_RESTORED' : 'FACT_VERSIONED',
+    scope: fact.scope,
+    factId: fact.id,
+    createdAt: recordedAt,
+    actor: 'system',
+    payload: { operation, version: nextVersion },
+  }, indexes.domainEventKeys)
   indexes.maximumVersionByFact.set(fact.id, nextVersion)
+}
+
+function appendDomainEvent(
+  draft: MemoryV4Snapshot,
+  event: Omit<MemoryV4Snapshot['domainEvents'][number], 'id'>,
+  knownKeys?: Set<string>,
+): void {
+  if (knownKeys?.has(event.idempotencyKey)
+    || (!knownKeys && draft.domainEvents.some(existing => existing.idempotencyKey === event.idempotencyKey)))
+    return
+  draft.domainEvents.push({
+    id: stableId('domain-event', event.idempotencyKey),
+    ...event,
+  })
+  knownKeys?.add(event.idempotencyKey)
 }
 
 function deleteMirroredFact(
@@ -666,9 +934,19 @@ function deleteMirroredFact(
   indexes: ShadowIndexes,
   sourceId: string,
   deletedAt: number,
+  purge = false,
 ): boolean {
   const fact = indexes.factByV3Id.get(sourceId)
-  if (!fact || fact.status === 'deleted')
+  if (!fact)
+    return false
+  const alreadyPurged = fact.canonicalText === '[purged]' || fact.metadata?.purgeCompletedAt !== undefined
+  if (alreadyPurged) {
+    fact.status = 'deleted'
+    fact.invalidatedAt ??= Math.max(fact.recordedAt, deletedAt)
+    fact.updatedAt = Math.max(fact.updatedAt, deletedAt)
+    return false
+  }
+  if (fact.status === 'deleted')
     return false
   for (const link of draft.evidenceLinks) {
     if (link.factId !== fact.id || !link.active)
@@ -680,13 +958,49 @@ function deleteMirroredFact(
   fact.invalidatedAt = Math.max(fact.recordedAt, deletedAt)
   fact.updatedAt = Math.max(fact.updatedAt, deletedAt)
   fact.metadata = mergeFactMetadata(fact.metadata, { v3SourceId: sourceId, v3DeletedAt: deletedAt })
+  if (purge) {
+    const episodeIds = new Set(draft.evidenceLinks.filter(link => link.factId === fact.id).map(link => link.episodeId))
+    for (const episode of draft.episodes) {
+      if (!episodeIds.has(episode.id))
+        continue
+      const shared = draft.evidenceLinks.some(link => link.episodeId === episode.id && link.factId !== fact.id && link.active)
+      if (shared)
+        continue
+      episode.contentState = 'deleted'
+      delete episode.content
+      delete episode.contentHash
+      delete episode.sourceMessageId
+      episode.sourceAttachmentIds = []
+      episode.deletedAt = Math.max(episode.recordedAt, deletedAt)
+    }
+    fact.object = '[purged]'
+    fact.objectType = 'string'
+    fact.normalizedValue = '[purged]'
+    fact.canonicalText = '[purged]'
+    fact.metadata = { v3SourceId: sourceId, purgeCompletedAt: deletedAt }
+    for (const version of draft.factVersions) {
+      if (version.factId !== fact.id)
+        continue
+      version.object = '[purged]'
+      version.objectType = 'string'
+      version.normalizedValue = '[purged]'
+      version.canonicalText = '[purged]'
+      version.reason = 'Historical content removed by an irreversible purge.'
+      delete version.condition
+    }
+    for (const legacy of draft.legacyImports) {
+      if (legacy.factId === fact.id)
+        legacy.raw = { id: legacy.sourceItemId, purgedAt: deletedAt }
+    }
+  }
   appendFactVersion(
     draft,
     indexes,
     fact,
-    'DELETE',
+    purge ? 'PURGE' : 'DELETE',
     deletedAt,
-    'The source V3 fact was explicitly forgotten or removed during reconciliation.',
+    purge ? 'The source V3 fact and its recoverable V4 content were irreversibly purged.'
+      : 'The source V3 fact was explicitly forgotten or removed during reconciliation.',
   )
   return true
 }
@@ -712,11 +1026,13 @@ function buildShadowIndexes(draft: MemoryV4Snapshot): ShadowIndexes {
       factByV3Id.set(fact.metadata.v3SourceId, fact)
   }
   const maximumVersionByFact = new Map<string, number>()
+  const latestVersionByFact = new Map<string, MemoryFactVersionV4>()
   for (const version of draft.factVersions) {
-    maximumVersionByFact.set(
-      version.factId,
-      Math.max(maximumVersionByFact.get(version.factId) ?? 0, version.version),
-    )
+    const maximum = maximumVersionByFact.get(version.factId) ?? 0
+    if (version.version >= maximum) {
+      maximumVersionByFact.set(version.factId, version.version)
+      latestVersionByFact.set(version.factId, version)
+    }
   }
   return {
     factByV3Id,
@@ -727,6 +1043,8 @@ function buildShadowIndexes(draft: MemoryV4Snapshot): ShadowIndexes {
     ])),
     candidateById: new Map(draft.candidates.map(candidate => [candidate.id, candidate])),
     maximumVersionByFact,
+    latestVersionByFact,
+    domainEventKeys: new Set(draft.domainEvents.map(event => event.idempotencyKey)),
   }
 }
 
@@ -735,7 +1053,15 @@ function factEpisodeKey(factId: string, episodeId: string): string {
 }
 
 interface FactVersionState {
+  subjectId: string
+  predicate: string
+  object: JsonValue
+  objectType: MemoryFactV4['objectType']
+  normalizedValue: JsonValue
   canonicalText: string
+  polarity: MemoryFactV4['polarity']
+  modality: MemoryFactV4['modality']
+  condition?: string
   status: MemoryFactStatusV4
   validFrom?: number
   validTo?: number
@@ -744,7 +1070,15 @@ interface FactVersionState {
 
 function factVersionState(fact: MemoryFactV4): FactVersionState {
   return {
+    subjectId: fact.subjectId,
+    predicate: fact.predicate,
+    object: fact.object,
+    objectType: fact.objectType,
+    normalizedValue: fact.normalizedValue,
     canonicalText: fact.canonicalText,
+    polarity: fact.polarity,
+    modality: fact.modality,
+    condition: fact.condition,
     status: fact.status,
     validFrom: fact.validFrom,
     validTo: fact.validTo,
@@ -754,6 +1088,14 @@ function factVersionState(fact: MemoryFactV4): FactVersionState {
 
 function sameVersionState(left: FactVersionState, right: FactVersionState): boolean {
   return left.canonicalText === right.canonicalText
+    && left.subjectId === right.subjectId
+    && left.predicate === right.predicate
+    && JSON.stringify(left.object) === JSON.stringify(right.object)
+    && left.objectType === right.objectType
+    && JSON.stringify(left.normalizedValue) === JSON.stringify(right.normalizedValue)
+    && left.polarity === right.polarity
+    && left.modality === right.modality
+    && left.condition === right.condition
     && left.status === right.status
     && left.validFrom === right.validFrom
     && left.validTo === right.validTo
@@ -765,6 +1107,10 @@ function operationFor(fact: MemoryFactV4, previous: FactVersionState): MemoryWri
     return 'RESTORE'
   if (fact.status === 'conflicted')
     return 'CONFLICT'
+  if (fact.status === 'suppressed')
+    return 'SUPPRESS'
+  if (fact.status === 'deleted')
+    return 'DELETE'
   if (fact.supersedesFactIds.length > 0 || fact.status === 'superseded')
     return 'SUPERSEDE'
   if (previous.canonicalText !== fact.canonicalText)
@@ -824,8 +1170,13 @@ function polarityFor(content: string): MemoryFactV4['polarity'] {
   return 'unknown'
 }
 
+function normalizedFactValue(content: string): string {
+  return content.normalize('NFKC').replace(/\s+/gu, ' ').trim()
+}
+
 function normalizeFactStatus(value: string): MemoryFactStatusV4 {
   return value === 'superseded' || value === 'conflicted' || value === 'expired' || value === 'orphaned'
+    || value === 'suppressed' || value === 'deleted'
     ? value
     : 'active'
 }
@@ -857,6 +1208,12 @@ function v4Scope(scope: MemoryScope): MemoryV4Scope {
     agentId: scope.agentId ?? 'default',
     ...(scope.sessionId ? { sessionId: scope.sessionId } : {}),
   })
+}
+
+function sameV4Scope(left: MemoryV4Scope, right: MemoryV4Scope): boolean {
+  return left.ownerId === right.ownerId
+    && left.agentId === right.agentId
+    && (left.sessionId === undefined || left.sessionId === right.sessionId)
 }
 
 function sourceKey(scope: MemoryV4Scope, sourceId: string): string {
@@ -919,6 +1276,10 @@ function jsonStringArray(value: unknown): string[] {
 
 function firstString(value: unknown): string | undefined {
   return arrayStrings(value)[0]
+}
+
+function stringMetadata(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined
 }
 
 function mostSensitive(values: unknown[]): MemoryFactV4['sensitivity'] {

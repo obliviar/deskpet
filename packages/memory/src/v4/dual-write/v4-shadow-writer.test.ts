@@ -39,7 +39,8 @@ describe('Memory V4 stage-two shadow writer', () => {
     expect(fact.status).toBe('active')
     expect(fact.canonicalText).toContain('小秦')
     expect(fact.evidenceScore).toBe(1)
-    expect(fact.verificationState).toBe('pending')
+    expect(fact.verificationState).toBe('verified')
+    expect(fact.verifierVersion).toBe('local-evidence-verifier-v1')
     expect(candidate.status).toBe('accepted')
     expect(candidate.evidenceEpisodeIds).toEqual([episode.id])
     expect(episode.content).toBe('我叫小秦')
@@ -47,6 +48,73 @@ describe('Memory V4 stage-two shadow writer', () => {
     expect(evidence).toMatchObject({ role: 'supports', strength: 'direct', active: true })
     expect(snapshot.factVersions.filter(item => item.factId === fact.id).map(item => item.operation))
       .toEqual(['ADD', 'MERGE_EVIDENCE'])
+    expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
+  })
+
+  it('persists quarantined conflicts as evidence-backed candidates without polluting V3', async () => {
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    const shadow = createV4ShadowWriter({ repository, now: () => NOW + 10, flushDelayMs: 10_000 })
+    const writer = createMemoryWriter({
+      store: createVectorStore({ onCommittedChange: shadow.enqueueCommit }),
+      extractor: turn => [{
+        content: `用户姓名/名字：${turn.userMessage}`,
+        metadata: {
+          kind: 'identity', memoryKey: 'profile.name', cardinality: 'single',
+          confidence: 0.95, importance: 0.9, extractionChannel: 'rules', extractorVersion: 'test-rules',
+        },
+      }],
+      onCaptured: shadow.enqueueCapture,
+    })
+
+    expect(await writer.capture({ userMessage: '小秦', assistantMessage: '', metadata: { sourceMessageIds: ['m1'] } }, scope)).toBe(1)
+    expect(await writer.capture({ userMessage: '小明', assistantMessage: '', metadata: { sourceMessageIds: ['m2'] } }, scope)).toBe(0)
+    shadow.flush()
+
+    const v3 = await writer.list(scope)
+    const snapshot = repository.snapshot()
+    const conflict = snapshot.candidates.find(item => item.canonicalText.includes('小明'))!
+    expect(v3).toHaveLength(1)
+    expect(v3[0]?.content).toContain('小秦')
+    expect(conflict).toMatchObject({
+      status: 'quarantined', proposedAction: 'CONFLICT', verifierVersion: 'local-evidence-verifier-v1',
+      evidenceEpisodeIds: [expect.any(String)],
+    })
+    expect(conflict.ambiguityFlags).toContain('unresolved-single-value-conflict')
+    expect(snapshot.episodes.find(item => item.sourceMessageId === 'm2')?.content).toBe('小明')
+    expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
+  })
+
+  it('scrubs a quarantined candidate and its plaintext episode when the source chat is deleted', async () => {
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    const shadow = createV4ShadowWriter({ repository, now: () => NOW + 10, flushDelayMs: 10_000 })
+    const writer = createMemoryWriter({
+      store: createVectorStore({ onCommittedChange: shadow.enqueueCommit }),
+      extractor: turn => [{
+        content: `用户姓名/名字：${turn.userMessage}`,
+        metadata: {
+          kind: 'identity', memoryKey: 'profile.name', cardinality: 'single',
+          confidence: 0.95, importance: 0.9, extractionChannel: 'rules', extractorVersion: 'test-rules',
+        },
+      }],
+      onCaptured: shadow.enqueueCapture,
+      onSourcesUnlinked: shadow.enqueueSourceUnlink,
+    })
+
+    await writer.capture({ userMessage: '小秦', assistantMessage: '', metadata: { sourceMessageIds: ['m1'] } }, scope)
+    await writer.capture({ userMessage: '小明', assistantMessage: '', metadata: { sourceMessageIds: ['m2'] } }, scope)
+    shadow.flush()
+    expect(repository.snapshot().candidates.find(item => item.canonicalText.includes('小明'))?.status).toBe('quarantined')
+
+    await writer.unlinkSources(['m2'], scope)
+    shadow.flush()
+    const snapshot = repository.snapshot()
+    const scrubbed = snapshot.candidates.find(item => item.evidenceEpisodeIds
+      .some(id => snapshot.episodes.find(episode => episode.id === id)?.sourceMessageId === 'm2'))!
+    const episode = snapshot.episodes.find(item => item.sourceMessageId === 'm2')!
+    expect(scrubbed).toMatchObject({ canonicalText: '[source-deleted]', status: 'rejected', proposedAction: 'NOOP' })
+    expect(JSON.stringify(scrubbed)).not.toContain('小明')
+    expect(episode).toMatchObject({ contentState: 'deleted', deletedAt: expect.any(Number) })
+    expect(episode).not.toHaveProperty('content')
     expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
   })
 
@@ -157,6 +225,41 @@ describe('Memory V4 stage-two shadow writer', () => {
     expect(repository.snapshot().facts).toHaveLength(1)
   })
 
+  it('versions an edited manual fact without overwriting its original evidence episode', () => {
+    let tick = NOW
+    const repository = createMemoryV4Repository({ now: () => ++tick })
+    const shadow = createV4ShadowWriter({ repository, now: () => ++tick, flushDelayMs: 10_000 })
+    const before = record({
+      id: 'editable-memory',
+      content: '用户喜欢咖啡',
+      origin: 'manual',
+      sourceMessageIds: [],
+    })
+    const after = {
+      ...before,
+      content: '用户喜欢低因咖啡',
+      updatedAt: NOW + 10,
+    }
+
+    shadow.enqueueCommit(commit([before], [], 'remember', NOW + 1))
+    shadow.enqueueCommit(commit([after], [], 'update', NOW + 10))
+    shadow.flush()
+
+    const snapshot = repository.snapshot()
+    const fact = snapshot.facts.find(item => item.metadata?.v3SourceId === before.id)!
+    const episodes = snapshot.episodes.filter(item => item.kind === 'manual-declaration')
+    const links = snapshot.evidenceLinks.filter(item => item.factId === fact.id)
+
+    expect(fact.canonicalText).toBe(after.content)
+    expect(snapshot.factVersions.filter(item => item.factId === fact.id).map(item => item.canonicalText))
+      .toEqual([before.content, after.content])
+    expect(episodes.map(item => item.content).sort()).toEqual([after.content, before.content].sort())
+    expect(new Set(episodes.map(item => item.id)).size).toBe(2)
+    expect(links.filter(item => item.active)).toHaveLength(1)
+    expect(links.filter(item => !item.active)).toHaveLength(1)
+    expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
+  })
+
   it('reconciles missed V3 records idempotently after restart and tombstones removed sources', () => {
     let tick = NOW
     const repository = createMemoryV4Repository({ now: () => ++tick })
@@ -177,6 +280,27 @@ describe('Memory V4 stage-two shadow writer', () => {
     expect(repository.snapshot().facts.find(item => item.metadata?.v3SourceId === first.id)?.status).toBe('deleted')
     expect(repository.snapshot().facts.find(item => item.metadata?.v3SourceId === second.id)?.status).toBe('active')
     expect(() => assertMemoryV4Snapshot(repository.snapshot())).not.toThrow()
+  })
+
+  it('never resurrects a purged V4 tombstone from a stale V3 source or reconciliation', () => {
+    let tick = NOW
+    const repository = createMemoryV4Repository({ now: () => ++tick })
+    const shadow = createV4ShadowWriter({ repository, now: () => ++tick, flushDelayMs: 10_000 })
+    const source = record({ id: 'purged-source', origin: 'manual', sourceMessageIds: [] })
+    shadow.enqueueCommit(commit([source], [], 'remember', NOW + 1))
+    shadow.flush()
+    shadow.enqueueCommit(commit([], [source.id], 'purge', NOW + 2))
+    shadow.flush()
+    expect(repository.snapshot().facts[0]).toMatchObject({ canonicalText: '[purged]', status: 'deleted' })
+
+    shadow.enqueueCommit(commit([source], [], 'remember', NOW + 3))
+    shadow.flush()
+    shadow.reconcileV3Payload(JSON.stringify({ version: 3, items: [source] }))
+
+    const snapshot = repository.snapshot()
+    expect(snapshot.facts[0]).toMatchObject({ canonicalText: '[purged]', status: 'deleted' })
+    expect(JSON.stringify(snapshot)).not.toContain(source.content)
+    expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
   })
 
   it('isolates a throwing post-commit observer from the successful V3 operation', async () => {

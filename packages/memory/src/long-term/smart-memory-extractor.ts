@@ -105,6 +105,8 @@ function parseCandidates(payload: string): MemoryCandidate[] {
       content,
       metadata: {
         kind: optionalString(memory.kind, 40) ?? 'other',
+        extractionChannel: 'model',
+        extractorVersion: 'smart-structured-v1',
         ...(optionalString(memory.memoryKey, 120) ? { memoryKey: optionalString(memory.memoryKey, 120) } : {}),
         cardinality: memory.cardinality === 'single' ? 'single' : 'multiple',
         confidence: clamp(memory.confidence, 0.7),
@@ -126,7 +128,16 @@ function mergeCandidates(first: MemoryCandidate[], second: MemoryCandidate[]): M
     const current = unique.get(key)
     unique.set(key, current ? {
       content: candidate.content,
-      metadata: { ...current.metadata, ...candidate.metadata },
+      metadata: {
+        ...current.metadata,
+        ...candidate.metadata,
+        extractionChannel: current.metadata.extractionChannel === 'rules'
+          ? 'rules+model'
+          : candidate.metadata.extractionChannel,
+        extractorVersion: current.metadata.extractionChannel === 'rules'
+          ? `${String(current.metadata.extractorVersion ?? 'local-rules')}+${String(candidate.metadata.extractorVersion ?? 'smart-structured')}`
+          : candidate.metadata.extractorVersion,
+      },
     } : candidate)
   }
   return [...unique.values()].slice(0, 8)

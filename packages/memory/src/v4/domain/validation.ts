@@ -15,14 +15,20 @@ const SHARE_POLICIES = ['allow-remote', 'local-only', 'ask'] as const
 const SENSITIVITIES = ['normal', 'private', 'secret'] as const
 const CARDINALITIES = ['single', 'multiple', 'set'] as const
 const POLARITIES = ['positive', 'negative', 'unknown'] as const
-const WRITE_ACTIONS = ['ADD', 'MERGE_EVIDENCE', 'REFINE', 'SUPERSEDE', 'CONFLICT', 'NOOP', 'QUARANTINE', 'DELETE', 'RESTORE'] as const
+const MODALITIES = ['asserted', 'planned', 'hypothetical', 'reported', 'inferred', 'unknown'] as const
+const OBJECT_TYPES = ['string', 'number', 'boolean', 'date', 'entity', 'json'] as const
+const WRITE_ACTIONS = ['ADD', 'MERGE_EVIDENCE', 'REFINE', 'SUPERSEDE', 'CONFLICT', 'NOOP', 'QUARANTINE', 'SUPPRESS', 'DELETE', 'PURGE', 'RESTORE'] as const
 const CANDIDATE_STATUSES = ['pending', 'accepted', 'rejected', 'quarantined'] as const
-const FACT_STATUSES = ['active', 'superseded', 'conflicted', 'quarantined', 'expired', 'orphaned', 'archived', 'deleted'] as const
+const FACT_STATUSES = ['active', 'superseded', 'conflicted', 'quarantined', 'expired', 'orphaned', 'archived', 'suppressed', 'deleted'] as const
 const VERIFICATION_STATES = ['verified', 'pending', 'legacy-unverified', 'rejected'] as const
 const FACT_ORIGINS = ['automatic', 'manual', 'image'] as const
 const EVIDENCE_ROLES = ['supports', 'references', 'legacy-derived'] as const
 const EVIDENCE_STRENGTHS = ['direct', 'reference-only', 'legacy-derived'] as const
 const EPISODE_PROVENANCE = ['native-v4', 'v3-reference', 'v3-derived-record'] as const
+const DERIVED_KINDS = ['summary', 'graph-edge', 'embedding', 'retrieval-cache'] as const
+const DERIVED_STATUSES = ['current', 'stale', 'deleted'] as const
+const DOMAIN_EVENT_TYPES = ['EPISODE_RECORDED', 'FACT_CREATED', 'FACT_VERSIONED', 'EVIDENCE_LINKED', 'EVIDENCE_UNLINKED', 'FACT_SUPPRESSED', 'FACT_DELETED', 'FACT_PURGED', 'FACT_RESTORED', 'DERIVED_ARTIFACT_STALE', 'V3_RECONCILED'] as const
+const DOMAIN_EVENT_ACTORS = ['system', 'user', 'migration'] as const
 
 export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV4Snapshot {
   if (!isRecord(value))
@@ -40,6 +46,8 @@ export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV
   const facts = requireArray(value.facts, 'facts')
   const evidenceLinks = requireArray(value.evidenceLinks, 'evidenceLinks')
   const factVersions = requireArray(value.factVersions, 'factVersions')
+  const derivedArtifacts = requireArray(value.derivedArtifacts, 'derivedArtifacts')
+  const domainEvents = requireArray(value.domainEvents, 'domainEvents')
   const retrievalEvents = requireArray(value.retrievalEvents, 'retrievalEvents')
   const manifests = requireArray(value.migrationManifests, 'migrationManifests')
   const legacyImports = requireArray(value.legacyImports, 'legacyImports')
@@ -59,6 +67,8 @@ export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV
   const evidenceIds = uniqueIds(evidenceLinks, 'evidence link')
   const factVersionIds = uniqueIds(factVersions, 'fact version')
   uniqueIds(retrievalEvents, 'retrieval event')
+  uniqueIds(derivedArtifacts, 'derived artifact')
+  uniqueIds(domainEvents, 'domain event')
   uniqueIds(manifests, 'migration manifest')
 
   const episodeScopes = new Map<string, MemoryV4Scope>()
@@ -106,7 +116,16 @@ export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV
     factVersionsForOwner.push({ version: version.version as number, record: version })
     versionsByFact.set(factId, factVersionsForOwner)
     requireEnum(version.operation, [...WRITE_ACTIONS, 'MIGRATE_V3'] as const, `fact version ${position}.operation`)
+    requireString(version.subjectId, `fact version ${position}.subjectId`)
+    requireString(version.predicate, `fact version ${position}.predicate`)
+    requireJsonValue(version.object, `fact version ${position}.object`)
+    requireEnum(version.objectType, OBJECT_TYPES, `fact version ${position}.objectType`)
+    requireJsonValue(version.normalizedValue, `fact version ${position}.normalizedValue`)
     requireString(version.canonicalText, `fact version ${position}.canonicalText`)
+    requireEnum(version.polarity, POLARITIES, `fact version ${position}.polarity`)
+    requireEnum(version.modality, MODALITIES, `fact version ${position}.modality`)
+    if (version.condition !== undefined)
+      requireString(version.condition, `fact version ${position}.condition`)
     requireEnum(version.status, FACT_STATUSES, `fact version ${position}.status`)
     requireOptionalChronology(version.validFrom, version.validTo, `fact version ${position}`)
     for (const evidenceId of requireUniqueStringArray(version.evidenceLinkIds, `fact version ${position}.evidenceLinkIds`)) {
@@ -116,6 +135,11 @@ export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV
         throw new Error(`Memory V4 fact version ${versionId} references evidence owned by another fact`)
     }
     requireTimestamp(version.recordedAt, `fact version ${position}.recordedAt`)
+    if (version.transactionClosedAt !== undefined) {
+      const closedAt = requireTimestamp(version.transactionClosedAt, `fact version ${position}.transactionClosedAt`)
+      if (closedAt < (version.recordedAt as number))
+        throw new Error(`Memory V4 fact version ${versionId} closed before it was recorded`)
+    }
     requireString(version.reason, `fact version ${position}.reason`)
   }
   for (const raw of facts) {
@@ -124,8 +148,16 @@ export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV
     if (!versions || versions.length === 0)
       throw new Error(`Memory V4 fact ${fact.id} has no auditable version history`)
     const latest = versions.reduce((left, right) => right.version > left.version ? right : left).record
-    if (latest.canonicalText !== fact.canonicalText || latest.status !== fact.status)
+    if (latest.canonicalText !== fact.canonicalText || latest.status !== fact.status
+      || latest.predicate !== fact.predicate || JSON.stringify(latest.object) !== JSON.stringify(fact.object))
       throw new Error(`Memory V4 fact ${fact.id} does not match its latest version`)
+    for (const item of versions) {
+      const isLatest = item.record === latest
+      if (isLatest && item.record.transactionClosedAt !== undefined)
+        throw new Error(`Memory V4 latest fact version for ${fact.id} is transaction-closed`)
+      if (!isLatest && item.record.transactionClosedAt === undefined)
+        throw new Error(`Memory V4 historical fact version for ${fact.id} has no transaction close time`)
+    }
   }
 
   for (const [position, raw] of retrievalEvents.entries()) {
@@ -146,6 +178,61 @@ export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV
     requireString(event.retrievalVersion, `retrieval event ${position}.retrievalVersion`)
     if (event.answerModel !== undefined)
       requireString(event.answerModel, `retrieval event ${position}.answerModel`)
+  }
+
+  for (const [position, raw] of derivedArtifacts.entries()) {
+    const artifact = requireRecord(raw, `derived artifact ${position}`)
+    const artifactId = requireString(artifact.id, `derived artifact ${position}.id`)
+    const artifactScope = requireScope(artifact.scope, `derived artifact ${position}.scope`)
+    requireEnum(artifact.kind, DERIVED_KINDS, `derived artifact ${position}.kind`)
+    const artifactStatus = requireEnum(artifact.status, DERIVED_STATUSES, `derived artifact ${position}.status`)
+    for (const episodeId of requireUniqueStringArray(artifact.sourceEpisodeIds, `derived artifact ${position}.sourceEpisodeIds`)) {
+      if (!episodeIds.has(episodeId) || !scopeCanContain(artifactScope, episodeScopes.get(episodeId)!))
+        throw new Error(`Memory V4 derived artifact ${artifactId} references a missing or out-of-scope episode`)
+    }
+    for (const factId of requireUniqueStringArray(artifact.sourceFactIds, `derived artifact ${position}.sourceFactIds`)) {
+      if (!factIds.has(factId) || !scopeCanContain(artifactScope, factScopes.get(factId)!))
+        throw new Error(`Memory V4 derived artifact ${artifactId} references a missing or out-of-scope fact`)
+    }
+    if (artifact.content !== undefined)
+      requireString(artifact.content, `derived artifact ${position}.content`)
+    if (artifact.contentHash !== undefined)
+      requireString(artifact.contentHash, `derived artifact ${position}.contentHash`)
+    const artifactCreatedAt = requireTimestamp(artifact.createdAt, `derived artifact ${position}.createdAt`)
+    const artifactUpdatedAt = requireTimestamp(artifact.updatedAt, `derived artifact ${position}.updatedAt`)
+    if (artifactUpdatedAt < artifactCreatedAt)
+      throw new Error(`Memory V4 derived artifact ${artifactId} updated before creation`)
+    if (artifact.invalidatedAt !== undefined)
+      requireTimestamp(artifact.invalidatedAt, `derived artifact ${position}.invalidatedAt`)
+    if (artifactStatus === 'current' && artifact.invalidatedAt !== undefined)
+      throw new Error(`Memory V4 current derived artifact ${artifactId} is invalidated`)
+    requireString(artifact.builderVersion, `derived artifact ${position}.builderVersion`)
+  }
+
+  const idempotencyKeys = new Set<string>()
+  for (const [position, raw] of domainEvents.entries()) {
+    const event = requireRecord(raw, `domain event ${position}`)
+    const eventId = requireString(event.id, `domain event ${position}.id`)
+    const key = requireString(event.idempotencyKey, `domain event ${position}.idempotencyKey`)
+    if (idempotencyKeys.has(key))
+      throw new Error(`Memory V4 domain events contain duplicate idempotency key ${key}`)
+    idempotencyKeys.add(key)
+    requireEnum(event.type, DOMAIN_EVENT_TYPES, `domain event ${position}.type`)
+    const eventScope = requireScope(event.scope, `domain event ${position}.scope`)
+    if (event.factId !== undefined) {
+      const factId = requireString(event.factId, `domain event ${position}.factId`)
+      if (!factIds.has(factId) || !scopeCanContain(eventScope, factScopes.get(factId)!))
+        throw new Error(`Memory V4 domain event ${eventId} references a missing or out-of-scope fact`)
+    }
+    if (event.episodeId !== undefined) {
+      const episodeId = requireString(event.episodeId, `domain event ${position}.episodeId`)
+      if (!episodeIds.has(episodeId) || !scopeCanContain(eventScope, episodeScopes.get(episodeId)!))
+        throw new Error(`Memory V4 domain event ${eventId} references a missing or out-of-scope episode`)
+    }
+    requireTimestamp(event.createdAt, `domain event ${position}.createdAt`)
+    requireEnum(event.actor, DOMAIN_EVENT_ACTORS, `domain event ${position}.actor`)
+    if (event.payload !== undefined)
+      requireJsonValue(event.payload, `domain event ${position}.payload`)
   }
 
   const legacyBySourceId = validateLegacyImports(legacyImports, factIds)
@@ -286,8 +373,13 @@ function validateCandidate(
   requireString(candidate.subjectId, `candidate ${position}.subjectId`)
   requireString(candidate.predicate, `candidate ${position}.predicate`)
   requireJsonValue(candidate.object, `candidate ${position}.object`)
+  requireEnum(candidate.objectType, OBJECT_TYPES, `candidate ${position}.objectType`)
+  requireJsonValue(candidate.normalizedValue, `candidate ${position}.normalizedValue`)
   requireString(candidate.canonicalText, `candidate ${position}.canonicalText`)
   requireEnum(candidate.polarity, POLARITIES, `candidate ${position}.polarity`)
+  requireEnum(candidate.modality, MODALITIES, `candidate ${position}.modality`)
+  if (candidate.condition !== undefined)
+    requireString(candidate.condition, `candidate ${position}.condition`)
   requireEnum(candidate.cardinality, CARDINALITIES, `candidate ${position}.cardinality`)
   requireOptionalChronology(candidate.validFrom, candidate.validTo, `candidate ${position}`)
   requireScore(candidate.extractionScore, `candidate ${position}.extractionScore`)
@@ -301,6 +393,10 @@ function validateCandidate(
   requireString(candidate.extractorVersion, `candidate ${position}.extractorVersion`)
   if (candidate.verifierVersion !== undefined)
     requireString(candidate.verifierVersion, `candidate ${position}.verifierVersion`)
+  if (candidate.policyVersion !== undefined)
+    requireString(candidate.policyVersion, `candidate ${position}.policyVersion`)
+  if (candidate.decisionReasonCodes !== undefined)
+    requireStringArray(candidate.decisionReasonCodes, `candidate ${position}.decisionReasonCodes`)
   const createdAt = requireTimestamp(candidate.createdAt, `candidate ${position}.createdAt`)
   const updatedAt = requireTimestamp(candidate.updatedAt, `candidate ${position}.updatedAt`)
   if (updatedAt < createdAt)
@@ -356,10 +452,15 @@ function validateFact(
   requireString(fact.subjectId, `fact ${position}.subjectId`)
   requireString(fact.predicate, `fact ${position}.predicate`)
   requireJsonValue(fact.object, `fact ${position}.object`)
+  requireEnum(fact.objectType, OBJECT_TYPES, `fact ${position}.objectType`)
+  requireJsonValue(fact.normalizedValue, `fact ${position}.normalizedValue`)
   requireString(fact.canonicalText, `fact ${position}.canonicalText`)
   requireString(fact.memoryKey, `fact ${position}.memoryKey`)
   requireEnum(fact.cardinality, CARDINALITIES, `fact ${position}.cardinality`)
   requireEnum(fact.polarity, POLARITIES, `fact ${position}.polarity`)
+  requireEnum(fact.modality, MODALITIES, `fact ${position}.modality`)
+  if (fact.condition !== undefined)
+    requireString(fact.condition, `fact ${position}.condition`)
   const status = requireEnum(fact.status, FACT_STATUSES, `fact ${position}.status`)
   requireOptionalChronology(fact.validFrom, fact.validTo, `fact ${position}`)
   const recordedAt = requireTimestamp(fact.recordedAt, `fact ${position}.recordedAt`)

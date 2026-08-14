@@ -73,7 +73,7 @@ export interface AdaptiveMemoryRecallOptions extends MemoryRecallOptions {
 
 export type AdaptiveMemoryRecallStopReason = 'no-candidates' | 'coverage-satisfied'
   | 'score-drop' | 'marginal-gain' | 'character-budget' | 'max-injected'
-  | 'max-batches' | 'candidates-exhausted'
+  | 'max-batches' | 'candidates-exhausted' | 'memory-not-needed'
 
 /** Result includes retrieval/injection separation for audit and unbiased usage accounting. */
 export interface AdaptiveMemoryRecallResult {
@@ -86,6 +86,16 @@ export interface AdaptiveMemoryRecallResult {
   evaluatedCount: number
   batchesEvaluated: number
   stopReason: AdaptiveMemoryRecallStopReason
+  /** Deterministic query-plan intent used to choose retrieval and selection budgets. */
+  queryIntent?: string
+  /** Candidate budget selected before ranking; injection remains independently bounded. */
+  candidateBudget?: number
+  /** Retrieval routes that contributed candidates, for local audit and evaluation. */
+  retrievalRoutes?: string[]
+  /** Number of candidates produced by each route before fusion. */
+  routeCandidateCounts?: Record<string, number>
+  queryPlanVersion?: string
+  fusionMethod?: string
 }
 
 /** Isolation boundary for long-term memories. */
@@ -98,10 +108,29 @@ export interface MemoryScope {
   sessionId?: string
 }
 
+/** A bounded, non-authoritative context window used only to resolve the current user turn. */
+export interface MemoryCaptureContextMessage {
+  id?: string
+  role: 'user' | 'assistant'
+  content: string
+  createdAt?: number
+}
+
+export interface MemoryCaptureContext {
+  /** Chronological recent messages. Implementations must cap both count and text length. */
+  recentMessages: MemoryCaptureContextMessage[]
+  /** Local navigation hint; never sufficient evidence for a memory by itself. */
+  topicSummary?: string
+}
+
 /** A completed turn from which durable facts may be extracted. */
 export interface MemoryCapture {
   userMessage: string
+  /** Full source text for a segmented local capture. It is not copied into V3 fact metadata. */
+  originalUserMessage?: string
   assistantMessage: string
+  /** Context may disambiguate the current turn, but the current user assertion remains the authority. */
+  context?: MemoryCaptureContext
   attachments?: Array<{
     type: 'image'
     data: string

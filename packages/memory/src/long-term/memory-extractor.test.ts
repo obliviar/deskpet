@@ -99,6 +99,17 @@ describe('extractMemoryCandidates', () => {
     ])
   })
 
+  it('keeps an asserted fact when a separate trailing clause asks a question', () => {
+    expect(extractMemoryCandidates({
+      userMessage: '我住在成都，你觉得这里适合长期生活吗？',
+      assistantMessage: '',
+    }).map(item => item.content)).toEqual(['用户所在地：成都'])
+    expect(extractMemoryCandidates({
+      userMessage: '你觉得我住在杭州合适吗？',
+      assistantMessage: '',
+    })).toEqual([])
+  })
+
   it('rejects hypotheses, quotations, questions, negation and corrected claims', () => {
     const inputs = [
       '如果我叫张三会怎么样',
@@ -163,5 +174,21 @@ describe('extractMemoryCandidates', () => {
       sensitivity: 'private',
       sharePolicy: 'local-only',
     })
+  })
+
+  it('uses bounded local context only after an explicit user confirmation', () => {
+    const context = {
+      recentMessages: [{ role: 'assistant' as const, content: '确认一下，你喜欢无糖美式吗？' }],
+    }
+    expect(extractMemoryCandidates({ userMessage: '是的', assistantMessage: '', context })
+      .map(item => item.content)).toEqual(['用户喜好/偏好：无糖美式'])
+    expect(extractMemoryCandidates({ userMessage: '也许吧', assistantMessage: '', context })).toEqual([])
+  })
+
+  it('does not truncate more than eight atomic facts', () => {
+    const userMessage = Array.from({ length: 12 }, (_, index) => `请记住：长期事实${index}。`).join('')
+    const result = extractMemoryCandidates({ userMessage, assistantMessage: '' })
+    expect(result).toHaveLength(12)
+    expect(result.at(-1)?.content).toContain('长期事实11')
   })
 })

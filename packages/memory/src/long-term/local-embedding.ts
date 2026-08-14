@@ -8,7 +8,7 @@ const CONCEPT_WEIGHT = 5
 const SEMANTIC_CONCEPT_PATTERNS: Array<[string, RegExp]> = [
   ['preference.any', /偏好|喜欢|偏爱|爱听|爱看|不喜欢|讨厌|常喝|常吃|prefer|preference|like|dislike|favorite|favourite/i],
   ['profile.name', /姓名|名字|称呼|叫(?:我|你)|\bname\b|\bcall\b/i],
-  ['profile.location', /所在地|住在|居住|常住|定居|落脚|哪座城市|哪里住|何处生活|based\s+in|live\s+in|has\s+been\s+home/i],
+  ['profile.location', /所在地|住在|居住|常住|定居|落脚|哪座城市|哪里住|何处生活|(?:哪|什么|哪个).{0,4}城市.{0,6}(?:生活|居住|住过|待过)|based\s+in|live\s+in|has\s+been\s+home/i],
   ['profile.native-language', /母语|方言|家乡话|从小讲|native\s+language|dialect/i],
   ['profile.shoe-size', /鞋码|几码.{0,4}鞋|鞋.{0,6}(?:尺码|号码|大小)|shoe\s+size/i],
   ['relationship.pet', /宠物|毛孩子|猫咪|猫|狗狗|狗|兔子|兔|\bdog\b|\bcat\b|\bpet\b|\brabbit\b/i],
@@ -21,7 +21,7 @@ const SEMANTIC_CONCEPT_PATTERNS: Array<[string, RegExp]> = [
   ['preference.response-style', /回答偏好|回复|回答|篇幅|简洁|详细|\bresponse\b|\breply\b|\bconcise\b/i],
   ['profile.programming-language', /编程语言|哪门语言|写程序|写代码|技术栈|python|typescript|javascript|rust|c\+\+|programming\s+language|tech\s+stack/i],
   ['preference.drink', /饮品|喝什么|泡什么|乌龙茶|咖啡|饮料|\bdrink\b|\bbeverage\b|\btea\b|\bcoffee\b/i],
-  ['routine.work-time', /工作习惯|工作时间|夜间|晚上工作|时段.{0,8}效率|效率最高|白天.{0,8}夜|办公|work.{0,12}(?:night|day)/i],
+  ['routine.work-time', /工作习惯|工作时间|(?:什么时候|何时).{0,6}工作|平时.{0,8}工作|夜间|晚上工作|时段.{0,8}效率|效率最高|白天.{0,8}夜|办公|work.{0,12}(?:night|day)/i],
   ['profile.birthday', /生日|出生日期|生日祝福|庆生|\bbirthday\b|celebrate.{0,8}birthday/i],
   ['relationship.friend', /好友|朋友|那位朋友|\bfriend\b/i],
   ['preference.food', /不喜欢.{0,12}(?:食物|吃)|不要(?:放|加)|吃饭|点菜|口味.{0,8}(?:禁忌|避讳)|忌口|不能吃|香菜|\bdislike\b|\bhate\b|cilantro|food.{0,12}(?:preference|restriction)/i],

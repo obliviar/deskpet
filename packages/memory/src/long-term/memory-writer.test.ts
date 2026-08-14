@@ -88,4 +88,57 @@ describe('long-term memory integration', () => {
     expect(refined[0]).toMatchObject({ id: original.id, content: '用户希望的称呼:小秦同学', status: 'active' })
     expect(refined[0]?.sourceMessageIds).toEqual(['m1', 'm2'])
   })
+
+  it('queues oversized continuation segments and flushes all durable facts', async () => {
+    const scope = { ownerId: 'long-user', agentId: 'deskpet' }
+    const writer = createMemoryWriter({
+      store: createVectorStore(),
+      maximumSegmentCharacters: 256,
+      extractor: turn => [...turn.userMessage.matchAll(/请记住[:：]长期编号(\d+)以及稳定的补充描述/gu)]
+        .map(match => ({
+          content: `用户明确希望记住：长期编号${match[1]}`,
+          metadata: {
+            kind: 'explicit', memoryKey: `explicit.long.${match[1]}`, cardinality: 'multiple',
+            confidence: 0.95, importance: 0.9, extractionChannel: 'rules', extractorVersion: 'queue-test-v1',
+          },
+        })),
+    })
+    const userMessage = Array.from({ length: 30 }, (_, index) => `请记住：长期编号${index}以及稳定的补充描述。`).join('')
+    await writer.capture({ userMessage, assistantMessage: '', metadata: { sourceMessageIds: ['long-1'] } }, scope)
+    expect(writer.pendingCaptureCount()).toBeGreaterThan(0)
+    await writer.flushPendingCaptures()
+    expect(writer.pendingCaptureCount()).toBe(0)
+    const stored = await writer.list(scope, 100)
+    expect(stored).toHaveLength(30)
+    expect(stored.some(item => item.content.includes('长期编号29'))).toBe(true)
+  })
+
+  it('isolates one failed segment and continues processing the remaining long message', async () => {
+    const scope = { ownerId: 'long-failure-user', agentId: 'deskpet' }
+    const failures: string[] = []
+    const writer = createMemoryWriter({
+      store: createVectorStore(),
+      maximumSegmentCharacters: 256,
+      maximumQueuedSegments: 2,
+      extractor: (turn) => {
+        if (turn.userMessage.includes('FAIL-FIRST'))
+          throw new Error('segment failure')
+        return [...turn.userMessage.matchAll(/请记住[:：]恢复编号(\d+)/gu)].map(match => ({
+          content: `用户明确希望记住：恢复编号${match[1]}`,
+          metadata: {
+            kind: 'explicit', memoryKey: `explicit.recovery.${match[1]}`, cardinality: 'multiple',
+            confidence: 0.95, importance: 0.9, extractionChannel: 'rules', extractorVersion: 'queue-failure-v1',
+          },
+        }))
+      },
+      onBackgroundCaptureError: error => failures.push(error instanceof Error ? error.message : String(error)),
+    })
+    const userMessage = `FAIL-FIRST${'占位'.repeat(180)}。${Array.from({ length: 12 }, (_, index) => `请记住：恢复编号${index}。`).join('')}`
+    expect(await writer.capture({ userMessage, assistantMessage: '' }, scope)).toBe(0)
+    await writer.flushPendingCaptures()
+    expect(failures).toEqual(['segment failure'])
+    const stored = await writer.list(scope, 100)
+    expect(stored.some(item => item.content.includes('恢复编号11'))).toBe(true)
+    expect(writer.pendingCaptureCount()).toBe(0)
+  })
 })

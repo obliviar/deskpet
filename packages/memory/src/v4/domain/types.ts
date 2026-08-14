@@ -38,6 +38,7 @@ export interface MemoryEpisodeV4 {
 }
 
 export type CandidateStatus = 'pending' | 'accepted' | 'rejected' | 'quarantined'
+export type CandidateReviewOutcomeV4 = 'approved' | 'rejected'
 export type MemoryCardinalityV4 = 'single' | 'multiple' | 'set'
 export type MemoryPolarityV4 = 'positive' | 'negative' | 'unknown'
 export type MemoryModalityV4 = 'asserted' | 'planned' | 'hypothetical' | 'reported' | 'inferred' | 'unknown'
@@ -63,6 +64,14 @@ export interface MemoryCandidateV4 {
   validTo?: number
   extractionScore: number
   verificationScore?: number
+  evidenceScore?: number
+  calibratedActiveProbability?: number
+  calibrationLowerBound?: number
+  calibrationUpperBound?: number
+  calibrationStatus?: 'calibrated' | 'insufficient-data' | 'out-of-distribution'
+  calibrationMethod?: 'isotonic-pav'
+  calibratorVersion?: string
+  calibrationCohort?: string
   durabilityScore: number
   ambiguityFlags: string[]
   proposedAction?: MemoryWriteActionV4
@@ -71,8 +80,37 @@ export interface MemoryCandidateV4 {
   verifierVersion?: string
   policyVersion?: string
   decisionReasonCodes?: string[]
+  reviewOutcome?: CandidateReviewOutcomeV4
+  reviewedAt?: number
+  reviewNote?: string
+  policyRuns?: MemoryCandidatePolicyRunV4[]
   createdAt: number
   updatedAt: number
+}
+
+export interface MemoryCandidatePolicyRunV4 {
+  id: string
+  action: MemoryWriteActionV4
+  status: CandidateStatus
+  extractionScore: number
+  verificationScore: number
+  evidenceScore: number
+  calibratedActiveProbability: number
+  calibrationLowerBound: number
+  calibrationUpperBound: number
+  calibrationStatus: 'calibrated' | 'insufficient-data' | 'out-of-distribution'
+  calibrationMethod: 'isotonic-pav'
+  calibratorVersion: string
+  calibrationCohort: string
+  durabilityScore: number
+  ambiguityFlags: string[]
+  reasonCodes: string[]
+  extractorVersion: string
+  normalizerVersion: string
+  verifierVersion: string
+  policyVersion: string
+  processedAt: number
+  shadow: boolean
 }
 
 export type MemoryFactStatusV4 = 'active' | 'superseded' | 'conflicted' | 'quarantined'
@@ -181,6 +219,7 @@ export interface MemoryDerivedArtifactV4 {
 export type MemoryDomainEventTypeV4 = 'EPISODE_RECORDED' | 'FACT_CREATED' | 'FACT_VERSIONED'
   | 'EVIDENCE_LINKED' | 'EVIDENCE_UNLINKED' | 'FACT_SUPPRESSED' | 'FACT_DELETED'
   | 'FACT_PURGED' | 'FACT_RESTORED' | 'DERIVED_ARTIFACT_STALE' | 'V3_RECONCILED'
+  | 'CANDIDATE_REVIEWED' | 'CANDIDATE_REPROCESSED'
 
 /** Append-only, idempotent lifecycle ledger. Payload contains identifiers, not plaintext evidence. */
 export interface MemoryDomainEventV4 {

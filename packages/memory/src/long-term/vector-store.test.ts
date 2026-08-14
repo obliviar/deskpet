@@ -315,7 +315,7 @@ describe('persistent vector store', () => {
     const result = await store.recallAdaptive('量子纠缠如何定义', scope)
     expect(result).toMatchObject({
       memories: [], candidateCount: 0, evaluatedCount: 0,
-      batchesEvaluated: 0, stopReason: 'no-candidates',
+      batchesEvaluated: 0, stopReason: 'memory-not-needed',
     })
     expect((await store.list(scope))[0]?.accessCount).toBe(0)
   })
@@ -544,6 +544,7 @@ describe('persistent vector store', () => {
       await store.remember(content, scope, { kind })
 
     expect((await store.recall('现在定居在哪里', scope, 1))[0]?.content).toContain('杭州滨江')
+    expect((await store.recall('以前在什么城市生活', scope, 2, { temporalMode: 'historical' }))[0]?.content).toContain('杭州滨江')
     expect((await store.recall('靠什么工作谋生', scope, 1))[0]?.content).toContain('产品设计')
     expect((await store.recall('手头在准备什么', scope, 1))[0]?.content).toContain('毕业论文')
     expect((await store.recall('另一半叫什么', scope, 1))[0]?.content).toContain('陈曦')

@@ -44,6 +44,15 @@ export type {
 } from './lifecycle/purge-confirmation'
 export { auditV3V4Consistency } from './audit/v3-v4-diff-audit'
 export type { MemoryV4AuditIssue, MemoryV4AuditReport } from './audit/v3-v4-diff-audit'
+export { createMemoryCandidateReviewService } from './review/memory-candidate-review'
+export type {
+  CandidateApprovalTarget,
+  CandidateCalibrationDataset,
+  CandidateReprocessOptions,
+  CandidateReprocessReport,
+  CandidateReviewItem,
+  MemoryCandidateReviewService,
+} from './review/memory-candidate-review'
 export type {
   V4CapturedMemory,
   V4ShadowCapture,

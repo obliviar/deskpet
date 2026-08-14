@@ -147,6 +147,32 @@ describe('evidence-first memory write policy', () => {
       reasonCodes: ['user-lifecycle-state-protected'],
     })
   })
+
+  it('quarantines an out-of-distribution calibrated cohort instead of falling back to a raw score', async () => {
+    const calibratedVerifier = createLocalMemoryCandidateVerifier({
+      calibrator: {
+        version: 'test-ood-v1',
+        calibrate: () => ({
+          probability: 0.99, lowerBound: 0.95, upperBound: 1,
+          status: 'out-of-distribution', sampleCount: 500, method: 'isotonic-pav',
+          calibratorVersion: 'test-ood-v1', cohort: 'global',
+        }),
+      },
+    })
+    const candidate = memoryCandidate('用户姓名/名字：小秦', {
+      kind: 'identity', memoryKey: 'profile.name', cardinality: 'single',
+      confidence: 0.99, importance: 0.9, extractionChannel: 'new-model',
+    })
+    const result = await calibratedVerifier(candidate, {
+      turn: { userMessage: '我叫小秦', assistantMessage: '' },
+      scope,
+      matches: { activeByMemoryKey: [] },
+    })
+    expect(result).toMatchObject({
+      action: 'QUARANTINE', status: 'quarantined',
+      reasonCodes: ['calibration-cohort-out-of-distribution'],
+    })
+  })
 })
 
 function memoryCandidate(content: string, metadata: Record<string, unknown>): MemoryCandidate {

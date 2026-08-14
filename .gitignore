@@ -9,3 +9,5 @@ release/
 out/
 resources/char/
 apps/deskpet-electron/config.json
+evals/memory/private/
+evals/memory/reports/private/

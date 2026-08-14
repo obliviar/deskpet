@@ -19,10 +19,14 @@ import {
   LEGACY_LOCAL_EMBEDDING_MODELS,
   localSemanticConcepts,
   LOCAL_EMBEDDING_MODEL,
-  sharesLocalSemanticConcept,
 } from './local-embedding'
-import { planTemporalQuery } from './temporal-query'
 import { isBroadPersonalMemoryQuery, selectAdaptiveRecall } from './adaptive-recall'
+import {
+  planMemoryQuery,
+  type MemoryQueryPlan,
+  type MemoryRetrievalRoute,
+} from './memory-query-planner'
+import { MEMORY_RRF_VERSION, reciprocalRankFusion } from './reciprocal-rank-fusion'
 
 export interface MemoryPersistence {
   load: () => string | undefined
@@ -55,6 +59,8 @@ export interface VectorStoreOptions {
   minLexicalScore?: number
   maxMemories?: number
   embedder?: (text: string) => Promise<number[]>
+  /** RRF is the default stage-three strategy; legacy linear scoring remains available for rollback/evaluation. */
+  retrievalFusion?: 'rrf-v1' | 'weighted-linear-v1'
   /**
    * Optional post-commit observer used by additive shadow stores. It runs only
    * after the V3 persistence operation succeeds. Observer failures are
@@ -125,12 +131,33 @@ interface RankedMemoryEntry {
   semanticScore: number
   lexicalScore: number
   temporalScore: number
+  retrievalRoutes: MemoryRetrievalRoute[]
+  routeRanks: Record<string, number>
 }
 
 interface RankedMemoryPool {
   entries: RankedMemoryEntry[]
   changed: Map<string, IndexedMemory>
   now: number
+  queryPlan: MemoryQueryPlan
+  routeCandidateCounts: Record<string, number>
+}
+
+interface MemoryCandidateFeatures {
+  item: IndexedMemory
+  semanticScore: number
+  lexicalScore: number
+  temporalScore: number
+  structuredScore: number
+  importanceScore: number
+  confidenceScore: number
+  recencyScore: number
+  frequencyScore: number
+  lexicalRelevant: boolean
+  semanticRelevant: boolean
+  structuredRelevant: boolean
+  broadRelevant: boolean
+  relevant: boolean
 }
 
 export function createVectorStore(options: VectorStoreOptions = {}) {
@@ -147,6 +174,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     storagePath,
     maxMemories = 20_000,
     embedder,
+    retrievalFusion = 'rrf-v1',
     onCommittedChange,
     onCommitObserverError,
   } = options
@@ -187,12 +215,15 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     const normalizedScope = normalizeScope(scope)
     const changed = new Map(markExpired(index, normalizedScope, secondary).map(item => [item.id, item]))
     const now = Date.now()
-    const temporalPlan = planTemporalQuery(query, recallOptions)
+    const queryPlan = planMemoryQuery(query, recallOptions)
+    const temporalPlan = { mode: queryPlan.temporalMode, asOf: queryPlan.asOf }
+    if (!queryPlan.requiresMemory)
+      return { entries: [], changed, now, queryPlan, routeCandidateCounts: {} }
     const candidates = index.filter(item => matchesScope(item.scope, normalizedScope)
       && isTemporalCandidate(item, temporalPlan.mode, temporalPlan.asOf, now)
       && isRecallAllowed(item, recallOptions))
     if (candidates.length === 0 || !query.trim())
-      return { entries: [], changed, now }
+      return { entries: [], changed, now, queryPlan, routeCandidateCounts: {} }
 
     for (const item of candidates) {
       if (item.embeddingModel !== embeddingModel || item.embedding.length === 0) {
@@ -211,26 +242,30 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     const broadPersonalQuery = isBroadPersonalMemoryQuery(query)
     const queryStrongTokens = strongLexicalTokens(query)
     const lexicalScores = bm25Scores(query, candidates.map(item => item.content))
-    const scored = candidates
+    const features: MemoryCandidateFeatures[] = candidates
       .map((item, itemIndex) => {
         const semantic = clampScore(cosineSimilarity(queryEmbedding, item.embedding))
         const lexical = lexicalScores[itemIndex] ?? 0
         const importance = clampScore(item.importance)
+        const confidence = clampScore(item.confidence)
         const recency = recencyScore(item, now)
         const frequency = Math.min(1, Math.log1p(item.accessCount) / Math.log(21))
         const temporal = temporalAlignment(item, temporalPlan.mode)
-        const score = clampScore(
-          semantic * 0.4
-          + lexical * 0.2
-          + importance * 0.14
-          + recency * 0.08
-          + frequency * 0.04
-          + temporal * 0.14,
-        )
         const strongLexicalOverlap = hasStrongLexicalOverlap(queryStrongTokens, item.content)
-        const sharedConcept = hasQueryConcepts
-          ? sharesLocalSemanticConcept(item.content, queryConcepts!)
+        // Avoid scanning every stored fact through the concept rules for broad
+        // queries that have no requested field. On a 20k profile this was the
+        // dominant avoidable part of the online path.
+        const itemConcepts = hasQueryConcepts
+          ? new Set(localSemanticConcepts(item.content))
+          : undefined
+        const sharedConcept = itemConcepts
+          ? intersectionSize(queryConcepts!, itemConcepts) > 0
           : false
+        const structured = hasQueryConcepts
+          ? weightedConceptCoverage(queryConcepts!, itemConcepts!)
+          : broadPersonalQuery
+            ? importance * 0.6 + confidence * 0.4
+            : 0
         const lexicalRelevant = lexical >= minLexicalScore
           && strongLexicalOverlap
           && (!hasQueryConcepts || sharedConcept)
@@ -243,23 +278,36 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         // remembers without naming any one semantic field. Only this tightly
         // scoped personal-memory intent may enter on quality priors alone.
         const broadRelevant = broadPersonalQuery && !hasQueryConcepts
-        const relevant = lexicalRelevant || semanticRelevant || broadRelevant
+        const structuredRelevant = hasQueryConcepts ? structured > 0 : broadRelevant
+        const relevant = lexicalRelevant || semanticRelevant || structuredRelevant || broadRelevant
         return {
           item,
-          score,
           semanticScore: semantic,
           lexicalScore: lexical,
           temporalScore: temporal,
+          structuredScore: structured,
+          importanceScore: importance,
+          confidenceScore: confidence,
+          recencyScore: recency,
+          frequencyScore: frequency,
+          lexicalRelevant,
+          semanticRelevant,
+          structuredRelevant,
+          broadRelevant,
           relevant,
         }
       })
-      .filter(entry => entry.relevant && entry.score >= minScore)
-      .sort((a, b) => b.score - a.score)
+
+    const ranked = retrievalFusion === 'weighted-linear-v1'
+      ? rankWithLegacyLinear(features, minScore)
+      : rankWithRrf(features, queryPlan, minScore)
 
     return {
-      entries: selectDiverse(scored, clampInteger(candidateLimit, 1, 100)),
+      entries: selectDiverse(ranked.entries, clampInteger(candidateLimit, 1, 100)),
       changed,
       now,
+      queryPlan,
+      routeCandidateCounts: ranked.routeCandidateCounts,
     }
   }
 
@@ -323,10 +371,13 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       topK = 5,
       recallOptions?: MemoryRecallOptions,
     ): Promise<MemoryFragment[]> {
-      const pool = await rankMemoryCandidates(query, scope, clampInteger(topK, 1, 20), recallOptions)
-      const selectedIds = new Set(pool.entries.map(entry => entry.item.id))
+      const requestedTopK = clampInteger(topK, 1, 20)
+      const planned = planMemoryQuery(query, recallOptions)
+      const pool = await rankMemoryCandidates(query, scope, Math.max(requestedTopK, Math.min(100, planned.candidateBudget)), recallOptions)
+      const entries = pool.entries.slice(0, requestedTopK)
+      const selectedIds = new Set(entries.map(entry => entry.item.id))
       commitRecallUsage(pool, selectedIds)
-      return pool.entries.map(({ item, score }) => toMemoryFragment(item, score))
+      return entries.map(({ item, score }) => toMemoryFragment(item, score))
     },
 
     async recallAdaptive(
@@ -334,8 +385,32 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       scope: MemoryScope,
       recallOptions: AdaptiveMemoryRecallOptions = {},
     ): Promise<AdaptiveMemoryRecallResult> {
-      const candidateLimit = clampInteger(recallOptions.candidateLimit ?? 20, 1, 100)
+      const planned = planMemoryQuery(query, recallOptions)
+      const candidateLimit = recallOptions.candidateLimit === undefined
+        ? planned.candidateBudget
+        : clampInteger(recallOptions.candidateLimit, 1, 100)
       const pool = await rankMemoryCandidates(query, scope, candidateLimit, recallOptions)
+      if (!pool.queryPlan.requiresMemory) {
+        persistChanges(persistence, index, [...pool.changed.values()], [], 'recall', onCommittedChange, onCommitObserverError)
+        return {
+          memories: [], retrievedMemoryIds: [], injectedMemoryIds: [], candidateCount: 0,
+          evaluatedCount: 0, batchesEvaluated: 0, stopReason: 'memory-not-needed',
+          queryIntent: pool.queryPlan.intent,
+          candidateBudget: pool.queryPlan.candidateBudget,
+          retrievalRoutes: pool.queryPlan.routes,
+          routeCandidateCounts: pool.routeCandidateCounts,
+          queryPlanVersion: pool.queryPlan.version,
+          fusionMethod: retrievalFusion === 'rrf-v1' ? MEMORY_RRF_VERSION : 'weighted-linear-v1',
+        }
+      }
+      const selectionOptions: AdaptiveMemoryRecallOptions = {
+        ...recallOptions,
+        initialBatchSize: recallOptions.initialBatchSize ?? pool.queryPlan.selection.initialBatchSize,
+        continuationBatchSize: recallOptions.continuationBatchSize ?? pool.queryPlan.selection.continuationBatchSize,
+        maxBatches: recallOptions.maxBatches ?? pool.queryPlan.selection.maxBatches,
+        maxInjected: recallOptions.maxInjected ?? pool.queryPlan.selection.maxInjected,
+        maxCharacters: recallOptions.maxCharacters ?? pool.queryPlan.selection.maxCharacters,
+      }
       const selection = selectAdaptiveRecall(
         query,
         pool.entries.map(entry => ({
@@ -344,7 +419,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           semanticScore: entry.semanticScore,
           lexicalScore: entry.lexicalScore,
         })),
-        recallOptions,
+        selectionOptions,
       )
       const selectedIds = new Set(selection.selectedMemoryIds)
       commitRecallUsage(pool, selectedIds)
@@ -358,6 +433,12 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         evaluatedCount: selection.evaluatedMemoryIds.length,
         batchesEvaluated: selection.batchesEvaluated,
         stopReason: selection.stopReason,
+        queryIntent: pool.queryPlan.intent,
+        candidateBudget: pool.queryPlan.candidateBudget,
+        retrievalRoutes: pool.queryPlan.routes,
+        routeCandidateCounts: pool.routeCandidateCounts,
+        queryPlanVersion: pool.queryPlan.version,
+        fusionMethod: retrievalFusion === 'rrf-v1' ? MEMORY_RRF_VERSION : 'weighted-linear-v1',
       }
     },
 
@@ -410,7 +491,10 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       let supersedes: string | undefined
       const changedConflicts: IndexedMemory[] = []
       if (conflicts.length > 0) {
-        if (confidence >= 0.8) {
+        const writeAction = optionalString(metadata?.memoryWriteAction)
+        const replacementAuthorized = writeAction === 'SUPERSEDE'
+          || (writeAction === undefined && confidence >= 0.8)
+        if (replacementAuthorized) {
           supersedes = [...conflicts].sort(compareMemoryRecency)[0]?.id
           for (const conflict of conflicts) {
             removeActiveIndexes(secondary, conflict)
@@ -780,6 +864,144 @@ function toMemoryFragment(item: IndexedMemory, score?: number): MemoryFragment {
     sensitivity: item.sensitivity,
     ...(score === undefined ? {} : { score }),
   }
+}
+
+function rankWithLegacyLinear(
+  features: readonly MemoryCandidateFeatures[],
+  minScore: number,
+): { entries: RankedMemoryEntry[]; routeCandidateCounts: Record<string, number> } {
+  const entries = features
+    .filter(entry => entry.relevant)
+    .map((entry) => {
+      const score = clampScore(
+        entry.semanticScore * 0.4
+        + entry.lexicalScore * 0.2
+        + entry.importanceScore * 0.14
+        + entry.recencyScore * 0.08
+        + entry.frequencyScore * 0.04
+        + entry.temporalScore * 0.14,
+      )
+      const retrievalRoutes = featureRoutes(entry)
+      return {
+        item: entry.item,
+        score,
+        semanticScore: entry.semanticScore,
+        lexicalScore: entry.lexicalScore,
+        temporalScore: entry.temporalScore,
+        retrievalRoutes,
+        routeRanks: { 'weighted-linear': 1 },
+      }
+    })
+    .filter(entry => entry.score >= minScore)
+    .sort((left, right) => right.score - left.score
+      || left.item.content.localeCompare(right.item.content)
+      || left.item.id.localeCompare(right.item.id))
+  return { entries, routeCandidateCounts: { 'weighted-linear': entries.length } }
+}
+
+function rankWithRrf(
+  features: readonly MemoryCandidateFeatures[],
+  plan: MemoryQueryPlan,
+  minScore: number,
+): { entries: RankedMemoryEntry[]; routeCandidateCounts: Record<string, number> } {
+  const relevant = features.filter(entry => entry.relevant)
+  const routeEntries = plan.routes.map((route) => {
+    const items = relevant
+      .filter(entry => routeIncludes(route, entry))
+      .sort((left, right) => routeScore(route, right, plan) - routeScore(route, left, plan)
+        || (route === 'temporal' ? memoryStart(right.item) - memoryStart(left.item) : 0)
+        || left.item.content.localeCompare(right.item.content)
+        || left.item.id.localeCompare(right.item.id))
+      .slice(0, plan.rankWindowSize)
+      .map(entry => ({ id: entry.item.id, item: entry }))
+    return { name: route, items }
+  }).filter(route => route.items.length > 0)
+  const routeCandidateCounts = Object.fromEntries(routeEntries.map(route => [route.name, route.items.length]))
+  const activeRouteCount = Math.max(1, routeEntries.length)
+  const entries = reciprocalRankFusion(routeEntries, { rankConstant: 60, windowSize: plan.rankWindowSize })
+    .map((entry): RankedMemoryEntry => {
+      const feature = entry.item
+      const agreement = entry.routes.length / activeRouteCount
+      const quality = feature.importanceScore * 0.45 + feature.confidenceScore * 0.55
+      const score = clampScore(
+        entry.normalizedScore * 0.78
+        + agreement * 0.09
+        + quality * 0.06
+        + feature.temporalScore * 0.05
+        + Math.round(feature.recencyScore * 100) / 100 * 0.02,
+      )
+      return {
+        item: feature.item,
+        score,
+        semanticScore: feature.semanticScore,
+        lexicalScore: feature.lexicalScore,
+        temporalScore: feature.temporalScore,
+        retrievalRoutes: entry.routes as MemoryRetrievalRoute[],
+        routeRanks: entry.routeRanks,
+      }
+    })
+    .filter(entry => entry.score >= minScore)
+    .sort((left, right) => right.score - left.score
+      || right.retrievalRoutes.length - left.retrievalRoutes.length
+      || left.item.content.localeCompare(right.item.content)
+      || left.item.id.localeCompare(right.item.id))
+  return { entries, routeCandidateCounts }
+}
+
+function featureRoutes(entry: MemoryCandidateFeatures): MemoryRetrievalRoute[] {
+  return [
+    ...(entry.lexicalRelevant ? ['lexical' as const] : []),
+    ...(entry.semanticRelevant ? ['semantic' as const] : []),
+    ...(entry.structuredRelevant ? ['structured' as const] : []),
+  ]
+}
+
+function routeIncludes(route: MemoryRetrievalRoute, entry: MemoryCandidateFeatures): boolean {
+  switch (route) {
+    case 'lexical': return entry.lexicalRelevant
+    case 'semantic': return entry.semanticRelevant
+    case 'structured': return entry.structuredRelevant
+    case 'temporal': return entry.relevant && entry.temporalScore > 0
+  }
+}
+
+function routeScore(route: MemoryRetrievalRoute, entry: MemoryCandidateFeatures, plan: MemoryQueryPlan): number {
+  switch (route) {
+    case 'lexical': return entry.lexicalScore
+    case 'semantic': return entry.semanticScore
+    case 'structured': return entry.structuredScore
+    case 'temporal': {
+      if (plan.asOf !== undefined) {
+        const start = entry.item.validFrom ?? entry.item.createdAt
+        const distanceDays = Math.abs(plan.asOf - start) / 86_400_000
+        return entry.temporalScore * 0.7 + (1 / (1 + distanceDays / 365)) * 0.3
+      }
+      return entry.temporalScore
+    }
+  }
+}
+
+function intersectionSize(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
+  let size = 0
+  for (const value of left) {
+    if (right.has(value))
+      size += 1
+  }
+  return size
+}
+
+function weightedConceptCoverage(query: ReadonlySet<string>, item: ReadonlySet<string>): number {
+  let matched = 0
+  let total = 0
+  for (const concept of query) {
+    // Generic preference intent is useful as a fallback, but must not outrank
+    // an exact field such as allergy, exercise or work time in multi-fact queries.
+    const weight = concept === 'preference.any' ? 0.2 : 1
+    total += weight
+    if (item.has(concept))
+      matched += weight
+  }
+  return total > 0 ? matched / total : 0
 }
 
 function selectDiverse<T extends { item: IndexedMemory; score: number }>(scored: T[], topK: number): T[] {

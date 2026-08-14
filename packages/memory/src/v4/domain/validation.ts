@@ -27,7 +27,7 @@ const EVIDENCE_STRENGTHS = ['direct', 'reference-only', 'legacy-derived'] as con
 const EPISODE_PROVENANCE = ['native-v4', 'v3-reference', 'v3-derived-record'] as const
 const DERIVED_KINDS = ['summary', 'graph-edge', 'embedding', 'retrieval-cache'] as const
 const DERIVED_STATUSES = ['current', 'stale', 'deleted'] as const
-const DOMAIN_EVENT_TYPES = ['EPISODE_RECORDED', 'FACT_CREATED', 'FACT_VERSIONED', 'EVIDENCE_LINKED', 'EVIDENCE_UNLINKED', 'FACT_SUPPRESSED', 'FACT_DELETED', 'FACT_PURGED', 'FACT_RESTORED', 'DERIVED_ARTIFACT_STALE', 'V3_RECONCILED'] as const
+const DOMAIN_EVENT_TYPES = ['EPISODE_RECORDED', 'FACT_CREATED', 'FACT_VERSIONED', 'EVIDENCE_LINKED', 'EVIDENCE_UNLINKED', 'FACT_SUPPRESSED', 'FACT_DELETED', 'FACT_PURGED', 'FACT_RESTORED', 'DERIVED_ARTIFACT_STALE', 'V3_RECONCILED', 'CANDIDATE_REVIEWED', 'CANDIDATE_REPROCESSED'] as const
 const DOMAIN_EVENT_ACTORS = ['system', 'user', 'migration'] as const
 
 export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV4Snapshot {
@@ -386,6 +386,20 @@ function validateCandidate(
   requireScore(candidate.durabilityScore, `candidate ${position}.durabilityScore`)
   if (candidate.verificationScore !== undefined)
     requireScore(candidate.verificationScore, `candidate ${position}.verificationScore`)
+  if (candidate.evidenceScore !== undefined)
+    requireScore(candidate.evidenceScore, `candidate ${position}.evidenceScore`)
+  for (const field of ['calibratedActiveProbability', 'calibrationLowerBound', 'calibrationUpperBound']) {
+    if (candidate[field] !== undefined)
+      requireScore(candidate[field], `candidate ${position}.${field}`)
+  }
+  if (candidate.calibrationStatus !== undefined)
+    requireEnum(candidate.calibrationStatus, ['calibrated', 'insufficient-data', 'out-of-distribution'] as const, `candidate ${position}.calibrationStatus`)
+  if (candidate.calibrationMethod !== undefined)
+    requireEnum(candidate.calibrationMethod, ['isotonic-pav'] as const, `candidate ${position}.calibrationMethod`)
+  if (candidate.calibratorVersion !== undefined)
+    requireString(candidate.calibratorVersion, `candidate ${position}.calibratorVersion`)
+  if (candidate.calibrationCohort !== undefined)
+    requireString(candidate.calibrationCohort, `candidate ${position}.calibrationCohort`)
   requireStringArray(candidate.ambiguityFlags, `candidate ${position}.ambiguityFlags`)
   if (candidate.proposedAction !== undefined)
     requireEnum(candidate.proposedAction, WRITE_ACTIONS, `candidate ${position}.proposedAction`)
@@ -397,6 +411,37 @@ function validateCandidate(
     requireString(candidate.policyVersion, `candidate ${position}.policyVersion`)
   if (candidate.decisionReasonCodes !== undefined)
     requireStringArray(candidate.decisionReasonCodes, `candidate ${position}.decisionReasonCodes`)
+  if (candidate.reviewOutcome !== undefined)
+    requireEnum(candidate.reviewOutcome, ['approved', 'rejected'] as const, `candidate ${position}.reviewOutcome`)
+  if (candidate.reviewedAt !== undefined)
+    requireTimestamp(candidate.reviewedAt, `candidate ${position}.reviewedAt`)
+  if (candidate.reviewNote !== undefined)
+    requireString(candidate.reviewNote, `candidate ${position}.reviewNote`)
+  if (candidate.policyRuns !== undefined) {
+    for (const [runIndex, rawRun] of requireArray(candidate.policyRuns, `candidate ${position}.policyRuns`).entries()) {
+      const run = requireRecord(rawRun, `candidate ${position}.policyRuns ${runIndex}`)
+      requireString(run.id, `candidate ${position}.policyRuns ${runIndex}.id`)
+      requireEnum(run.action, WRITE_ACTIONS, `candidate ${position}.policyRuns ${runIndex}.action`)
+      requireEnum(run.status, CANDIDATE_STATUSES, `candidate ${position}.policyRuns ${runIndex}.status`)
+      requireScore(run.extractionScore, `candidate ${position}.policyRuns ${runIndex}.extractionScore`)
+      requireScore(run.verificationScore, `candidate ${position}.policyRuns ${runIndex}.verificationScore`)
+      requireScore(run.evidenceScore, `candidate ${position}.policyRuns ${runIndex}.evidenceScore`)
+      for (const key of ['calibratedActiveProbability', 'calibrationLowerBound', 'calibrationUpperBound'])
+        requireScore(run[key], `candidate ${position}.policyRuns ${runIndex}.${key}`)
+      requireEnum(run.calibrationStatus, ['calibrated', 'insufficient-data', 'out-of-distribution'] as const, `candidate ${position}.policyRuns ${runIndex}.calibrationStatus`)
+      requireEnum(run.calibrationMethod, ['isotonic-pav'] as const, `candidate ${position}.policyRuns ${runIndex}.calibrationMethod`)
+      requireString(run.calibratorVersion, `candidate ${position}.policyRuns ${runIndex}.calibratorVersion`)
+      requireString(run.calibrationCohort, `candidate ${position}.policyRuns ${runIndex}.calibrationCohort`)
+      requireScore(run.durabilityScore, `candidate ${position}.policyRuns ${runIndex}.durabilityScore`)
+      requireStringArray(run.ambiguityFlags, `candidate ${position}.policyRuns ${runIndex}.ambiguityFlags`)
+      requireStringArray(run.reasonCodes, `candidate ${position}.policyRuns ${runIndex}.reasonCodes`)
+      for (const key of ['extractorVersion', 'normalizerVersion', 'verifierVersion', 'policyVersion'])
+        requireString(run[key], `candidate ${position}.policyRuns ${runIndex}.${key}`)
+      requireTimestamp(run.processedAt, `candidate ${position}.policyRuns ${runIndex}.processedAt`)
+      if (typeof run.shadow !== 'boolean')
+        throw new Error(`candidate ${position}.policyRuns ${runIndex}.shadow must be boolean`)
+    }
+  }
   const createdAt = requireTimestamp(candidate.createdAt, `candidate ${position}.createdAt`)
   const updatedAt = requireTimestamp(candidate.updatedAt, `candidate ${position}.updatedAt`)
   if (updatedAt < createdAt)

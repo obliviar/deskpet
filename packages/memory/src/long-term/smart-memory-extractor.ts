@@ -2,6 +2,7 @@ import type { MemoryCapture, MemorySensitivity, MemorySharePolicy } from '@deskp
 import OpenAI from 'openai'
 import { inferMemoryPrivacy, isSafeMemoryContent } from './memory-extractor'
 import type { MemoryCandidate, MemoryExtractor } from './memory-extractor'
+import { normalizeMemoryCandidate } from './memory-normalizer'
 
 export interface SmartExtractorConfig {
   apiKey: string
@@ -25,7 +26,12 @@ interface RawSmartMemory {
   sensitivity?: unknown
   sharePolicy?: unknown
   validFrom?: unknown
+  validTo?: unknown
   expiresAt?: unknown
+  polarity?: unknown
+  modality?: unknown
+  condition?: unknown
+  entityAliases?: unknown
 }
 
 /**
@@ -75,9 +81,10 @@ function buildPrompt(userMessage: string): string {
     '从下面的用户原话中提取未来对话仍然有用的、明确陈述的事实。',
     '不要推测；不要提取一次性请求、寒暄、模型指令、密钥、密码或令牌。',
     '若新事实会替换旧值（姓名、生日、所在地等），cardinality 使用 single，并给稳定 memoryKey。',
+    '输出 polarity、modality 与 condition；假设或转述不得标记为 asserted。',
     '敏感隐私设为 private 或 secret；private 默认 sharePolicy=local-only，secret 必须 local-only。',
     '临时事实可填写 expiresAt（ISO 8601）；不确定时留空。',
-    '输出：{"memories":[{"content":"简明事实","kind":"identity|preference|project|relationship|explicit|image|other","memoryKey":"可选稳定键","cardinality":"single|multiple","confidence":0到1,"importance":0到1,"sensitivity":"normal|private|secret","sharePolicy":"allow-remote|local-only|ask","validFrom":"可选ISO时间","expiresAt":"可选ISO时间"}]}',
+    '输出：{"memories":[{"content":"简明事实","kind":"identity|preference|project|relationship|health|routine|goal|explicit|image|other","memoryKey":"可选稳定键","cardinality":"single|multiple|set","polarity":"positive|negative|unknown","modality":"asserted|planned|hypothetical|reported|unknown","condition":"可选条件","confidence":0到1,"importance":0到1,"sensitivity":"normal|private|secret","sharePolicy":"allow-remote|local-only|ask","validFrom":"可选ISO时间","validTo":"可选ISO时间","expiresAt":"可选ISO时间"}]}',
     `用户原话：${userMessage.normalize('NFKC').slice(0, 6000)}`,
   ].join('\n')
 }
@@ -88,7 +95,9 @@ function parseCandidates(payload: string): MemoryCandidate[] {
   if (!Array.isArray(parsed.memories))
     return []
   const candidates: MemoryCandidate[] = []
-  for (const raw of parsed.memories.slice(0, 8)) {
+  if (parsed.memories.length > 128)
+    throw new Error('Smart memory extractor returned too many candidates')
+  for (const raw of parsed.memories) {
     if (!raw || typeof raw !== 'object')
       continue
     const memory = raw as RawSmartMemory
@@ -101,22 +110,29 @@ function parseCandidates(payload: string): MemoryCandidate[] {
     const localPrivacy = inferMemoryPrivacy(content)
     const sensitivity = stricterSensitivity(modelSensitivity, localPrivacy.sensitivity)
     const sharePolicy = normalizeSharePolicy(memory.sharePolicy, sensitivity)
-    candidates.push({
+    candidates.push(normalizeMemoryCandidate({
       content,
       metadata: {
         kind: optionalString(memory.kind, 40) ?? 'other',
         extractionChannel: 'model',
         extractorVersion: 'smart-structured-v1',
         ...(optionalString(memory.memoryKey, 120) ? { memoryKey: optionalString(memory.memoryKey, 120) } : {}),
-        cardinality: memory.cardinality === 'single' ? 'single' : 'multiple',
+        cardinality: memory.cardinality === 'single' || memory.cardinality === 'set' ? memory.cardinality : 'multiple',
+        ...(memory.polarity === 'positive' || memory.polarity === 'negative' || memory.polarity === 'unknown'
+          ? { polarity: memory.polarity } : {}),
+        ...(memory.modality === 'asserted' || memory.modality === 'planned' || memory.modality === 'hypothetical'
+          || memory.modality === 'reported' || memory.modality === 'unknown' ? { modality: memory.modality } : {}),
+        ...(optionalString(memory.condition, 200) ? { condition: optionalString(memory.condition, 200) } : {}),
+        ...(Array.isArray(memory.entityAliases) ? { entityAliases: memory.entityAliases } : {}),
         confidence: clamp(memory.confidence, 0.7),
         importance: clamp(memory.importance, 0.6),
         sensitivity,
         sharePolicy,
         ...(parseTimestamp(memory.validFrom) ? { validFrom: parseTimestamp(memory.validFrom) } : {}),
+        ...(parseTimestamp(memory.validTo) ? { validTo: parseTimestamp(memory.validTo) } : {}),
         ...(parseTimestamp(memory.expiresAt) ? { expiresAt: parseTimestamp(memory.expiresAt) } : {}),
       },
-    })
+    }))
   }
   return candidates
 }
@@ -140,7 +156,7 @@ function mergeCandidates(first: MemoryCandidate[], second: MemoryCandidate[]): M
       },
     } : candidate)
   }
-  return [...unique.values()].slice(0, 8)
+  return [...unique.values()]
 }
 
 function stricterSensitivity(

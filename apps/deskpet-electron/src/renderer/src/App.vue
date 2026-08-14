@@ -51,15 +51,99 @@ interface MemorySettings {
   remotePolicy: 'normal-only' | 'allow-private' | 'disabled'
 }
 
+interface MemoryReviewItem {
+  candidate: {
+    id: string
+    canonicalText: string
+    predicate: string
+    verificationScore?: number
+    evidenceScore?: number
+    calibratedActiveProbability?: number
+    calibrationLowerBound?: number
+    calibrationStatus?: 'calibrated' | 'insufficient-data' | 'out-of-distribution'
+    durabilityScore: number
+    ambiguityFlags: string[]
+    decisionReasonCodes?: string[]
+    createdAt: number
+  }
+  evidence: Array<{ id: string; content?: string; contentState: string; recordedAt: number }>
+}
+
 // ── Speech synthesis types (Chromium built-in TTS) ─────
 // (speechSynthesis and SpeechSynthesisUtterance are global DOM types)
+
+const CUSTOM_THEME_PREFIX = 'custom:'
+const DEFAULT_CUSTOM_COLOR = '#7c5ce7'
+
+function parseHexColor(value: string): { r: number; g: number; b: number } | null {
+  const match = /^#([0-9a-f]{6})$/i.exec(value.trim())
+  if (!match) return null
+  const hex = match[1]!
+  return {
+    r: Number.parseInt(hex.slice(0, 2), 16),
+    g: Number.parseInt(hex.slice(2, 4), 16),
+    b: Number.parseInt(hex.slice(4, 6), 16),
+  }
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  return `#${[r, g, b]
+    .map(channel => Math.round(Math.max(0, Math.min(255, channel))).toString(16).padStart(2, '0'))
+    .join('')}`
+}
+
+function mixHex(color: string, target: string, targetWeight: number): string {
+  const sourceRgb = parseHexColor(color)!
+  const targetRgb = parseHexColor(target)!
+  return rgbToHex(
+    sourceRgb.r * (1 - targetWeight) + targetRgb.r * targetWeight,
+    sourceRgb.g * (1 - targetWeight) + targetRgb.g * targetWeight,
+    sourceRgb.b * (1 - targetWeight) + targetRgb.b * targetWeight,
+  )
+}
+
+function relativeLuminance(color: string): number {
+  const rgb = parseHexColor(color)!
+  const channels = [rgb.r, rgb.g, rgb.b].map((channel) => {
+    const value = channel / 255
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+  })
+  return channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722
+}
+
+function ensureWhiteTextContrast(color: string): string {
+  let result = color
+  while (1.05 / (relativeLuminance(result) + 0.05) < 4.5)
+    result = mixHex(result, '#000000', 0.12)
+  return result
+}
+
+function createCustomTheme(color: string): Theme {
+  const normalized = parseHexColor(color) ? color.toLowerCase() : DEFAULT_CUSTOM_COLOR
+  const accent = ensureWhiteTextContrast(normalized)
+  const accentRgb = parseHexColor(accent)!
+  return {
+    id: 'custom',
+    name: '自定义颜色',
+    bg: mixHex(normalized, '#ffffff', 0.82),
+    surface: mixHex(normalized, '#ffffff', 0.95),
+    surfaceHover: mixHex(normalized, '#ffffff', 0.88),
+    border: mixHex(normalized, '#ffffff', 0.64),
+    text: '#1f2937',
+    textMuted: '#64748b',
+    accent,
+    accentHover: mixHex(accent, '#000000', 0.12),
+    accentSoft: `rgba(${accentRgb.r},${accentRgb.g},${accentRgb.b},0.14)`,
+    scrollThumb: mixHex(normalized, '#ffffff', 0.52),
+  }
+}
 
 const themes: Theme[] = [
   { id: 'dark', name: '深空黑', bg: '#0f1117', surface: '#1c1f26', surfaceHover: '#252830', border: '#252830', text: '#e1e4e8', textMuted: '#666', accent: '#2d7d46', accentHover: '#35954f', accentSoft: 'rgba(45,125,70,0.15)', scrollThumb: '#353840' },
   { id: 'light', name: '日光白', bg: '#f6f8fa', surface: '#ffffff', surfaceHover: '#eaeef2', border: '#d0d7de', text: '#1f2328', textMuted: '#656d76', accent: '#0969da', accentHover: '#0550ae', accentSoft: 'rgba(9,105,218,0.12)', scrollThumb: '#c0c7cf' },
-  { id: 'forest', name: '护眼绿', bg: '#1a2e1f', surface: '#243a2c', surfaceHover: '#2d4534', border: '#2d4534', text: '#d4e8d4', textMuted: '#7a9a7a', accent: '#5cb85c', accentHover: '#6cc96c', accentSoft: 'rgba(92,184,92,0.15)', scrollThumb: '#3a5240' },
-  { id: 'warm', name: '暖夕阳', bg: '#1f1a17', surface: '#2a221e', surfaceHover: '#332923', border: '#332923', text: '#f0e0d0', textMuted: '#8a7a6a', accent: '#d97757', accentHover: '#e88566', accentSoft: 'rgba(217,119,87,0.15)', scrollThumb: '#3d322c' },
-  { id: 'ocean', name: '深海蓝', bg: '#0d1929', surface: '#16263d', surfaceHover: '#1e3251', border: '#1e3251', text: '#c8daf0', textMuted: '#5a7a9a', accent: '#3b82f6', accentHover: '#4c92f8', accentSoft: 'rgba(59,130,246,0.15)', scrollThumb: '#243a55' },
+  { id: 'forest', name: '清新绿', bg: '#e7f4e9', surface: '#f7fbf7', surfaceHover: '#dceee0', border: '#bed8c4', text: '#1f3525', textMuted: '#5f7664', accent: '#397a4b', accentHover: '#2f663f', accentSoft: 'rgba(57,122,75,0.14)', scrollThumb: '#aacbb2' },
+  { id: 'warm', name: '暖杏色', bg: '#fff0e6', surface: '#fffaf6', surfaceHover: '#fbe4d6', border: '#e8c7b4', text: '#402b20', textMuted: '#7f685b', accent: '#bd5f3f', accentHover: '#9f4c31', accentSoft: 'rgba(189,95,63,0.14)', scrollThumb: '#dbb29a' },
+  { id: 'ocean', name: '晴空蓝', bg: '#e8f3ff', surface: '#f8fbff', surfaceHover: '#dcecff', border: '#bfd7ef', text: '#19334d', textMuted: '#607891', accent: '#1769aa', accentHover: '#12578e', accentSoft: 'rgba(23,105,170,0.14)', scrollThumb: '#a9cae8' },
 ]
 
 // ── State ───────────────────────────────────────────────
@@ -73,6 +157,8 @@ const isLoading = ref(false)
 const chatEl = ref<HTMLElement | null>(null)
 const currentTheme = ref<Theme>(themes[0]!)
 const showThemeMenu = ref(false)
+const customColor = ref(DEFAULT_CUSTOM_COLOR)
+let themePreviewOrigin: Theme | null = null
 
 // API settings state
 const showApiSettings = ref(false)
@@ -90,6 +176,8 @@ const memoryEnabled = ref(false)
 const memoryCount = ref(0)
 const memoryStoragePath = ref('')
 const memoryItems = ref<MemoryItem[]>([])
+const memoryReviewItems = ref<MemoryReviewItem[]>([])
+const pendingCaptureSegments = ref(0)
 const manualMemoryInput = ref('')
 const memoryLoading = ref(false)
 const memoryMutating = ref(false)
@@ -163,8 +251,17 @@ onMounted(async () => {
     isFirstRun.value = false
   }
   if (settings.theme) {
-    const t = themes.find(t => t.id === settings.theme)
-    if (t) currentTheme.value = t
+    if (typeof settings.theme === 'string' && settings.theme.startsWith(CUSTOM_THEME_PREFIX)) {
+      const savedColor = settings.theme.slice(CUSTOM_THEME_PREFIX.length)
+      if (parseHexColor(savedColor)) {
+        customColor.value = savedColor.toLowerCase()
+        currentTheme.value = createCustomTheme(customColor.value)
+      }
+    }
+    else {
+      const t = themes.find(t => t.id === settings.theme)
+      if (t) currentTheme.value = t
+    }
   }
 
   await refreshApiStatus()
@@ -225,6 +322,7 @@ async function refreshApiStatus() {
 }
 
 async function openApiSettings() {
+  closeThemeMenu(true)
   await refreshApiStatus()
   apiKeyInput.value = ''
   apiStatusMessage.value = ''
@@ -297,7 +395,7 @@ function applyMemoryRuntimeStatus(status: any) {
 
 async function openMemoryManager() {
   showApiSettings.value = false
-  showThemeMenu.value = false
+  closeThemeMenu(true)
   memoryStatusMessage.value = ''
   memoryStatusError.value = false
   pendingDeleteMemoryId.value = null
@@ -325,6 +423,8 @@ async function refreshMemoryList() {
     memoryCount.value = Number(result.count) || 0
     memoryStoragePath.value = result.storagePath || ''
     memoryItems.value = Array.isArray(result.items) ? result.items : []
+    memoryReviewItems.value = Array.isArray(result.reviewItems) ? result.reviewItems : []
+    pendingCaptureSegments.value = Number(result.pendingCaptureSegments) || 0
     applyMemoryRuntimeStatus(result)
     if (result.error) {
       memoryStatusError.value = true
@@ -337,6 +437,78 @@ async function refreshMemoryList() {
   }
   finally {
     memoryLoading.value = false
+  }
+}
+
+async function reviewMemoryCandidate(id: string, outcome: 'approved' | 'rejected') {
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  memoryStatusError.value = false
+  try {
+    const result = await ipcRenderer.invoke('memory:candidate-review', { id, outcome })
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '候选审核失败。'
+      return
+    }
+    memoryStatusMessage.value = outcome === 'approved'
+      ? '候选已由你确认，并作为手动确认事实进入正式记忆。'
+      : '候选已拒绝，不会进入正式记忆。'
+    await refreshMemoryList()
+  }
+  catch (error) {
+    memoryStatusError.value = true
+    memoryStatusMessage.value = error instanceof Error ? error.message : '候选审核失败。'
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function reprocessMemoryCandidates() {
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  memoryStatusError.value = false
+  try {
+    let cursor: string | undefined
+    let processed = 0
+    let changed = 0
+    let calibrationSamples = 0
+    do {
+      const result = await ipcRenderer.invoke('memory:candidate-reprocess', { cursor, batchSize: 100 })
+      if (!result?.ok) {
+        memoryStatusError.value = true
+        memoryStatusMessage.value = result?.error || '候选重处理失败。'
+        return
+      }
+      processed += Number(result.report?.processed) || 0
+      changed += Number(result.report?.changedDecisions) || 0
+      calibrationSamples = Number(result.report?.calibration?.sampleCount) || 0
+      cursor = result.report?.nextCursor
+    } while (cursor)
+    memoryStatusMessage.value = `影子重处理完成：检查 ${processed} 条候选，发现 ${changed} 条策略差异；使用 ${calibrationSamples} 条隔离审核反馈，仅供影子比较，不具备生产校准资格。`
+    await refreshMemoryList()
+  }
+  finally {
+    memoryMutating.value = false
+  }
+}
+
+async function flushMemoryCaptureQueue() {
+  if (memoryMutating.value) return
+  memoryMutating.value = true
+  try {
+    const result = await ipcRenderer.invoke('memory:capture-flush')
+    if (!result?.ok) {
+      memoryStatusError.value = true
+      memoryStatusMessage.value = result?.error || '后台写入队列处理失败。'
+      return
+    }
+    memoryStatusMessage.value = '后台长消息写入队列已全部处理。'
+    await refreshMemoryList()
+  }
+  finally {
+    memoryMutating.value = false
   }
 }
 
@@ -890,10 +1062,36 @@ function toggleAutoSpeak() {
 }
 
 // ── Theme ───────────────────────────────────────────────
+function closeThemeMenu(restorePreview: boolean) {
+  if (restorePreview && themePreviewOrigin)
+    currentTheme.value = themePreviewOrigin
+  themePreviewOrigin = null
+  showThemeMenu.value = false
+}
+
+function toggleThemeMenu() {
+  if (showThemeMenu.value) {
+    closeThemeMenu(true)
+    return
+  }
+  themePreviewOrigin = currentTheme.value
+  showThemeMenu.value = true
+}
+
 async function selectTheme(t: Theme) {
   currentTheme.value = t
-  showThemeMenu.value = false
+  closeThemeMenu(false)
   await ipcRenderer.invoke('settings:set-theme', t.id)
+}
+
+function previewCustomTheme() {
+  currentTheme.value = createCustomTheme(customColor.value)
+}
+
+async function applyCustomTheme() {
+  currentTheme.value = createCustomTheme(customColor.value)
+  closeThemeMenu(false)
+  await ipcRenderer.invoke('settings:set-theme', `${CUSTOM_THEME_PREFIX}${customColor.value.toLowerCase()}`)
 }
 
 // ── Utils ───────────────────────────────────────────────
@@ -952,12 +1150,21 @@ async function doReset() {
       </button>
       <button class="icon-btn" :class="{ active: autoSpeak }" title="语音播报" @click="toggleAutoSpeak">🔊</button>
       <div class="theme-picker">
-        <button class="icon-btn" title="切换主题" @click="showThemeMenu = !showThemeMenu">🎨</button>
+        <button class="icon-btn" title="切换主题" @click="toggleThemeMenu">🎨</button>
         <div v-if="showThemeMenu" class="theme-menu" @click.stop>
           <div v-for="t in themes" :key="t.id" :class="['theme-item', { active: t.id === currentTheme.id }]" @click="selectTheme(t)">
             <span class="theme-swatch" :style="{ background: t.bg, border: `1px solid ${t.border}` }" />
             <span class="theme-dot" :style="{ background: t.accent }" />
             <span>{{ t.name }}</span>
+          </div>
+          <div :class="['theme-custom', { active: currentTheme.id === 'custom' }]">
+            <label for="custom-theme-color">自定义颜色</label>
+            <div class="theme-custom-controls">
+              <input id="custom-theme-color" v-model="customColor" type="color" title="选择自定义颜色" @input="previewCustomTheme" />
+              <span>{{ customColor.toUpperCase() }}</span>
+              <button type="button" @click="applyCustomTheme">应用</button>
+            </div>
+            <small>自动生成明亮背景并保持文字清晰</small>
           </div>
         </div>
       </div>
@@ -1089,6 +1296,45 @@ async function doReset() {
             </button>
           </div>
           <div class="field-hint">按 Ctrl + Enter 可添加。疑似密钥、密码或指令注入内容会被拒绝。</div>
+
+          <section v-if="memoryReviewItems.length > 0 || pendingCaptureSegments > 0" class="memory-review-panel">
+            <div class="memory-list-header">
+              <strong>待确认候选</strong>
+              <span>隔离内容不会参与回答</span>
+            </div>
+            <div v-if="pendingCaptureSegments > 0" class="memory-queue-status">
+              <span>后台仍有 {{ pendingCaptureSegments }} 个长消息分段待处理</span>
+              <button class="secondary-btn" :disabled="memoryMutating" @click="flushMemoryCaptureQueue">等待全部完成</button>
+            </div>
+            <div v-for="review in memoryReviewItems" :key="review.candidate.id" class="memory-review-item">
+              <div class="memory-item-main">
+                <div class="memory-item-meta">
+                  <span class="memory-kind">{{ review.candidate.predicate }}</span>
+                  <span class="memory-state conflicted">待确认</span>
+                  <span v-if="review.candidate.calibrationStatus === 'calibrated'">
+                    校准概率 {{ Math.round((review.candidate.calibratedActiveProbability || 0) * 100) }}%
+                    （保守下界 {{ Math.round((review.candidate.calibrationLowerBound || 0) * 100) }}%）
+                  </span>
+                  <span v-else>启发式验证分 {{ Math.round((review.candidate.verificationScore || 0) * 100) }}%（尚未校准）</span>
+                  <span>证据 {{ Math.round((review.candidate.evidenceScore || 0) * 100) }}%</span>
+                </div>
+                <div class="memory-content">{{ review.candidate.canonicalText }}</div>
+                <details v-if="review.evidence.length > 0" class="memory-review-evidence">
+                  <summary>查看原始证据与隔离原因</summary>
+                  <div v-for="evidence in review.evidence" :key="evidence.id">{{ evidence.content || '[证据已删除或不可用]' }}</div>
+                  <div>原因：{{ (review.candidate.decisionReasonCodes || []).join('、') || (review.candidate.ambiguityFlags || []).join('、') }}</div>
+                </details>
+              </div>
+              <div class="memory-item-actions">
+                <button class="memory-restore-btn" :disabled="memoryMutating" @click="reviewMemoryCandidate(review.candidate.id, 'approved')">确认并保存</button>
+                <button class="memory-delete-btn" :disabled="memoryMutating" @click="reviewMemoryCandidate(review.candidate.id, 'rejected')">拒绝</button>
+              </div>
+            </div>
+            <div class="memory-review-toolbar">
+              <span>策略升级后可影子重跑全部候选，不会直接改动正式记忆。</span>
+              <button class="secondary-btn" :disabled="memoryMutating" @click="reprocessMemoryCandidates">影子重处理</button>
+            </div>
+          </section>
 
           <div class="memory-list-header">
             <strong>已保存的记忆</strong>
@@ -1300,6 +1546,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .memory-add-row { display: flex; align-items: stretch; gap: 8px; }
 .memory-input { min-height: 62px; resize: vertical; line-height: 1.45; }
 .memory-add-row .primary-btn { min-width: 72px; }
+.memory-review-panel { margin-top: 16px; padding: 12px; border: 1px solid rgba(217,119,87,0.45); border-radius: 9px; background: rgba(217,119,87,0.06); }
+.memory-review-panel .memory-list-header { margin-top: 0; }
+.memory-review-item { display: flex; gap: 12px; margin-top: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.memory-review-evidence { margin-top: 8px; color: var(--text-muted); font-size: 10px; line-height: 1.5; }
+.memory-review-evidence summary { cursor: pointer; color: var(--accent); }
+.memory-review-evidence div { margin-top: 5px; padding: 6px; border-radius: 5px; background: var(--surface); white-space: pre-wrap; }
+.memory-review-toolbar, .memory-queue-status { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; color: var(--text-muted); font-size: 10px; }
 .memory-list-header { display: flex; align-items: baseline; justify-content: space-between; margin: 20px 0 8px; }
 .memory-list-header strong { font-size: 13px; }
 .memory-list-header span { color: var(--text-muted); font-size: 10px; }
@@ -1335,6 +1588,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 @media (max-width: 720px) {
   .memory-settings-grid, .memory-item-controls { grid-template-columns: 1fr; }
   .memory-item { flex-direction: column; }
+  .memory-review-item { flex-direction: column; }
   .memory-item-actions { width: 100%; flex-direction: row; }
 }
 
@@ -1345,6 +1599,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .theme-item.active { background: var(--accent-soft); color: var(--accent); }
 .theme-swatch { width: 18px; height: 18px; border-radius: 4px; flex-shrink: 0; }
 .theme-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.theme-custom { margin-top: 5px; padding: 9px 10px 7px; border-top: 1px solid var(--border); color: var(--text); }
+.theme-custom.active { color: var(--accent); }
+.theme-custom > label { display: block; margin-bottom: 7px; font-size: 12px; font-weight: 600; }
+.theme-custom-controls { display: flex; align-items: center; gap: 7px; }
+.theme-custom-controls input { width: 30px; height: 26px; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: transparent; cursor: pointer; }
+.theme-custom-controls span { flex: 1; color: var(--text-muted); font-family: Consolas, monospace; font-size: 10px; }
+.theme-custom-controls button { padding: 5px 9px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; font: inherit; font-size: 11px; }
+.theme-custom small { display: block; margin-top: 6px; color: var(--text-muted); font-size: 9px; white-space: nowrap; }
 
 .chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
 .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; opacity: 0.5; gap: 8px; }

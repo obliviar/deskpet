@@ -11,6 +11,8 @@ import {
   createJournaledV4Persistence,
   auditV3V4Consistency,
   createMemoryV4LifecycleService,
+  createMemoryCandidateReviewService,
+  createLocalMemoryCandidateVerifier,
   createMemoryPurgeConfirmationGate,
   createMemoryV4Repository,
   createMemoryWriter,
@@ -18,6 +20,7 @@ import {
   createV4ShadowWriter,
   createVectorStore,
   extractMemoryCandidates,
+  fitIsotonicMemoryConfidenceCalibrator,
   inferMemoryPrivacy,
   isSafeMemoryContent,
   LOCAL_EMBEDDING_MODEL,
@@ -29,7 +32,9 @@ import type {
   MemoryCandidate,
   MemoryExtractor,
   MemoryV4LifecycleService,
+  MemoryCandidateReviewService,
   MemoryV4Repository,
+  VectorStore,
   V4ShadowWriter,
 } from '@deskpet/memory'
 import { createToolRegistry, webSearchTool, fileReadTool, httpFetchTool } from '@deskpet/tools'
@@ -248,7 +253,9 @@ let memoryLegacyMigrated = false
 let memoryV4Shadow: V4ShadowWriter | undefined
 let memoryV4Repository: MemoryV4Repository | undefined
 let memoryV4Lifecycle: MemoryV4LifecycleService | undefined
+let memoryCandidateReview: MemoryCandidateReviewService | undefined
 let memoryV4Persistence: JournaledV4Persistence | undefined
+let memoryStore: VectorStore | undefined
 let memoryV4Error = ''
 let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
 let memoryV4Audit: ReturnType<typeof auditV3V4Consistency> | undefined
@@ -324,7 +331,9 @@ function initializeMemory(): void {
   memoryV4Shadow = undefined
   memoryV4Repository = undefined
   memoryV4Lifecycle = undefined
+  memoryCandidateReview = undefined
   memoryV4Persistence = undefined
+  memoryStore = undefined
   purgeConfirmation.clear()
   memoryInitializationError = ''
   memoryLegacyMigrated = false
@@ -354,6 +363,7 @@ function initializeMemory(): void {
       onCommittedChange: commit => memoryV4Shadow?.enqueueCommit(commit),
       onCommitObserverError: error => writeBootLog(`Memory V4 commit enqueue failed: ${errorMessage(error)}`),
     })
+    memoryStore = store
     memory = createMemoryWriter({
       store,
       extractor: createConfiguredMemoryExtractor(),
@@ -367,6 +377,7 @@ function initializeMemory(): void {
         memoryV4Shadow?.flush()
       },
       onSourceUnlinkObserverError: error => writeBootLog(`Memory V4 source unlink enqueue failed: ${errorMessage(error)}`),
+      onBackgroundCaptureError: error => writeBootLog(`Memory background capture failed: ${errorMessage(error)}`),
     })
     memoryLegacyMigrated = persistence.wasLegacyMigrated()
     writeBootLog(`long-term memory initialized (${semanticActive ? 'semantic' : 'local-hash'})`)
@@ -389,6 +400,7 @@ function initializeMemory(): void {
       const v4Repository = createMemoryV4Repository({ persistence: v4Persistence })
       memoryV4Repository = v4Repository
       memoryV4Lifecycle = createMemoryV4LifecycleService(v4Repository)
+      memoryCandidateReview = createMemoryCandidateReviewService(v4Repository)
       memoryV4Persistence = v4Persistence
       const snapshot = v4Repository.snapshot()
       if (snapshot.facts.some(fact => fact.metadata?.purgeCompletedAt !== undefined))
@@ -806,7 +818,70 @@ function setupIPC() {
       progress: semanticModelProgress,
     },
     items: memory ? await memory.list(localMemoryScope, Number(limit)) : [],
+    reviewItems: memoryCandidateReview?.list(localMemoryScope, Number(limit)) ?? [],
+    pendingCaptureSegments: memory?.pendingCaptureCount() ?? 0,
   }))
+
+  ipcMain.handle('memory:candidate-review', async (
+    _event,
+    input: { id?: unknown; outcome?: unknown; note?: unknown },
+  ) => {
+    if (!memory || !memoryCandidateReview)
+      return { ok: false, error: 'V4 候选审核当前不可用。' }
+    const id = typeof input?.id === 'string' ? input.id.trim() : ''
+    const note = typeof input?.note === 'string' ? input.note.trim() : undefined
+    if (!id || (input.outcome !== 'approved' && input.outcome !== 'rejected'))
+      return { ok: false, error: '无效的候选审核操作。' }
+    const changed = input.outcome === 'approved'
+      ? await memoryCandidateReview.approve(id, localMemoryScope, async target => {
+          await memory!.remember(target.content, target.scope, target.metadata)
+        }, note)
+      : memoryCandidateReview.reject(id, localMemoryScope, note)
+    memoryV4Shadow?.flush()
+    return changed ? { ok: true } : { ok: false, error: '候选不存在、已审核或不属于当前作用域。' }
+  })
+
+  ipcMain.handle('memory:candidate-reprocess', async (
+    _event,
+    input: { cursor?: unknown; batchSize?: unknown } = {},
+  ) => {
+    if (!memoryCandidateReview || !memoryStore)
+      return { ok: false, error: 'V4 候选重处理当前不可用。' }
+    const calibrationDataset = memoryCandidateReview.calibrationDataset(localMemoryScope)
+    const calibrator = fitIsotonicMemoryConfidenceCalibrator(calibrationDataset.examples, {
+      versionLabel: 'quarantine-review-shadow-v1',
+    })
+    const report = await memoryCandidateReview.reprocess({
+      scope: localMemoryScope,
+      verifier: createLocalMemoryCandidateVerifier({ calibrator }),
+      inspectMatches: memoryStore.inspectWriteMatches,
+      batchSize: typeof input.batchSize === 'number' ? input.batchSize : 100,
+      ...(typeof input.cursor === 'string' && input.cursor.trim() ? { cursor: input.cursor.trim() } : {}),
+      shadow: true,
+    })
+    return {
+      ok: true,
+      report: {
+        ...report,
+        calibration: {
+          source: calibrationDataset.source,
+          suitableForProductionCalibration: calibrationDataset.suitableForProductionCalibration,
+          sampleCount: calibrationDataset.reviewedCount,
+          approvedCount: calibrationDataset.approvedCount,
+          rejectedCount: calibrationDataset.rejectedCount,
+          calibratorVersion: calibrator.version,
+        },
+      },
+    }
+  })
+
+  ipcMain.handle('memory:capture-flush', async () => {
+    if (!memory)
+      return { ok: false, error: '长期记忆已关闭。' }
+    await memory.flushPendingCaptures()
+    memoryV4Shadow?.flush()
+    return { ok: true, pendingCaptureSegments: memory.pendingCaptureCount() }
+  })
 
   ipcMain.handle('memory:add', async (_event, content: string) => {
     if (!memory)
@@ -875,6 +950,7 @@ function setupIPC() {
   })
 
   ipcMain.handle('memory:settings-set', async (_event, input: Partial<MemorySettings>) => {
+    await memory?.flushPendingCaptures()
     memorySettings = normalizeMemorySettings({ ...memorySettings, ...input })
     if (memorySettings.semanticEnabled && !semanticMemory.isInstalled()) {
       memorySettings.semanticEnabled = false
@@ -889,6 +965,7 @@ function setupIPC() {
 
   ipcMain.handle('memory:model-install', async () => {
     try {
+      await memory?.flushPendingCaptures()
       await semanticMemory.install()
       memorySettings.semanticEnabled = true
       saveMemorySettings()
@@ -1007,7 +1084,21 @@ app.on('window-all-closed', () => {
     app.quit()
 })
 
-app.on('before-quit', () => {
+let memoryShutdownComplete = false
+app.on('before-quit', (event) => {
+  if (!memoryShutdownComplete && (memory?.pendingCaptureCount() ?? 0) > 0) {
+    event.preventDefault()
+    void memory!.flushPendingCaptures()
+      .catch(error => writeBootLog(`Memory background capture final flush failed: ${errorMessage(error)}`))
+      .finally(() => {
+        memoryShutdownComplete = true
+        memoryV4Shadow?.flush()
+        saveSessions()
+        persist.saveAllImmediately()
+        app.quit()
+      })
+    return
+  }
   try {
     memoryV4Shadow?.flush()
   }

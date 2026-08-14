@@ -486,7 +486,11 @@ function recordCapture(
   fallbackNow: number,
 ): void {
   const evaluations = capture.evaluations ?? []
-  if ((capture.memories.length === 0 && evaluations.length === 0) || !isSafeMemoryContent(capture.turn.userMessage))
+  const originalUserMessage = capture.turn.originalUserMessage?.slice(0, 100_000)
+  const episodeContent = originalUserMessage && isSafeMemoryContent(originalUserMessage)
+    ? originalUserMessage
+    : capture.turn.userMessage
+  if ((capture.memories.length === 0 && evaluations.length === 0) || !isSafeMemoryContent(episodeContent))
     return
   const recordedAt = positiveTimestamp(capture.capturedAt, fallbackNow)
   const factScope = v4Scope(capture.scope)
@@ -503,8 +507,8 @@ function recordCapture(
   ])
   const episodeId = sourceMessageId
     ? stableId('episode-message', sourceKey(factScope, sourceMessageId))
-    : stableId('episode-message', `${sourceKey(factScope, sha256(capture.turn.userMessage))}\u0000${recordedAt}`)
-  const episodePrivacy = inferMemoryPrivacy(capture.turn.userMessage)
+    : stableId('episode-message', `${sourceKey(factScope, sha256(episodeContent))}\u0000${recordedAt}`)
+  const episodePrivacy = inferMemoryPrivacy(episodeContent)
   const sensitivity = mostSensitive([
     episodePrivacy.sensitivity,
     ...capture.memories.map(item => item.record.sensitivity),
@@ -519,8 +523,8 @@ function recordCapture(
     actor: 'user',
     kind: 'message',
     contentState: 'available',
-    content: capture.turn.userMessage,
-    contentHash: sha256(capture.turn.userMessage),
+    content: episodeContent,
+    contentHash: sha256(episodeContent),
     recordedAt,
     ...(sourceMessageId ? { sourceMessageId } : {}),
     sourceAttachmentIds: attachmentIds,
@@ -550,19 +554,22 @@ function recordCapture(
         id: candidateId,
         scope: fact.scope,
         evidenceEpisodeIds: [episode.id],
-        subjectId: fact.subjectId,
-        predicate: predicateFor(record),
+        subjectId: stringMetadata(candidate.metadata.subjectId) ?? fact.subjectId,
+        predicate: stringMetadata(candidate.metadata.predicate) ?? predicateFor(record),
         object: candidate.content,
         objectType: 'string',
-        normalizedValue: normalizedFactValue(candidate.content),
+        normalizedValue: stringMetadata(candidate.metadata.normalizedValue) ?? normalizedFactValue(candidate.content),
         canonicalText: candidate.content,
-        polarity: polarityFor(candidate.content),
-        modality: 'asserted',
-        cardinality: cardinalityFor(record),
+        polarity: candidatePolarity(candidate),
+        modality: candidateModalityFromMetadata(candidate),
+        ...(stringMetadata(candidate.metadata.condition) ? { condition: stringMetadata(candidate.metadata.condition) } : {}),
+        cardinality: candidateCardinality(candidate, record),
         ...(optionalTimestamp(record.validFrom) ? { validFrom: optionalTimestamp(record.validFrom) } : {}),
         ...(optionalTimestamp(record.validTo) ? { validTo: optionalTimestamp(record.validTo) } : {}),
         extractionScore: score(evaluation?.extractionScore, score(record.confidence, 0.7)),
         verificationScore: score(evaluation?.verificationScore, record.origin === 'manual' ? 1 : 0),
+        evidenceScore: score(evaluation?.evidenceScore, record.origin === 'manual' ? 1 : 0),
+        ...(evaluation ? calibrationFields(evaluation) : {}),
         durabilityScore: score(evaluation?.durabilityScore, score(record.importance, 0.6)),
         ambiguityFlags: evaluation?.ambiguityFlags ?? [],
         proposedAction: evaluation?.action ?? (previous.status === 'quarantined' ? 'ADD' : 'MERGE_EVIDENCE'),
@@ -630,19 +637,23 @@ function upsertEvaluatedCandidate(
     id: candidateId,
     scope,
     evidenceEpisodeIds: [episode.id],
-    subjectId: `owner:${scope.ownerId}`,
-    predicate: record ? predicateFor(record) : candidatePredicate(candidate),
+    subjectId: stringMetadata(candidate.metadata.subjectId) ?? `owner:${scope.ownerId}`,
+    predicate: stringMetadata(candidate.metadata.predicate) ?? (record ? predicateFor(record) : candidatePredicate(candidate)),
     object: candidate.content,
     objectType: 'string',
-    normalizedValue: normalizedFactValue(candidate.content),
+    normalizedValue: stringMetadata(candidate.metadata.normalizedValue) ?? normalizedFactValue(candidate.content),
     canonicalText: candidate.content,
-    polarity: polarityFor(candidate.content),
+    polarity: candidatePolarity(candidate),
     modality: candidateModality(evaluation),
-    cardinality: candidate.metadata.cardinality === 'single' ? 'single' : 'multiple',
+    ...(stringMetadata(candidate.metadata.condition) ? { condition: stringMetadata(candidate.metadata.condition) } : {}),
+    cardinality: candidate.metadata.cardinality === 'single' || candidate.metadata.cardinality === 'set'
+      ? candidate.metadata.cardinality : 'multiple',
     ...(optionalTimestamp(candidate.metadata.validFrom) ? { validFrom: optionalTimestamp(candidate.metadata.validFrom) } : {}),
     ...(optionalTimestamp(candidate.metadata.validTo) ? { validTo: optionalTimestamp(candidate.metadata.validTo) } : {}),
     extractionScore: score(evaluation.extractionScore, 0),
     verificationScore: score(evaluation.verificationScore, 0),
+    evidenceScore: score(evaluation.evidenceScore, 0),
+    ...calibrationFields(evaluation),
     durabilityScore: score(evaluation.durabilityScore, 0),
     ambiguityFlags: uniqueStrings(evaluation.ambiguityFlags),
     proposedAction: evaluation.action,
@@ -675,6 +686,18 @@ function upsertEvaluatedCandidate(
   }
 }
 
+function calibrationFields(evaluation: MemoryCandidateEvaluation) {
+  return {
+    calibratedActiveProbability: score(evaluation.calibration.probability, 0),
+    calibrationLowerBound: score(evaluation.calibration.lowerBound, 0),
+    calibrationUpperBound: score(evaluation.calibration.upperBound, 1),
+    calibrationStatus: evaluation.calibration.status,
+    calibrationMethod: evaluation.calibration.method,
+    calibratorVersion: evaluation.calibration.calibratorVersion,
+    calibrationCohort: evaluation.calibration.cohort,
+  }
+}
+
 function candidatePredicate(candidate: MemoryCandidate): string {
   return stringMetadata(candidate.metadata.memoryKey)
     ?? stringMetadata(candidate.metadata.kind)
@@ -686,11 +709,35 @@ function evaluatedCandidateId(scope: MemoryV4Scope, episodeId: string, content: 
 }
 
 function candidateModality(evaluation: MemoryCandidateEvaluation): MemoryFactV4['modality'] {
+  const normalized = candidateModalityFromMetadata(evaluation.candidate)
+  if (normalized !== 'unknown' && normalized !== 'asserted')
+    return normalized
   if (evaluation.ambiguityFlags.includes('non-asserted:hypothetical'))
     return 'hypothetical'
   if (evaluation.ambiguityFlags.includes('non-asserted:reported-speech'))
     return 'reported'
   return 'asserted'
+}
+
+function candidatePolarity(candidate: MemoryCandidate): MemoryFactV4['polarity'] {
+  const value = candidate.metadata.polarity
+  return value === 'positive' || value === 'negative' || value === 'unknown'
+    ? value
+    : polarityFor(candidate.content)
+}
+
+function candidateModalityFromMetadata(candidate: MemoryCandidate): MemoryFactV4['modality'] {
+  const value = candidate.metadata.modality
+  return value === 'asserted' || value === 'planned' || value === 'hypothetical'
+    || value === 'reported' || value === 'inferred' || value === 'unknown'
+    ? value
+    : 'asserted'
+}
+
+function candidateCardinality(candidate: MemoryCandidate, record: V3MemoryRecord): MemoryFactV4['cardinality'] {
+  return candidate.metadata.cardinality === 'single' || candidate.metadata.cardinality === 'set'
+    ? candidate.metadata.cardinality
+    : cardinalityFor(record)
 }
 
 function recordRetrieval(

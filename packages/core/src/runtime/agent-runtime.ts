@@ -189,6 +189,8 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
     const memoryScope = deps.resolveMemoryScope?.(sessionId) ?? { ownerId: sessionId, agentId: 'default' }
     await hooks.emitBeforeMessageComposedHooks(userMessage, ctx)
 
+    const memoryContext = buildMemoryCaptureContext(deps.session.getSessionMessages(sessionId))
+
     // Build the user message content (possibly multimodal).
     const userContent: ChatMessage['content'] = options?.attachments && options.attachments.length > 0
       ? [{ type: 'text', text: userMessage }, ...options.attachments]
@@ -223,6 +225,7 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
       ? deps.memory.capture({
           userMessage,
           assistantMessage: '',
+          context: memoryContext,
           attachments: options?.attachments,
           metadata: {
             sessionId,
@@ -307,6 +310,40 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
   }
 
   return { send, hooks }
+}
+
+function buildMemoryCaptureContext(history: ChatHistoryItem[]): NonNullable<import('@deskpet/contracts').MemoryCapture['context']> {
+  const messages = history
+    .filter((item): item is ChatHistoryItem & { role: 'user' | 'assistant' } =>
+      item.role === 'user' || item.role === 'assistant')
+    .slice(-6)
+  let remaining = 2400
+  const bounded = messages.reverse().flatMap((item) => {
+    if (remaining <= 0)
+      return []
+    const content = item.content.normalize('NFKC').replace(/\s+/gu, ' ').trim().slice(-Math.min(600, remaining))
+    remaining -= content.length
+    return content ? [{ id: item.id, role: item.role, content, createdAt: item.createdAt }] : []
+  }).reverse()
+  return { recentMessages: bounded, ...(bounded.length > 0 ? { topicSummary: summarizeLocalTopics(bounded.map(item => item.content)) } : {}) }
+}
+
+function summarizeLocalTopics(contents: string[]): string {
+  const stop = new Set(['我们', '你们', '他们', '这个', '那个', '什么', '怎么', '可以', '就是', '还是', 'please', 'about', 'that', 'this', 'with'])
+  const counts = new Map<string, number>()
+  for (const content of contents) {
+    const tokens = content.normalize('NFKC').toLocaleLowerCase().match(/[\p{Script=Han}]{2,6}|[a-z][a-z0-9+#.-]{2,}/gu) ?? []
+    for (const token of tokens) {
+      if (!stop.has(token))
+        counts.set(token, (counts.get(token) ?? 0) + 1)
+    }
+  }
+  return [...counts]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 8)
+    .map(([token]) => token)
+    .join('、')
+    .slice(0, 200)
 }
 
 export type AgentRuntime = ReturnType<typeof createAgentRuntime>

@@ -1,4 +1,5 @@
 import type { MemoryCapture, MemorySensitivity, MemorySharePolicy } from '@deskpet/contracts'
+import { normalizeMemoryCandidate } from './memory-normalizer'
 
 export interface MemoryCandidate {
   content: string
@@ -17,7 +18,8 @@ const UNSAFE_PATTERNS = [
 
 const SENSITIVE_PATTERNS = [
   /\bsk-[a-z0-9_-]{12,}\b/i,
-  /\b(api[_ -]?key|password|passwd|密码|验证码|access[_ -]?token)\b/i,
+  /\b(?:api[_ -]?key|password|passwd|access[_ -]?token)\b/i,
+  /(?:密码|验证码|访问令牌|密钥)/u,
 ]
 
 const PRIVATE_PATTERNS = [
@@ -80,13 +82,43 @@ export function extractMemoryCandidates(turn: MemoryCapture): MemoryCandidate[] 
   addSupportedCorrections(candidates, input)
   for (const clause of splitClauses(input))
     extractClause(candidates, clause)
+  addContextConfirmedCandidates(candidates, turn, input)
 
   const unique = new Map<string, MemoryCandidate>()
   for (const candidate of candidates) {
     if (isSafeMemoryContent(candidate.content))
       unique.set(candidate.content.toLocaleLowerCase(), candidate)
   }
-  return [...unique.values()].slice(0, 8)
+  return [...unique.values()].map(candidate => normalizeMemoryCandidate(candidate, turn))
+}
+
+/** Context resolves only an explicit confirmation in the current user turn. */
+function addContextConfirmedCandidates(
+  candidates: MemoryCandidate[],
+  turn: MemoryCapture,
+  input: string,
+): void {
+  if (!/^(?:是的|对(?:的)?|没错|确实|可以这么说|yes|correct|that's right)[。！!.\s]*$/iu.test(input))
+    return
+  const recentAssistant = [...(turn.context?.recentMessages ?? [])]
+    .reverse()
+    .find(message => message.role === 'assistant')?.content
+  if (!recentAssistant)
+    return
+  const prompt = normalize(recentAssistant)
+  const preference = /(?:所以|也就是说|确认一下)?(?:你|您)(?:是)?(?:喜欢|偏好)\s*([^，。！？,.!?吗]{1,100})(?:吗|对吗|是不是)?[？?]?$/u.exec(prompt)?.[1]
+    ?? /(?:do you|you) (?:like|prefer)\s+([^,.!?]{1,100})[?]?$/iu.exec(prompt)?.[1]
+  if (!preference)
+    return
+  const value = cleanValue(preference)
+  if (!value || isUnsafe(value))
+    return
+  addCandidate(candidates, `用户喜好/偏好：${value}`, 'preference', undefined, 'multiple', 0.8, 0.82, {
+    extractionChannel: 'context-confirmation',
+    extractorVersion: 'local-context-confirmation-v1',
+    contextResolved: true,
+    contextResolution: 'explicit-user-confirmation',
+  })
 }
 
 function extractClause(candidates: MemoryCandidate[], clause: string): void {
@@ -98,6 +130,7 @@ function extractClause(candidates: MemoryCandidate[], clause: string): void {
   addMatch(candidates, clause, /(?:请)?(?:叫我|称呼我(?:为)?)\s*([^，。！？,.!?\n]{1,40})/u, 'identity', '用户希望的称呼', 'profile.preferred_name', 'single')
   addMatch(candidates, clause, /(?:我的生日是|我生日是)\s*([^。！？.!?\n]{1,80})/u, 'identity', '用户生日', 'profile.birthday', 'single')
   addMatch(candidates, clause, /(?:大家|朋友们?|同事们?|别人)(?:一般|平时|通常)?(?:都)?(?:叫|喊|称呼)我\s*([^，。！？,.!?\n]{1,40})/u, 'identity', '用户希望的称呼', 'profile.preferred_name', 'single')
+  addMatch(candidates, clause, /(?:大伙|伙伴们?)(?:一般|平时|平常|通常)?(?:都)?(?:叫|喊|称呼)我\s*([^，。！？,.!?\n]{1,40})/u, 'identity', '用户希望的称呼', 'profile.preferred_name', 'single')
   addReverseMatch(candidates, clause, /([^，。！？,.!?\n]{1,40})是我(?:常用|平时用|习惯用)的?(?:昵称|称呼)/u, 'identity', '用户希望的称呼', 'profile.preferred_name', 'single')
   addMatch(candidates, clause, /我(?:最)?(?:喜欢|偏好)\s*([^。！？.!?\n]{1,200})/u, 'preference', '用户喜好/偏好')
   addMatch(candidates, clause, /也(?:喜欢|偏好)\s*([^。！？.!?\n]{1,200})/u, 'preference', '用户喜好/偏好')
@@ -294,7 +327,7 @@ function addCandidate(
 function splitClauses(input: string): string[] {
   return input
     .replace(/[。！？!?;；\n]+/gu, '\n')
-    .replace(/[，,](?=\s*(?:我|我的|请|记住|别忘了|每周|平时|通常|现在|也|而且|同时|I\b|My\b|Call\b|Remember\b))/giu, '\n')
+    .replace(/[，,](?=\s*(?:我|我的|你|您|请问|请|记住|别忘了|每周|平时|通常|现在|也|而且|同时|I\b|My\b|Call\b|Remember\b))/giu, '\n')
     .split('\n')
     .map(value => value.trim())
     .filter(Boolean)
@@ -306,8 +339,7 @@ function shouldIgnoreInput(input: string): boolean {
     || REPORTED_SELF_PATTERNS.some(pattern => pattern.test(input))
     || (!supportedCorrection && NON_FACTUAL_CONTEXT_PATTERNS.some(pattern => pattern.test(input)))
     || (!supportedCorrection && NEGATED_IDENTITY_PATTERNS.some(pattern => pattern.test(input)))
-    || /(?:吗|么|呢)\s*[？?]?$/u.test(input)
-    || /[？?]\s*$/u.test(input)
+    || splitClauses(input).every(clause => /(?:吗|么|呢)\s*[？?]?$/u.test(clause) || /[？?]\s*$/u.test(clause))
 }
 
 function shouldIgnoreClause(clause: string): boolean {
@@ -326,7 +358,7 @@ function cleanValue(value: string): string {
 }
 
 function normalize(value: string): string {
-  return value.normalize('NFKC').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000)
+  return value.normalize('NFKC').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100_000)
 }
 
 /** Validate content before it is manually persisted as long-term memory. */

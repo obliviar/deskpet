@@ -2,9 +2,12 @@ import type { MemoryCapture, MemoryScope } from '@deskpet/contracts'
 import type { MemoryCandidate } from './memory-extractor'
 import { isSafeMemoryContent } from './memory-extractor'
 import type { V3MemoryRecord } from './vector-store'
+import type { MemoryCalibrationPrediction, MemoryConfidenceCalibrator } from './confidence-calibration'
 
 export const LOCAL_MEMORY_VERIFIER_VERSION = 'local-evidence-verifier-v1'
 export const MEMORY_WRITE_POLICY_VERSION = 'evidence-first-policy-v1'
+
+const REVIEW_REQUIRED_PREDICATES = /^(?:profile\.(?:phone|email|vehicle_plate)|health\.|contact\.)/u
 
 export type MemoryCandidateDecisionAction = 'ADD' | 'MERGE_EVIDENCE' | 'REFINE'
   | 'SUPERSEDE' | 'CONFLICT' | 'QUARANTINE' | 'NOOP'
@@ -28,6 +31,7 @@ export interface MemoryCandidateEvaluation {
   verifierVersion: string
   policyVersion: string
   matchedMemoryId?: string
+  calibration: MemoryCalibrationPrediction
 }
 
 export interface MemoryCandidateVerificationContext {
@@ -46,6 +50,7 @@ export interface LocalMemoryCandidateVerifierOptions {
   minimumEvidenceScore?: number
   minimumDurabilityScore?: number
   minimumVerificationScore?: number
+  calibrator?: MemoryConfidenceCalibrator
 }
 
 const CORRECTION_PATTERNS = [
@@ -110,6 +115,19 @@ export function createLocalMemoryCandidateVerifier(
     const verificationScore = roundScore(
       extractionScore * 0.25 + evidenceScore * 0.45 + durabilityScore * 0.2 + clarityScore * 0.1,
     )
+    const calibration = options.calibrator?.calibrate(verificationScore, calibrationCohort(candidate)) ?? {
+      probability: verificationScore,
+      lowerBound: 0,
+      upperBound: 1,
+      status: 'insufficient-data' as const,
+      sampleCount: 0,
+      method: 'isotonic-pav' as const,
+      calibratorVersion: 'none',
+      cohort: calibrationCohort(candidate),
+    }
+    const policyVerificationScore = calibration.status === 'calibrated'
+      ? calibration.lowerBound
+      : verificationScore
     const base = {
       candidate,
       extractionScore,
@@ -117,8 +135,19 @@ export function createLocalMemoryCandidateVerifier(
       durabilityScore,
       verificationScore,
       ambiguityFlags,
+      calibration,
       verifierVersion: LOCAL_MEMORY_VERIFIER_VERSION,
       policyVersion: MEMORY_WRITE_POLICY_VERSION,
+    }
+
+    if (calibration.status === 'out-of-distribution') {
+      return {
+        ...base,
+        action: 'QUARANTINE',
+        status: 'quarantined',
+        ambiguityFlags: unique([...ambiguityFlags, 'calibration-out-of-distribution']),
+        reasonCodes: ['calibration-cohort-out-of-distribution'],
+      } satisfies MemoryCandidateEvaluation
     }
 
     if (!isSafeMemoryContent(candidate.content)) {
@@ -132,20 +161,33 @@ export function createLocalMemoryCandidateVerifier(
     }
     if (extractionScore < minimumExtractionScore
       || evidenceScore < minimumEvidenceScore
-      || verificationScore < minimumVerificationScore
+      || policyVerificationScore < minimumVerificationScore
       || ambiguityFlags.includes('ambiguous-value')
       || ambiguityFlags.includes('automatic-secret')) {
       return {
         ...base,
         action: 'QUARANTINE',
         status: 'quarantined',
-        reasonCodes: qualityReasons(
-          extractionScore,
-          evidenceScore,
-          verificationScore,
-          ambiguityFlags,
-          { minimumExtractionScore, minimumEvidenceScore, minimumVerificationScore },
-        ),
+        reasonCodes: calibration.status === 'calibrated' && calibration.lowerBound < minimumVerificationScore
+          ? ['calibrated-lower-bound-below-threshold']
+          : qualityReasons(
+              extractionScore,
+              evidenceScore,
+              verificationScore,
+              ambiguityFlags,
+              { minimumExtractionScore, minimumEvidenceScore, minimumVerificationScore },
+            ),
+      } satisfies MemoryCandidateEvaluation
+    }
+
+    const predicate = string(candidate.metadata.predicate) || string(candidate.metadata.memoryKey)
+    if (REVIEW_REQUIRED_PREDICATES.test(predicate) || candidate.metadata.sensitivity === 'secret') {
+      return {
+        ...base,
+        action: 'QUARANTINE',
+        status: 'quarantined',
+        ambiguityFlags: unique([...ambiguityFlags, 'high-risk-review-required']),
+        reasonCodes: ['high-risk-field-requires-confirmation'],
       } satisfies MemoryCandidateEvaluation
     }
 
@@ -255,7 +297,15 @@ export function quarantinedVerifierFailure(
     reasonCodes: [reason],
     verifierVersion: LOCAL_MEMORY_VERIFIER_VERSION,
     policyVersion: MEMORY_WRITE_POLICY_VERSION,
+    calibration: {
+      probability: 0, lowerBound: 0, upperBound: 1, status: 'insufficient-data', sampleCount: 0,
+      method: 'isotonic-pav', calibratorVersion: 'none', cohort: calibrationCohort(candidate),
+    },
   }
+}
+
+function calibrationCohort(candidate: MemoryCandidate): string {
+  return `${string(candidate.metadata.extractionChannel) || 'unknown'}:${string(candidate.metadata.kind) || 'other'}`
 }
 
 function calculateEvidenceScore(candidate: MemoryCandidate, turn: MemoryCapture): number {
@@ -263,6 +313,9 @@ function calculateEvidenceScore(candidate: MemoryCandidate, turn: MemoryCapture)
   const channel = string(candidate.metadata.extractionChannel)
   if ((origin === 'image' || channel === 'image') && (turn.attachments?.length ?? 0) > 0)
     return 0.95
+  if (channel === 'context-confirmation'
+    && /^(?:是的|对(?:的)?|没错|确实|可以这么说|yes|correct|that's right)[。！!.\s]*$/iu.test(turn.userMessage))
+    return 0.92
   if (channel === 'rules' || channel === 'rules+model')
     return 0.98
 

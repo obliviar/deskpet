@@ -148,6 +148,7 @@ const themes: Theme[] = [
 
 // ── State ───────────────────────────────────────────────
 const agentName = ref('DeskPet')
+const appVersion = ref('')
 const isFirstRun = ref(true)
 const loaded = ref(false)
 const nameInput = ref('')
@@ -200,7 +201,18 @@ const memorySettings = ref<MemorySettings>({
 const memoryEncrypted = ref(false)
 const semanticInstalled = ref(false)
 const semanticModelName = ref('Xenova/bge-small-zh-v1.5')
-const semanticModelProgress = ref<{ status: string; progress?: number; file?: string; error?: string }>({ status: 'idle' })
+const semanticModelProgress = ref<{
+  status: string
+  progress?: number
+  file?: string
+  error?: string
+  total?: number
+  ready?: number
+  pending?: number
+  integrity?: string
+  checkedFiles?: number
+  checkedBytes?: number
+}>({ status: 'idle' })
 const semanticInstalling = ref(false)
 
 // Screen capture state
@@ -245,6 +257,7 @@ function onMemoryModelProgress(_event: unknown, progress: typeof semanticModelPr
 
 // ── Lifecycle ───────────────────────────────────────────
 onMounted(async () => {
+  appVersion.value = await ipcRenderer.invoke('app:version')
   const settings = await ipcRenderer.invoke('settings:get')
   if (settings.agentName) {
     agentName.value = settings.agentName
@@ -387,7 +400,10 @@ function applyMemoryRuntimeStatus(status: any) {
   if (status?.settings)
     memorySettings.value = { ...memorySettings.value, ...status.settings }
   memoryEncrypted.value = !!status?.encrypted
+  const integrityState = status?.semantic?.integrity?.state
   semanticInstalled.value = !!status?.semantic?.installed
+    && integrityState !== 'corrupt'
+    && integrityState !== 'incompatible'
   semanticModelName.value = status?.semantic?.model || semanticModelName.value
   if (status?.semantic?.progress)
     semanticModelProgress.value = status.semantic.progress
@@ -550,7 +566,7 @@ async function installSemanticModel() {
     }
     semanticInstalled.value = true
     memorySettings.value = { ...memorySettings.value, ...result.settings }
-    memoryStatusMessage.value = '本地语义模型已安装并启用；旧记忆会在召回时逐步重建向量。'
+    memoryStatusMessage.value = '本地语义模型及旧记忆索引已准备完成，语义检索已原子启用。'
     await refreshMemoryList()
   }
   catch (error) {
@@ -822,6 +838,10 @@ function modelProgressLabel(): string {
   const progress = semanticModelProgress.value
   if (progress.status === 'error') return `安装错误：${progress.error || '未知错误'}`
   if (progress.status === 'ready') return '模型就绪'
+  if (progress.status === 'verifying')
+    return `正在校验模型完整性${typeof progress.checkedFiles === 'number' ? ` · ${progress.checkedFiles} 个文件` : ''}`
+  if (progress.status === 'indexing')
+    return `正在后台构建语义索引${typeof progress.ready === 'number' && typeof progress.total === 'number' ? ` ${progress.ready}/${progress.total}` : ''}${typeof progress.progress === 'number' ? ` · ${Math.round(progress.progress)}%` : ''}`
   if (progress.status === 'downloading')
     return `下载中${typeof progress.progress === 'number' ? ` ${Math.round(progress.progress)}%` : ''}${progress.file ? ` · ${progress.file}` : ''}`
   if (progress.status === 'loading') return '正在加载模型…'
@@ -1130,6 +1150,7 @@ async function doReset() {
   <div v-else-if="isFirstRun" class="setup" :style="themeVars">
     <div class="setup-card">
       <h1>欢迎使用 DeskPet</h1>
+      <span v-if="appVersion" class="setup-version">v{{ appVersion }}</span>
       <p>给你的 AI 智能体取个名字吧</p>
       <input v-model="nameInput" placeholder="输入名字..." @keydown.enter="confirmName" autofocus />
       <button :disabled="!nameInput.trim()" @click="confirmName">确认</button>
@@ -1140,6 +1161,7 @@ async function doReset() {
   <div v-else class="app" :style="themeVars">
     <div class="header">
       <span class="name">{{ agentName }}</span>
+      <span v-if="appVersion" class="version-badge">v{{ appVersion }}</span>
       <span class="badge">在线</span>
       <span class="spacer" />
       <button class="icon-btn memory-btn" :class="{ active: memoryEnabled }" title="长期记忆管理" @click="openMemoryManager">
@@ -1475,6 +1497,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .setup { display: flex; align-items: center; justify-content: center; height: 100vh; background: var(--bg); color: var(--text); }
 .setup-card { text-align: center; display: flex; flex-direction: column; gap: 16px; width: 320px; }
 .setup-card h1 { font-size: 24px; font-weight: 600; }
+.setup-version { align-self: center; margin-top: -10px; color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .setup-card p { opacity: 0.6; font-size: 14px; }
 .setup-card input { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; font-size: 16px; outline: none; text-align: center; font-family: inherit; }
 .setup-card input:focus { border-color: var(--accent); }
@@ -1486,6 +1509,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 
 .header { display: flex; align-items: center; gap: 10px; padding: 10px 20px; background: var(--bg); border-bottom: 1px solid var(--border); position: relative; }
 .header .name { font-size: 15px; font-weight: 600; }
+.header .version-badge { color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .header .badge { font-size: 11px; color: var(--accent); background: var(--accent-soft); padding: 2px 8px; border-radius: 6px; }
 .header .spacer { flex: 1; }
 .icon-btn { background: transparent; color: var(--text-muted); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 14px; cursor: pointer; font-family: inherit; }

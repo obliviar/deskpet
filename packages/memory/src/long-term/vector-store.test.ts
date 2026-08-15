@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { createVectorStore } from './vector-store'
+import { createFilePersistence, createVectorStore } from './vector-store'
+import { createMemoryEmbeddingIndex } from './embedding-index'
 import type { MemoryPersistenceDelta, V3MemoryCommit } from './vector-store'
 
 const temporaryDirectories: string[] = []
@@ -562,6 +563,60 @@ describe('persistent vector store', () => {
     await store.remember('用户所在地：苏州', scope, { kind: 'identity' })
 
     expect((await store.recall('现在定居在哪里', scope, 1))[0]?.content).toContain('苏州')
+  })
+
+  it('prepares an alternate model off the recall path and switches without re-embedding documents', async () => {
+    const memoryPath = temporaryFile()
+    const embeddingPath = temporaryFile()
+    const scope = { ownerId: 'background-semantic', agentId: 'deskpet' }
+    const sideIndex = createMemoryEmbeddingIndex({ persistence: createFilePersistence(embeddingPath) })
+    const hashStore = createVectorStore({ storagePath: memoryPath, embeddingIndex: sideIndex })
+    await hashStore.remember('用户所在地：杭州滨江', scope, { kind: 'identity' })
+    await hashStore.remember('用户喜欢听爵士乐', scope, { kind: 'preference' })
+
+    const calls: string[] = []
+    const bgeEmbedder = async (text: string) => {
+      calls.push(text)
+      return text.includes('所在地') || text.includes('定居') ? [1, 0] : [0, 1]
+    }
+    expect(hashStore.embeddingStatus('test-bge-v1', scope)).toMatchObject({ total: 2, ready: 0, pending: 2 })
+    const progress: number[] = []
+    await expect(hashStore.prepareEmbeddings('test-bge-v1', bgeEmbedder, scope, {
+      batchSize: 1,
+      onProgress: state => progress.push(state.ready),
+    })).resolves.toMatchObject({ total: 2, ready: 2, pending: 0 })
+    expect(calls).toHaveLength(2)
+    expect(progress.at(-1)).toBe(2)
+
+    calls.splice(0)
+    const semanticStore = createVectorStore({
+      storagePath: memoryPath,
+      embeddingModel: 'test-bge-v1',
+      embedder: bgeEmbedder,
+      embeddingIndex: createMemoryEmbeddingIndex({ persistence: createFilePersistence(embeddingPath) }),
+      foregroundEmbeddingUpgrade: false,
+      minScore: 0,
+      minSemanticScore: 0.1,
+    })
+    expect((await semanticStore.recall('现在定居在哪里', scope, 1))[0]?.content).toContain('杭州滨江')
+    expect(calls).toEqual(['现在定居在哪里'])
+  })
+
+  it('invalidates prepared vectors when content changes and removes them on purge', async () => {
+    const sideIndex = createMemoryEmbeddingIndex()
+    const store = createVectorStore({ embeddingIndex: sideIndex })
+    const scope = { ownerId: 'semantic-lifecycle', agentId: 'deskpet' }
+    const remembered = await store.remember('用户所在地：杭州', scope)
+    await store.prepareEmbeddings('test-bge-v1', async () => [1, 0], scope)
+    expect(sideIndex.hasMemory(remembered!.id)).toBe(true)
+
+    await store.update(remembered!.id, scope, { content: '用户所在地：上海' })
+    expect(sideIndex.get(remembered!.id, 'test-bge-v1', '用户所在地：上海')).toBeUndefined()
+    await store.prepareEmbeddings('test-bge-v1', async () => [0, 1], scope)
+    expect(sideIndex.hasMemory(remembered!.id)).toBe(true)
+
+    await store.purge(remembered!.id, scope)
+    expect(sideIndex.hasMemory(remembered!.id)).toBe(false)
   })
 
   it('deduplicates equivalent fact wording without merging opposite preferences', async () => {

@@ -27,6 +27,12 @@ import {
   type MemoryRetrievalRoute,
 } from './memory-query-planner'
 import { MEMORY_RRF_VERSION, reciprocalRankFusion } from './reciprocal-rank-fusion'
+import type { MemoryEmbeddingIndex, MemoryEmbeddingIndexStatus } from './embedding-index'
+import {
+  createMemoryBm25Index,
+  tokenizeBm25,
+  type MemoryBm25Index,
+} from './bm25-index'
 
 export interface MemoryPersistence {
   load: () => string | undefined
@@ -59,6 +65,10 @@ export interface VectorStoreOptions {
   minLexicalScore?: number
   maxMemories?: number
   embedder?: (text: string) => Promise<number[]>
+  /** Rebuildable encrypted side index used to prepare/switch embedding models without mixing vector spaces. */
+  embeddingIndex?: MemoryEmbeddingIndex
+  /** Legacy behavior is kept by default. Desktop semantic mode disables foreground bulk upgrades. */
+  foregroundEmbeddingUpgrade?: boolean
   /** RRF is the default stage-three strategy; legacy linear scoring remains available for rollback/evaluation. */
   retrievalFusion?: 'rrf-v1' | 'weighted-linear-v1'
   /**
@@ -123,6 +133,7 @@ interface SecondaryIndexes {
   exact: Map<string, Set<string>>
   activeByMemoryKey: Map<string, Set<string>>
   activeByToken: Map<string, Set<string>>
+  bm25: MemoryBm25Index
 }
 
 interface RankedMemoryEntry {
@@ -160,6 +171,16 @@ interface MemoryCandidateFeatures {
   relevant: boolean
 }
 
+export interface MemoryEmbeddingPreparationProgress extends MemoryEmbeddingIndexStatus {
+  processed: number
+}
+
+export interface MemoryEmbeddingPreparationOptions {
+  batchSize?: number
+  onProgress?: (progress: MemoryEmbeddingPreparationProgress) => void
+  shouldCancel?: () => boolean
+}
+
 export function createVectorStore(options: VectorStoreOptions = {}) {
   const configuredEmbeddingModel = options.embeddingModel ?? LOCAL_EMBEDDING_MODEL
   // Treat old local-hash configuration values as aliases for the current local
@@ -174,6 +195,8 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     storagePath,
     maxMemories = 20_000,
     embedder,
+    embeddingIndex,
+    foregroundEmbeddingUpgrade = true,
     retrievalFusion = 'rrf-v1',
     onCommittedChange,
     onCommitObserverError,
@@ -189,6 +212,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
   const loaded = loadIndex(persistence)
   const index = loaded.items
   const secondary = createSecondaryIndexes(index)
+  embeddingIndex?.reconcileMemoryIds(new Set(index.map(item => item.id)))
   if (persistence && loaded.migrated)
     persistence.backupBeforeMigration?.()
   if (persistence && (!loaded.exists || loaded.migrated))
@@ -204,6 +228,79 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     if (result.length === 0)
       throw new Error('Embedding provider returned an empty vector')
     return result
+  }
+
+  function storedEmbedding(item: IndexedMemory, model = embeddingModel): number[] | undefined {
+    if (item.embeddingModel === model && item.embedding.length > 0)
+      return item.embedding
+    return embeddingIndex?.get(item.id, model, item.content)
+  }
+
+  function cacheCanonicalEmbedding(item: IndexedMemory): void {
+    if (!embeddingIndex || item.embedding.length === 0 || item.embeddingModel === LOCAL_EMBEDDING_MODEL)
+      return
+    embeddingIndex.putBatch([{
+      memoryId: item.id,
+      model: item.embeddingModel,
+      content: item.content,
+      vector: item.embedding,
+    }])
+  }
+
+  function embeddingStatus(model: string, scope: MemoryScope): MemoryEmbeddingIndexStatus {
+    const normalizedScope = normalizeScope(scope)
+    const scoped = index.filter(item => matchesScope(item.scope, normalizedScope))
+    const ready = scoped.filter(item => !!storedEmbedding(item, model)).length
+    return { model, total: scoped.length, ready, pending: scoped.length - ready }
+  }
+
+  async function prepareEmbeddings(
+    model: string,
+    targetEmbedder: (text: string) => Promise<number[]>,
+    scope: MemoryScope,
+    preparationOptions: MemoryEmbeddingPreparationOptions = {},
+  ): Promise<MemoryEmbeddingIndexStatus> {
+    if (!embeddingIndex)
+      throw new Error('A side embedding index is required for background preparation')
+    if (!model.trim())
+      throw new Error('Embedding preparation model is required')
+    const normalizedScope = normalizeScope(scope)
+    const batchSize = clampInteger(preparationOptions.batchSize ?? 16, 1, 256)
+    let processed = 0
+    let status = embeddingStatus(model, normalizedScope)
+    preparationOptions.onProgress?.({ ...status, processed })
+
+    // A second pass captures records edited or added while the first pass was
+    // running. Further concurrent writes remain pending and prevent activation.
+    for (let pass = 0; pass < 2 && status.pending > 0; pass++) {
+      const pending = index
+        .filter(item => matchesScope(item.scope, normalizedScope) && !storedEmbedding(item, model))
+        .map(item => ({ id: item.id, content: item.content }))
+      for (let offset = 0; offset < pending.length; offset += batchSize) {
+        if (preparationOptions.shouldCancel?.())
+          return embeddingStatus(model, normalizedScope)
+        const prepared: Array<{ memoryId: string; model: string; content: string; vector: number[] }> = []
+        for (const snapshot of pending.slice(offset, offset + batchSize)) {
+          const current = secondary.byId.get(snapshot.id)
+          if (!current || current.content !== snapshot.content || storedEmbedding(current, model))
+            continue
+          const vector = await targetEmbedder(snapshot.content)
+          if (!Array.isArray(vector) || vector.length === 0 || !vector.every(Number.isFinite))
+            throw new Error(`Embedding preparation returned an invalid vector for memory ${snapshot.id}`)
+          // The content may have changed while the model was running. Its hash
+          // would make a stale vector unreadable, but skipping avoids disk noise.
+          if (secondary.byId.get(snapshot.id)?.content === snapshot.content)
+            prepared.push({ memoryId: snapshot.id, model, content: snapshot.content, vector })
+        }
+        embeddingIndex.putBatch(prepared)
+        processed += prepared.length
+        status = embeddingStatus(model, normalizedScope)
+        preparationOptions.onProgress?.({ ...status, processed })
+        await yieldToEventLoop()
+      }
+      status = embeddingStatus(model, normalizedScope)
+    }
+    return status
   }
 
   async function rankMemoryCandidates(
@@ -225,13 +322,19 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     if (candidates.length === 0 || !query.trim())
       return { entries: [], changed, now, queryPlan, routeCandidateCounts: {} }
 
+    const candidateEmbeddings = new Map<string, number[]>()
     for (const item of candidates) {
-      if (item.embeddingModel !== embeddingModel || item.embedding.length === 0) {
-        item.embedding = await embed(item.content)
+      let candidateEmbedding = storedEmbedding(item)
+      if (!candidateEmbedding && foregroundEmbeddingUpgrade) {
+        candidateEmbedding = await embed(item.content)
+        item.embedding = candidateEmbedding
         item.embeddingModel = embeddingModel
         item.updatedAt = Date.now()
+        cacheCanonicalEmbedding(item)
         changed.set(item.id, item)
       }
+      if (candidateEmbedding)
+        candidateEmbeddings.set(item.id, candidateEmbedding)
     }
 
     const queryEmbedding = await embed(query)
@@ -241,11 +344,21 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     const hasQueryConcepts = (queryConcepts?.size ?? 0) > 0
     const broadPersonalQuery = isBroadPersonalMemoryQuery(query)
     const queryStrongTokens = strongLexicalTokens(query)
-    const lexicalScores = bm25Scores(query, candidates.map(item => item.content))
+    const allowedCandidateIds = new Set(candidates.map(item => item.id))
+    const lexicalHits = secondary.bm25.search(query, {
+      scope: normalizedScope,
+      mode: temporalPlan.mode === 'current' ? 'current' : 'historical',
+      // Oversample before concept/relevance checks. RRF still receives at most
+      // rankWindowSize lexical candidates, while a mismatching high-BM25 fact
+      // cannot crowd a relevant lower-ranked fact out of the route too early.
+      limit: Math.min(400, Math.max(queryPlan.rankWindowSize, queryPlan.rankWindowSize * 4)),
+      allow: id => allowedCandidateIds.has(id),
+    })
+    const lexicalScores = new Map(lexicalHits.map(hit => [hit.id, hit.score]))
     const features: MemoryCandidateFeatures[] = candidates
-      .map((item, itemIndex) => {
-        const semantic = clampScore(cosineSimilarity(queryEmbedding, item.embedding))
-        const lexical = lexicalScores[itemIndex] ?? 0
+      .map((item) => {
+        const semantic = clampScore(cosineSimilarity(queryEmbedding, candidateEmbeddings.get(item.id) ?? []))
+        const lexical = lexicalScores.get(item.id) ?? 0
         const importance = clampScore(item.importance)
         const confidence = clampScore(item.confidence)
         const recency = recencyScore(item, now)
@@ -478,6 +591,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           embedding,
           memoryKey,
           metadata,
+          storedEmbedding,
         )
       }
       const conflicts = memoryKey && cardinality === 'single' && !closedHistoricalInterval
@@ -502,6 +616,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
             conflict.validTo = temporalCloseBoundary(conflict, effectiveValidFrom ?? now)
             conflict.invalidatedAt = now
             conflict.updatedAt = now
+            syncBm25Index(secondary, conflict)
             changedConflicts.push(conflict)
           }
         }
@@ -515,10 +630,12 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           && normalizeContent(duplicate.content).toLocaleLowerCase() !== normalizedContent.toLocaleLowerCase()
         removeActiveIndexes(secondary, duplicate)
         if (refineContent) {
+          embeddingIndex?.removeMemoryIds([duplicate.id])
           removeSetValue(secondary.exact, exactContentKey(duplicate.scope, duplicate.content), duplicate.id)
           duplicate.content = normalizedContent
           duplicate.embedding = embedding ?? await embed(normalizedContent)
           duplicate.embeddingModel = embeddingModel
+          cacheCanonicalEmbedding(duplicate)
           addSetValue(secondary.exact, exactContentKey(duplicate.scope, duplicate.content), duplicate.id)
         }
         duplicate.metadata = mergeMetadata(duplicate.metadata, metadata)
@@ -586,10 +703,12 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         updatedAt: now,
       }
       index.push(newItem)
+      cacheCanonicalEmbedding(newItem)
       addMemoryIndexes(secondary, newItem)
       const pruned = pruneScope(index, normalizedScope, maxMemories)
       for (const item of pruned)
         removeMemoryIndexes(secondary, item)
+      embeddingIndex?.removeMemoryIds(pruned.map(item => item.id))
       persistChanges(
         persistence,
         index,
@@ -606,6 +725,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       const normalizedScope = normalizeScope(scope)
       const itemIndex = index.findIndex(item => item.id === id && matchesScope(item.scope, normalizedScope))
       if (itemIndex >= 0) {
+        embeddingIndex?.removeMemoryIds([id])
         removeMemoryIndexes(secondary, index[itemIndex]!)
         index.splice(itemIndex, 1)
         persistChanges(
@@ -624,15 +744,21 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       const normalizedScope = normalizeScope(scope)
       const itemIndex = index.findIndex(item => item.id === id && matchesScope(item.scope, normalizedScope))
       if (itemIndex < 0) {
+        embeddingIndex?.removeMemoryIds([id])
+        embeddingIndex?.compact()
+        embeddingIndex?.scrubBackups()
         persistence?.compact?.()
         persistence?.scrubBackups?.()
         return false
       }
+      embeddingIndex?.removeMemoryIds([id])
       removeMemoryIndexes(secondary, index[itemIndex]!)
       index.splice(itemIndex, 1)
       persistChanges(persistence, index, [], [id], 'purge', onCommittedChange, onCommitObserverError)
       persistence?.compact?.()
       persistence?.scrubBackups?.()
+      embeddingIndex?.compact()
+      embeddingIndex?.scrubBackups()
       return true
     },
 
@@ -650,9 +776,11 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       const now = Date.now()
       removeActiveIndexes(secondary, item)
       if (updatedContent !== undefined && updatedEmbedding) {
+        embeddingIndex?.removeMemoryIds([item.id])
         item.content = updatedContent
         item.embedding = updatedEmbedding
         item.embeddingModel = embeddingModel
+        cacheCanonicalEmbedding(item)
       }
       if (patch.importance !== undefined)
         item.importance = clampNumber(patch.importance, 0, 1, item.importance)
@@ -712,6 +840,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           conflict.validTo = temporalCloseBoundary(conflict, now)
           conflict.invalidatedAt = now
           conflict.updatedAt = now
+          syncBm25Index(secondary, conflict)
           changedConflicts.push(conflict)
         }
       }
@@ -781,6 +910,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           index.splice(i, 1)
         }
       }
+      embeddingIndex?.removeMemoryIds(deletedIds)
       persistChanges(
         persistence,
         index,
@@ -796,6 +926,8 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       const normalizedScope = normalizeScope(scope)
       return index.filter(item => matchesScope(item.scope, normalizedScope)).length
     },
+    embeddingStatus,
+    prepareEmbeddings,
   }
 }
 
@@ -1016,46 +1148,8 @@ function selectDiverse<T extends { item: IndexedMemory; score: number }>(scored:
   return selected
 }
 
-function bm25Scores(query: string, documents: string[]): number[] {
-  const queryTokens = [...new Set(tokenize(query))]
-  if (queryTokens.length === 0)
-    return documents.map(() => 0)
-  const tokenized = documents.map(tokenize)
-  const averageLength = tokenized.reduce((sum, tokens) => sum + tokens.length, 0) / Math.max(1, tokenized.length)
-  const documentFrequency = new Map<string, number>()
-  for (const tokens of tokenized) {
-    for (const token of new Set(tokens))
-      documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1)
-  }
-  const k1 = 1.2
-  const b = 0.75
-  return tokenized.map((tokens) => {
-    const frequency = new Map<string, number>()
-    for (const token of tokens)
-      frequency.set(token, (frequency.get(token) ?? 0) + 1)
-    let score = 0
-    for (const token of queryTokens) {
-      const tf = frequency.get(token) ?? 0
-      if (tf === 0)
-        continue
-      const df = documentFrequency.get(token) ?? 0
-      const idf = Math.log(1 + (documents.length - df + 0.5) / (df + 0.5))
-      score += idf * ((tf * (k1 + 1)) / (tf + k1 * (1 - b + b * tokens.length / Math.max(1, averageLength))))
-    }
-    return clampScore(1 - Math.exp(-score))
-  })
-}
-
 function tokenize(value: string): string[] {
-  const normalized = value.normalize('NFKC').toLocaleLowerCase()
-  const tokens = normalized.match(/[a-z0-9]+/g)?.map(token => `w:${token}`) ?? []
-  const han = normalized.match(/[\u3400-\u9fff]/g) ?? []
-  for (let index = 0; index < han.length; index++) {
-    tokens.push(`c:${han[index]}`)
-    if (index + 1 < han.length)
-      tokens.push(`b:${han[index]}${han[index + 1]}`)
-  }
-  return tokens
+  return tokenizeBm25(value)
 }
 
 function strongLexicalTokens(value: string): Set<string> {
@@ -1072,6 +1166,7 @@ function createSecondaryIndexes(items: IndexedMemory[]): SecondaryIndexes {
     exact: new Map(),
     activeByMemoryKey: new Map(),
     activeByToken: new Map(),
+    bm25: createMemoryBm25Index(),
   }
   for (const item of items)
     addMemoryIndexes(secondary, item)
@@ -1091,6 +1186,7 @@ function removeMemoryIndexes(secondary: SecondaryIndexes, item: IndexedMemory): 
 }
 
 function addActiveIndexes(secondary: SecondaryIndexes, item: IndexedMemory): void {
+  syncBm25Index(secondary, item)
   if (item.status !== 'active')
     return
   if (item.memoryKey)
@@ -1104,6 +1200,7 @@ function addActiveIndexes(secondary: SecondaryIndexes, item: IndexedMemory): voi
 }
 
 function removeActiveIndexes(secondary: SecondaryIndexes, item: IndexedMemory): void {
+  secondary.bm25.remove(item.id)
   if (item.memoryKey)
     removeSetValue(secondary.activeByMemoryKey, memoryKeyIndexKey(item.scope, item.memoryKey), item.id)
   const kind = optionalString(item.metadata?.kind)
@@ -1112,6 +1209,19 @@ function removeActiveIndexes(secondary: SecondaryIndexes, item: IndexedMemory): 
     if (kind)
       removeSetValue(secondary.activeByToken, tokenIndexKey(item.scope, token, kind), item.id)
   }
+}
+
+function syncBm25Index(secondary: SecondaryIndexes, item: IndexedMemory): void {
+  if (item.status !== 'active' && item.status !== 'superseded') {
+    secondary.bm25.remove(item.id)
+    return
+  }
+  secondary.bm25.upsert({
+    id: item.id,
+    content: item.content,
+    scope: item.scope,
+    state: item.status === 'active' ? 'active' : 'historical',
+  })
 }
 
 function findExactMemory(
@@ -1148,6 +1258,7 @@ function findSemanticDuplicate(
   embedding: number[],
   memoryKey: string | undefined,
   metadata: Record<string, unknown> | undefined,
+  resolveEmbedding: (item: IndexedMemory) => number[] | undefined = item => item.embedding,
 ): IndexedMemory | undefined {
   const candidateIds = new Set<string>()
   if (memoryKey) {
@@ -1170,7 +1281,7 @@ function findSemanticDuplicate(
     const item = secondary.byId.get(id)
     if (item?.status === 'active'
       && matchesExactScope(item.scope, scope)
-      && isSemanticDuplicate(item, content, embedding, memoryKey, metadata))
+      && isSemanticDuplicate(item, content, embedding, memoryKey, metadata, resolveEmbedding(item)))
       return item
   }
   return undefined
@@ -1263,13 +1374,14 @@ function isSemanticDuplicate(
   embedding: number[],
   memoryKey: string | undefined,
   metadata: Record<string, unknown> | undefined,
+  existingEmbedding: number[] = item.embedding,
 ): boolean {
   const incomingKind = optionalString(metadata?.kind)
   const existingKind = optionalString(item.metadata?.kind)
   if (incomingKind && existingKind && incomingKind !== existingKind)
     return false
 
-  const semantic = clampScore(cosineSimilarity(embedding, item.embedding))
+  const semantic = clampScore(cosineSimilarity(embedding, existingEmbedding))
   const lexical = jaccard(tokenize(content), tokenize(item.content))
   const sameKey = !!memoryKey && item.memoryKey === memoryKey
   const valueLexical = jaccard(tokenize(factValue(content)), tokenize(factValue(item.content)))
@@ -1648,6 +1760,10 @@ function clampInteger(value: number, minimum: number, maximum: number): number {
   if (!Number.isFinite(value))
     return minimum
   return Math.max(minimum, Math.min(maximum, Math.floor(value)))
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0))
 }
 
 function requireApiKey(apiKey?: string): string {

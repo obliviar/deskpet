@@ -1,6 +1,6 @@
 {
   "name": "@deskpet/electron",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "DeskPet Electron desktop app",
@@ -10,7 +10,7 @@
     "build": "electron-vite build",
     "test:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/memory-v4-smoke.ps1",
     "preview": "electron-vite preview",
-    "package": "electron-vite build && electron-builder --win zip",
+    "package": "electron-vite build && electron-builder --win dir && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-versioned.ps1",
     "typecheck": "pnpm run typecheck:renderer && pnpm run typecheck:node",
     "typecheck:renderer": "vue-tsc --noEmit -p tsconfig.web.json",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json"

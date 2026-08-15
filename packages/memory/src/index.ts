@@ -2,12 +2,46 @@ export { createVectorStore } from './long-term/vector-store'
 export type {
   MemoryPersistence,
   MemoryPersistenceDelta,
+  MemoryEmbeddingPreparationOptions,
+  MemoryEmbeddingPreparationProgress,
   V3MemoryCommit,
   V3MemoryCommitReason,
   V3MemoryRecord,
   VectorStore,
   VectorStoreOptions,
 } from './long-term/vector-store'
+export { createMemoryEmbeddingIndex, MEMORY_EMBEDDING_INDEX_VERSION } from './long-term/embedding-index'
+export type {
+  MemoryEmbeddingIndex,
+  MemoryEmbeddingIndexStatus,
+  MemoryEmbeddingVectorInput,
+} from './long-term/embedding-index'
+export { createMemoryBm25Index, MEMORY_BM25_INDEX_VERSION, tokenizeBm25 } from './long-term/bm25-index'
+export type {
+  Bm25DocumentInput,
+  Bm25DocumentState,
+  Bm25IndexOptions,
+  Bm25IndexStats,
+  Bm25MemoryScope,
+  Bm25SearchHit,
+  Bm25SearchOptions,
+  MemoryBm25Index,
+} from './long-term/bm25-index'
+export {
+  buildModelArtifactManifest,
+  inspectModelArtifactManifest,
+  MODEL_ARTIFACT_MANIFEST_VERSION,
+  verifyModelArtifactManifest,
+  writeModelArtifactManifestAtomic,
+} from './long-term/model-artifact-integrity'
+export type {
+  ModelArtifactFile,
+  ModelArtifactIdentity,
+  ModelArtifactInspection,
+  ModelArtifactManifest,
+  ModelArtifactProbeRecord,
+  ModelArtifactVerification,
+} from './long-term/model-artifact-integrity'
 export { createEncryptedFilePersistence } from './long-term/encrypted-persistence'
 export type { EncryptedFilePersistenceOptions, EncryptedMemoryPersistence } from './long-term/encrypted-persistence'
 export { createLocalEmbedding, LOCAL_EMBEDDING_MODEL } from './long-term/local-embedding'

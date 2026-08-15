@@ -12,6 +12,7 @@ import {
   auditV3V4Consistency,
   createMemoryV4LifecycleService,
   createMemoryCandidateReviewService,
+  createMemoryEmbeddingIndex,
   createLocalMemoryCandidateVerifier,
   createMemoryPurgeConfirmationGate,
   createMemoryV4Repository,
@@ -33,6 +34,7 @@ import type {
   MemoryExtractor,
   MemoryV4LifecycleService,
   MemoryCandidateReviewService,
+  MemoryEmbeddingIndex,
   MemoryV4Repository,
   VectorStore,
   V4ShadowWriter,
@@ -43,7 +45,12 @@ import { createPersistence } from './persist'
 import { createSettingsManager } from './settings'
 import { setupVoiceIPC } from './voice'
 import { createImageMemoryService, isExplicitImageMemoryRequest } from './image-memory'
-import { createSemanticMemoryService, SEMANTIC_MEMORY_MODEL, SEMANTIC_MEMORY_REVISION } from './semantic-memory'
+import {
+  createSemanticMemoryService,
+  SEMANTIC_MEMORY_FINGERPRINT,
+  SEMANTIC_MEMORY_MODEL,
+} from './semantic-memory'
+import type { SemanticModelProgress } from './semantic-memory'
 
 // Some Windows systems cannot initialize Electron's GPU subprocess. Disable
 // hardware acceleration before app readiness so the packaged app still starts.
@@ -248,6 +255,7 @@ function normalizeMemorySettings(value: Partial<MemorySettings> | undefined): Me
 let memorySettings = normalizeMemorySettings(persist.loadJson<Partial<MemorySettings>>('memory-settings', defaultMemorySettings))
 let memory: ReturnType<typeof createMemoryWriter> | undefined
 let memoryPersistence: EncryptedMemoryPersistence | undefined
+let memoryEmbeddingIndex: MemoryEmbeddingIndex | undefined
 let memoryInitializationError = ''
 let memoryLegacyMigrated = false
 let memoryV4Shadow: V4ShadowWriter | undefined
@@ -262,22 +270,68 @@ let memoryV4Audit: ReturnType<typeof auditV3V4Consistency> | undefined
 const localMemoryScope = { ownerId: 'local-user', agentId: 'deskpet' }
 const memoryStoragePath = join(userDataDir, 'memories.enc')
 const memoryKeyPath = join(userDataDir, 'memory-key.json')
+const memoryEmbeddingStoragePath = join(userDataDir, 'memory-embeddings.enc')
+const memoryEmbeddingKeyPath = join(userDataDir, 'memory-embedding-key.json')
 const legacyMemoryStoragePath = join(userDataDir, 'memories.json')
 const memoryV4StoragePath = join(userDataDir, 'memory-v4.enc')
 const memoryV4BackupPath = join(userDataDir, 'memory-v4.enc.backup')
 const memoryV4JournalPath = join(userDataDir, 'memory-v4.enc.journal')
 const memoryV4KeyPath = join(userDataDir, 'memory-v4-key.json')
-let semanticModelProgress: { status: string; progress?: number; file?: string; error?: string } = { status: 'idle' }
+let semanticModelProgress: SemanticModelProgress = { status: 'idle' }
+let semanticPreparationPromise: Promise<void> | undefined
 let imageMemoryProgress: { status: string; progress?: number } = { status: 'idle' }
 const purgeConfirmation = createMemoryPurgeConfirmationGate()
 const semanticMemory = createSemanticMemoryService(join(userDataDir, 'models', 'memory'), (progress) => {
-  semanticModelProgress = progress
-  mainWindow?.webContents.send('memory:model-progress', progress)
+  updateSemanticModelProgress(progress)
 })
 const imageMemory = createImageMemoryService(join(userDataDir, 'models', 'ocr'), (progress) => {
   imageMemoryProgress = progress
   mainWindow?.webContents.send('memory:ocr-progress', progress)
 })
+
+function updateSemanticModelProgress(progress: SemanticModelProgress): void {
+  semanticModelProgress = progress
+  mainWindow?.webContents.send('memory:model-progress', progress)
+}
+
+function prepareSemanticMemoryIndex(): Promise<void> {
+  if (semanticPreparationPromise)
+    return semanticPreparationPromise
+  semanticPreparationPromise = (async () => {
+    if (!memoryStore || !memoryEmbeddingIndex)
+      throw new Error('长期记忆索引尚未初始化。')
+    const initial = memoryStore.embeddingStatus(SEMANTIC_MEMORY_FINGERPRINT, localMemoryScope)
+    updateSemanticModelProgress({
+      status: 'indexing',
+      progress: initial.total === 0 ? 100 : initial.ready / initial.total * 100,
+      ...initial,
+    })
+    const result = await memoryStore.prepareEmbeddings(
+      SEMANTIC_MEMORY_FINGERPRINT,
+      semanticMemory.embed,
+      localMemoryScope,
+      {
+        batchSize: 8,
+        onProgress: progress => updateSemanticModelProgress({
+          status: 'indexing',
+          progress: progress.total === 0 ? 100 : progress.ready / progress.total * 100,
+          total: progress.total,
+          ready: progress.ready,
+          pending: progress.pending,
+        }),
+      },
+    )
+    if (result.pending > 0)
+      throw new Error(`仍有 ${result.pending} 条记忆未完成语义索引，请重试。`)
+    updateSemanticModelProgress({ status: 'ready', progress: 100, ...result })
+  })().catch((error) => {
+    updateSemanticModelProgress({ status: 'error', error: errorMessage(error) })
+    throw error
+  }).finally(() => {
+    semanticPreparationPromise = undefined
+  })
+  return semanticPreparationPromise
+}
 
 function saveMemorySettings(): void {
   persist.saveJson('memory-settings', memorySettings)
@@ -328,6 +382,7 @@ function initializeMemory(): void {
   }
   memory = undefined
   memoryPersistence = undefined
+  memoryEmbeddingIndex = undefined
   memoryV4Shadow = undefined
   memoryV4Repository = undefined
   memoryV4Lifecycle = undefined
@@ -353,17 +408,64 @@ function initializeMemory(): void {
       unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
     })
     memoryPersistence = persistence
-    const semanticActive = memorySettings.semanticEnabled && semanticMemory.isInstalled()
+    let embeddingIndex: MemoryEmbeddingIndex | undefined
+    try {
+      const embeddingPersistence = createEncryptedFilePersistence({
+        encryptedPath: memoryEmbeddingStoragePath,
+        keyPath: memoryEmbeddingKeyPath,
+        protectKey: key => safeStorage.encryptString(key.toString('base64')),
+        unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
+      })
+      embeddingIndex = createMemoryEmbeddingIndex({ persistence: embeddingPersistence })
+    }
+    catch (error) {
+      writeBootLog(`semantic side index disabled: ${errorMessage(error)}`)
+      updateSemanticModelProgress({ status: 'error', error: `派生语义索引不可用：${errorMessage(error)}` })
+    }
+    memoryEmbeddingIndex = embeddingIndex
+    const probeStore = createVectorStore({
+      persistence,
+      embeddingModel: LOCAL_EMBEDDING_MODEL,
+      ...(embeddingIndex ? { embeddingIndex } : {}),
+    })
+    const semanticRequested = memorySettings.semanticEnabled
+    const requestedSemantic = semanticRequested && semanticMemory.isVerified()
+    const preparedSemantic = probeStore.embeddingStatus(SEMANTIC_MEMORY_FINGERPRINT, localMemoryScope)
+    const semanticActive = !!embeddingIndex && requestedSemantic && preparedSemantic.pending === 0
+    if (semanticRequested && !semanticActive) {
+      memorySettings.semanticEnabled = false
+      saveMemorySettings()
+      if (semanticMemory.isVerified()) {
+        updateSemanticModelProgress({
+          status: 'idle',
+          integrity: semanticMemory.integrity().state,
+          ...preparedSemantic,
+        })
+        writeBootLog(`semantic activation deferred: ${preparedSemantic.pending}/${preparedSemantic.total} vectors pending`)
+      }
+      else {
+        writeBootLog(`semantic activation disabled: ${semanticMemory.integrity().error ?? semanticMemory.integrity().state}`)
+      }
+    }
     const store = createVectorStore({
       persistence,
       embeddingModel: semanticActive
-        ? `${SEMANTIC_MEMORY_MODEL}@${SEMANTIC_MEMORY_REVISION}`
+        ? SEMANTIC_MEMORY_FINGERPRINT
         : LOCAL_EMBEDDING_MODEL,
       ...(semanticActive ? { embedder: semanticMemory.embed } : {}),
+      ...(embeddingIndex ? { embeddingIndex } : {}),
+      foregroundEmbeddingUpgrade: !semanticActive,
       onCommittedChange: commit => memoryV4Shadow?.enqueueCommit(commit),
       onCommitObserverError: error => writeBootLog(`Memory V4 commit enqueue failed: ${errorMessage(error)}`),
     })
     memoryStore = store
+    if (semanticActive)
+      updateSemanticModelProgress({
+        status: 'ready',
+        progress: 100,
+        integrity: semanticMemory.integrity().state,
+        ...preparedSemantic,
+      })
     memory = createMemoryWriter({
       store,
       extractor: createConfiguredMemoryExtractor(),
@@ -639,6 +741,8 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
   const residual = auditPurgedMemory(id, fact.id, originalContent)
   if ((await memory.list(localMemoryScope, 20_000)).some(item => item.id === id))
     residual.push('V3 当前索引仍含该记忆')
+  if (memoryEmbeddingIndex?.hasMemory(id))
+    residual.push('派生向量索引仍含该记忆')
   if (residual.length > 0)
     return { ok: false as const, error: `清除后残留审计失败：${residual.join('；')}`, residual }
   writeBootLog(`Memory purge completed: ${id}, V3 removed=${removedV3}, V4 version=${lifecycle.version}, residual=0`)
@@ -655,12 +759,15 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
       residualCount: 0,
       checkpointCompacted: true,
       backupsScrubbed: true,
+      embeddingIndexPurged: true,
     },
   }
 }
 
 // ── IPC ─────────────────────────────────────────────────
 function setupIPC() {
+  ipcMain.handle('app:version', () => app.getVersion())
+
   ipcMain.handle('chat:send', async (_event, message: string, attachments?: { type: 'image'; data: string; mimeType: string }[]) => {
     if (!apiConfig.apiKey.trim())
       return { ok: false, error: '尚未配置 API Key，请点击右上角“API 设置”。' }
@@ -785,10 +892,13 @@ function setupIPC() {
     settings: memorySettings,
     semantic: {
       installed: semanticMemory.isInstalled(),
-      active: memorySettings.semanticEnabled && semanticMemory.isInstalled(),
+      active: memorySettings.semanticEnabled && semanticMemory.isVerified(),
       model: SEMANTIC_MEMORY_MODEL,
       progress: semanticModelProgress,
+      integrity: semanticMemory.integrity(),
       cachePath: semanticMemory.cacheDir,
+      indexPath: memoryEmbeddingStoragePath,
+      index: memoryStore?.embeddingStatus(SEMANTIC_MEMORY_FINGERPRINT, localMemoryScope),
     },
     ocr: { progress: imageMemoryProgress, cachePath: imageMemory.cachePath },
   }))
@@ -813,9 +923,12 @@ function setupIPC() {
     settings: memorySettings,
     semantic: {
       installed: semanticMemory.isInstalled(),
-      active: memorySettings.semanticEnabled && semanticMemory.isInstalled(),
+      active: memorySettings.semanticEnabled && semanticMemory.isVerified(),
       model: SEMANTIC_MEMORY_MODEL,
       progress: semanticModelProgress,
+      integrity: semanticMemory.integrity(),
+      indexPath: memoryEmbeddingStoragePath,
+      index: memoryStore?.embeddingStatus(SEMANTIC_MEMORY_FINGERPRINT, localMemoryScope),
     },
     items: memory ? await memory.list(localMemoryScope, Number(limit)) : [],
     reviewItems: memoryCandidateReview?.list(localMemoryScope, Number(limit)) ?? [],
@@ -951,12 +1064,20 @@ function setupIPC() {
 
   ipcMain.handle('memory:settings-set', async (_event, input: Partial<MemorySettings>) => {
     await memory?.flushPendingCaptures()
-    memorySettings = normalizeMemorySettings({ ...memorySettings, ...input })
-    if (memorySettings.semanticEnabled && !semanticMemory.isInstalled()) {
-      memorySettings.semanticEnabled = false
-      saveMemorySettings()
+    const nextSettings = normalizeMemorySettings({ ...memorySettings, ...input })
+    if (nextSettings.semanticEnabled && !semanticMemory.isInstalled()) {
       return { ok: false, error: '请先下载本地语义模型。', settings: memorySettings }
     }
+    if (nextSettings.semanticEnabled && !semanticMemory.isVerified() && !await semanticMemory.verify()) {
+      return {
+        ok: false,
+        error: semanticMemory.integrity().error ?? '本地语义模型完整性校验失败，请重新安装。',
+        settings: memorySettings,
+      }
+    }
+    if (nextSettings.semanticEnabled && !memorySettings.semanticEnabled)
+      await prepareSemanticMemoryIndex()
+    memorySettings = nextSettings
     saveMemorySettings()
     initializeMemory()
     rebuildRuntime()
@@ -967,6 +1088,7 @@ function setupIPC() {
     try {
       await memory?.flushPendingCaptures()
       await semanticMemory.install()
+      await prepareSemanticMemoryIndex()
       memorySettings.semanticEnabled = true
       saveMemorySettings()
       initializeMemory()
@@ -1065,9 +1187,14 @@ function createWindow() {
 }
 
 // ── App lifecycle ──────────────────────────────────────
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   apiConfig = loadApiConfig()
   initializeSessions()
+  if (config.memoryEnabled && memorySettings.semanticEnabled && semanticMemory.isInstalled()) {
+    const verified = await semanticMemory.verify()
+    if (!verified)
+      writeBootLog(`semantic startup verification failed: ${semanticMemory.integrity().error ?? 'unknown error'}`)
+  }
   initializeMemory()
   rebuildRuntime()
   setupIPC()

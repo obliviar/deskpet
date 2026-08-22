@@ -52,6 +52,16 @@ export interface V4ShadowRetrieval {
   createdAt?: number
 }
 
+export interface V4ShadowRetrievalFeedback {
+  query: string
+  scope: MemoryScope
+  adoptedMemoryIds?: string[]
+  correctedMemoryIds?: string[]
+  deniedMemoryIds?: string[]
+  answerModel?: string
+  reportedAt?: number
+}
+
 export interface V4ShadowWriterOptions {
   repository: MemoryV4Repository
   now?: () => number
@@ -70,6 +80,7 @@ export interface V4ShadowWriter {
   enqueueCommit: (commit: V3MemoryCommit) => void
   enqueueCapture: (capture: V4ShadowCapture) => void
   enqueueRetrieval: (retrieval: V4ShadowRetrieval) => void
+  enqueueRetrievalFeedback: (feedback: V4ShadowRetrievalFeedback) => void
   enqueueSourceUnlink: (commit: MemorySourceUnlinkCommit) => void
   flush: () => void
   reconcileV3Payload: (payload: string) => V4ShadowReconciliationResult
@@ -80,6 +91,7 @@ type ShadowOperation =
   | { type: 'commit'; value: V3MemoryCommit }
   | { type: 'capture'; value: V4ShadowCapture }
   | { type: 'retrieval'; value: V4ShadowRetrieval }
+  | { type: 'retrieval-feedback'; value: V4ShadowRetrievalFeedback }
   | { type: 'source-unlink'; value: MemorySourceUnlinkCommit }
 
 interface ShadowIndexes {
@@ -205,6 +217,7 @@ export function createV4ShadowWriter(options: V4ShadowWriterOptions): V4ShadowWr
     enqueueCommit: commit => enqueue({ type: 'commit', value: commit }),
     enqueueCapture: capture => enqueue({ type: 'capture', value: capture }),
     enqueueRetrieval: retrieval => enqueue({ type: 'retrieval', value: retrieval }),
+    enqueueRetrievalFeedback: feedback => enqueue({ type: 'retrieval-feedback', value: feedback }),
     enqueueSourceUnlink: commit => enqueue({ type: 'source-unlink', value: commit }),
     flush,
     reconcileV3Payload,
@@ -246,6 +259,10 @@ function applyOperation(
     recordCapture(draft, indexes, operation.value, fallbackNow)
     return
   }
+  if (operation.type === 'retrieval-feedback') {
+    recordRetrievalFeedback(draft, indexes, operation.value, fallbackNow)
+    return
+  }
   if (operation.type === 'source-unlink') {
     recordSourceUnlink(draft, indexes, operation.value, fallbackNow)
     return
@@ -282,12 +299,26 @@ function upsertRecord(
   const policyVerified = score(record.metadata?.memoryVerificationScore, 0) >= 0.72
     && typeof record.metadata?.memoryVerifierVersion === 'string'
   const incomingStatus = normalizeFactStatus(record.status)
-  const status = record.origin !== 'manual' && incomingStatus === 'active' && !directEvidence
-    ? 'quarantined'
-    : incomingStatus
+  const sourceUpdatedAt = positiveTimestamp(record.updatedAt, committedAt)
+  const mirroredSourceUpdatedAt = optionalTimestamp(existing?.metadata?.v3SourceUpdatedAt)
+  // Capacity archival is a V4 lifecycle decision and V3 has no equivalent
+  // status. Preserve it while startup reconciliation is replaying the same V3
+  // source revision; a genuinely changed source fact is allowed to re-enter
+  // active evaluation instead of remaining silently archived forever.
+  const preserveArchived = existing?.status === 'archived'
+    && incomingStatus === 'active'
+    && (mirroredSourceUpdatedAt !== undefined
+      ? sourceUpdatedAt <= mirroredSourceUpdatedAt
+      : existing.canonicalText === record.content && existing.memoryKey === (record.memoryKey ?? existing.memoryKey))
+  const status = preserveArchived
+    ? 'archived'
+    : record.origin !== 'manual' && incomingStatus === 'active' && !directEvidence
+      ? 'quarantined'
+      : incomingStatus
   const relatedFactId = record.supersedes ? indexes.factByV3Id.get(record.supersedes)?.id : undefined
   const metadata = mergeFactMetadata(existing?.metadata, {
     v3SourceId: record.id,
+    v3SourceUpdatedAt: sourceUpdatedAt,
     ...(typeof record.metadata?.kind === 'string' ? { v3Kind: record.metadata.kind } : {}),
   })
   const fact: MemoryFactV4 = existing ?? {
@@ -336,12 +367,17 @@ function upsertRecord(
   fact.memoryKey = record.memoryKey ?? fact.memoryKey ?? `v3.fact.${record.id}`
   fact.cardinality = cardinalityFor(record)
   fact.polarity = polarityFor(record.content)
+  const archivedAt = preserveArchived ? fact.invalidatedAt : undefined
   fact.status = status
   assignOptionalTimestamp(fact, 'validFrom', record.validFrom)
   assignOptionalTimestamp(fact, 'validTo', record.validTo)
   assignOptionalTimestamp(fact, 'invalidatedAt', record.invalidatedAt)
   assignOptionalTimestamp(fact, 'expiresAt', record.expiresAt)
-  fact.updatedAt = Math.max(fact.recordedAt, positiveTimestamp(record.updatedAt, committedAt))
+  if (preserveArchived && archivedAt !== undefined)
+    fact.invalidatedAt = archivedAt
+  fact.updatedAt = preserveArchived
+    ? Math.max(fact.updatedAt, sourceUpdatedAt)
+    : Math.max(fact.recordedAt, sourceUpdatedAt)
   fact.evidenceLinkIds = uniqueStrings([...fact.evidenceLinkIds, ...evidenceLinks.map(link => link.id)])
   fact.extractionScore = score(record.confidence, fact.extractionScore)
   fact.evidenceScore = directEvidence ? 1 : evidenceLinks.length > 0 ? Math.max(fact.evidenceScore, 0.4) : fact.evidenceScore
@@ -382,6 +418,7 @@ function upsertRecord(
       committedAt,
       reconciliation ? 'Reconciled from the durable V3 index at startup.' : `Mirrored committed V3 ${reason} change.`,
     )
+    invalidateDerivedForFactChange(draft, fact, committedAt)
   }
 }
 
@@ -618,6 +655,8 @@ function recordCapture(
       )
     }
   }
+  if (capture.memories.length > 0)
+    invalidateSummariesForEpisode(draft, episode, recordedAt)
 }
 
 function upsertEvaluatedCandidate(
@@ -765,6 +804,42 @@ function recordRetrieval(
   draft.retrievalEvents.push(event)
 }
 
+/**
+ * Backfills adopted/corrected/denied fact ids onto the most recent retrieval
+ * event whose query hash and scope match the reported feedback. Later reports
+ * overwrite earlier outcomes for the same event (last write wins, deduped).
+ */
+function recordRetrievalFeedback(
+  draft: MemoryV4Snapshot,
+  indexes: ShadowIndexes,
+  feedback: V4ShadowRetrievalFeedback,
+  fallbackNow: number,
+): void {
+  if (!feedback.query)
+    return
+  const scope = v4Scope(feedback.scope)
+  const queryHash = sha256(feedback.query)
+  let target: RetrievalEventV4 | undefined
+  for (let index = draft.retrievalEvents.length - 1; index >= 0; index -= 1) {
+    const event = draft.retrievalEvents[index]!
+    if (event.queryHash !== queryHash || !sameV4Scope(event.scope, scope))
+      continue
+    target = event
+    break
+  }
+  if (!target)
+    return
+  const adopted = memoryIdsToFactIds(indexes, uniqueStrings(feedback.adoptedMemoryIds ?? []))
+  const corrected = memoryIdsToFactIds(indexes, uniqueStrings(feedback.correctedMemoryIds ?? []))
+  const denied = memoryIdsToFactIds(indexes, uniqueStrings(feedback.deniedMemoryIds ?? []))
+  target.adoptedFactIds = adopted
+  target.correctedFactIds = corrected
+  target.deniedFactIds = denied
+  if (feedback.answerModel)
+    target.answerModel = feedback.answerModel
+  target.retrievalVersion = 'adaptive-batched-v1'
+}
+
 function recordSourceUnlink(
   draft: MemoryV4Snapshot,
   indexes: ShadowIndexes,
@@ -848,6 +923,51 @@ function recordSourceUnlink(
     actor: 'user',
     payload: { unlinkedEvidence, scrubbedCandidates, staleArtifacts },
   }, indexes.domainEventKeys)
+}
+
+function invalidateDerivedForFactChange(
+  draft: MemoryV4Snapshot,
+  fact: MemoryFactV4,
+  timestamp: number,
+): void {
+  for (const artifact of draft.derivedArtifacts) {
+    if (artifact.status !== 'current')
+      continue
+    const sameOwnerAgent = artifact.scope.ownerId === fact.scope.ownerId
+      && artifact.scope.agentId === fact.scope.agentId
+    if (!(artifact.sourceFactIds.includes(fact.id) || (artifact.kind === 'tier-index' && sameOwnerAgent)))
+      continue
+    artifact.status = 'stale'
+    artifact.invalidatedAt = Math.max(artifact.createdAt, timestamp)
+    artifact.updatedAt = Math.max(artifact.updatedAt, timestamp)
+  }
+}
+
+function invalidateSummariesForEpisode(
+  draft: MemoryV4Snapshot,
+  episode: MemoryEpisodeV4,
+  timestamp: number,
+): void {
+  const episodeById = new Map(draft.episodes.map(item => [item.id, item]))
+  const day = new Date(episode.recordedAt).toISOString().slice(0, 10)
+  for (const artifact of draft.derivedArtifacts) {
+    if (artifact.kind !== 'summary' || artifact.status !== 'current'
+      || artifact.scope.ownerId !== episode.scope.ownerId || artifact.scope.agentId !== episode.scope.agentId)
+      continue
+    const sameBucket = artifact.sourceEpisodeIds.some((sourceId) => {
+      const source = episodeById.get(sourceId)
+      if (!source)
+        return false
+      return artifact.id.startsWith('consolidation-summary:session:')
+        ? source.scope.sessionId === episode.scope.sessionId
+        : new Date(source.recordedAt).toISOString().slice(0, 10) === day
+    })
+    if (!sameBucket)
+      continue
+    artifact.status = 'stale'
+    artifact.invalidatedAt = Math.max(artifact.createdAt, timestamp)
+    artifact.updatedAt = Math.max(artifact.updatedAt, timestamp)
+  }
 }
 
 function ensureEpisode(

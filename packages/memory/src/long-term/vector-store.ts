@@ -1,6 +1,8 @@
 import type {
   AdaptiveMemoryRecallOptions,
   AdaptiveMemoryRecallResult,
+  MemoryEvidencePackEntry,
+  MemoryEvidenceSourceType,
   MemoryFragment,
   MemoryOrigin,
   MemoryRecallOptions,
@@ -27,6 +29,9 @@ import {
   type MemoryRetrievalRoute,
 } from './memory-query-planner'
 import { MEMORY_RRF_VERSION, reciprocalRankFusion } from './reciprocal-rank-fusion'
+import { calibrateRecallAbstention } from './abstention-calibration'
+import type { RecallAbstentionCalibrationModel } from './abstention-calibration'
+import type { TemporalQueryRange } from './temporal-query'
 import type { MemoryEmbeddingIndex, MemoryEmbeddingIndexStatus } from './embedding-index'
 import {
   createMemoryBm25Index,
@@ -71,6 +76,8 @@ export interface VectorStoreOptions {
   foregroundEmbeddingUpgrade?: boolean
   /** RRF is the default stage-three strategy; legacy linear scoring remains available for rollback/evaluation. */
   retrievalFusion?: 'rrf-v1' | 'weighted-linear-v1'
+  /** Versioned threshold model fitted on a calibration split. */
+  abstentionCalibration?: RecallAbstentionCalibrationModel
   /**
    * Optional post-commit observer used by additive shadow stores. It runs only
    * after the V3 persistence operation succeeds. Observer failures are
@@ -131,8 +138,11 @@ interface LoadResult {
 interface SecondaryIndexes {
   byId: Map<string, IndexedMemory>
   exact: Map<string, Set<string>>
+  /** All current/historical versions by key; used for bounded evidence graphs. */
+  byMemoryKey: Map<string, Set<string>>
   activeByMemoryKey: Map<string, Set<string>>
   activeByToken: Map<string, Set<string>>
+  activeBySourceMessage: Map<string, Set<string>>
   bm25: MemoryBm25Index
 }
 
@@ -168,6 +178,7 @@ interface MemoryCandidateFeatures {
   semanticRelevant: boolean
   structuredRelevant: boolean
   broadRelevant: boolean
+  episodeRelevant: boolean
   relevant: boolean
 }
 
@@ -198,6 +209,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     embeddingIndex,
     foregroundEmbeddingUpgrade = true,
     retrievalFusion = 'rrf-v1',
+    abstentionCalibration,
     onCommittedChange,
     onCommitObserverError,
   } = options
@@ -313,11 +325,15 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     const changed = new Map(markExpired(index, normalizedScope, secondary).map(item => [item.id, item]))
     const now = Date.now()
     const queryPlan = planMemoryQuery(query, recallOptions)
-    const temporalPlan = { mode: queryPlan.temporalMode, asOf: queryPlan.asOf }
+    const temporalPlan: { mode: MemoryTemporalMode; asOf?: number; validBetween?: TemporalQueryRange } = {
+      mode: queryPlan.temporalMode,
+      ...(queryPlan.asOf === undefined ? {} : { asOf: queryPlan.asOf }),
+      ...(queryPlan.validBetween === undefined ? {} : { validBetween: queryPlan.validBetween }),
+    }
     if (!queryPlan.requiresMemory)
       return { entries: [], changed, now, queryPlan, routeCandidateCounts: {} }
     const candidates = index.filter(item => matchesScope(item.scope, normalizedScope)
-      && isTemporalCandidate(item, temporalPlan.mode, temporalPlan.asOf, now)
+      && isTemporalCandidate(item, temporalPlan.mode, temporalPlan.asOf, now, temporalPlan.validBetween)
       && isRecallAllowed(item, recallOptions))
     if (candidates.length === 0 || !query.trim())
       return { entries: [], changed, now, queryPlan, routeCandidateCounts: {} }
@@ -345,16 +361,65 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
     const broadPersonalQuery = isBroadPersonalMemoryQuery(query)
     const queryStrongTokens = strongLexicalTokens(query)
     const allowedCandidateIds = new Set(candidates.map(item => item.id))
-    const lexicalHits = secondary.bm25.search(query, {
-      scope: normalizedScope,
-      mode: temporalPlan.mode === 'current' ? 'current' : 'historical',
+    const lexicalScores = new Map<string, number>()
+    for (const lexicalQuery of [query, ...queryPlan.subQueries]) {
       // Oversample before concept/relevance checks. RRF still receives at most
       // rankWindowSize lexical candidates, while a mismatching high-BM25 fact
       // cannot crowd a relevant lower-ranked fact out of the route too early.
-      limit: Math.min(400, Math.max(queryPlan.rankWindowSize, queryPlan.rankWindowSize * 4)),
-      allow: id => allowedCandidateIds.has(id),
-    })
-    const lexicalScores = new Map(lexicalHits.map(hit => [hit.id, hit.score]))
+      const lexicalHits = secondary.bm25.search(lexicalQuery, {
+        scope: normalizedScope,
+        mode: temporalPlan.mode === 'current' ? 'current' : 'historical',
+        limit: Math.min(400, Math.max(queryPlan.rankWindowSize, queryPlan.rankWindowSize * 4)),
+        allow: id => allowedCandidateIds.has(id),
+      })
+      for (const hit of lexicalHits) {
+        const current = lexicalScores.get(hit.id) ?? 0
+        if (hit.score > current)
+          lexicalScores.set(hit.id, hit.score)
+      }
+    }
+    // Independent structured-candidate source: strong-token postings from the
+    // active inverted index. Facts carrying an exact keyword (plate number,
+    // nickname) enter the structured route even without a concept hit.
+    const structuredPostingIds = new Set<string>()
+    for (const token of queryStrongTokens) {
+      const posting = secondary.activeByToken.get(tokenIndexKey(normalizedScope, token))
+      if (!posting || posting.size === 0 || posting.size > 500)
+        continue
+      for (const id of posting) {
+        if (allowedCandidateIds.has(id))
+          structuredPostingIds.add(id)
+      }
+    }
+    // Episode retrieval: memories captured from the same source messages as a
+    // strong seed set join an episode-neighbour route. Only active memories
+    // are indexed by source message, and neighbours must still pass the same
+    // scope/temporal/recall filters as the seed candidates.
+    const episodeRouteActive = queryPlan.routes.includes('episode')
+    const episodeNeighbourIds = new Set<string>()
+    if (episodeRouteActive) {
+      const seedIds = [...lexicalScores.entries()]
+        .filter(([, score]) => score >= minLexicalScore)
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, 12)
+        .map(([id]) => id)
+      for (const id of structuredPostingIds)
+        seedIds.push(id)
+      const seedMessageIds = new Set<string>()
+      for (const id of seedIds) {
+        for (const messageId of secondary.byId.get(id)?.sourceMessageIds ?? [])
+          seedMessageIds.add(messageId)
+      }
+      for (const messageId of seedMessageIds) {
+        const posting = secondary.activeBySourceMessage.get(sourceMessageIndexKey(normalizedScope, messageId))
+        if (!posting)
+          continue
+        for (const id of posting) {
+          if (allowedCandidateIds.has(id) && episodeNeighbourIds.size < 60)
+            episodeNeighbourIds.add(id)
+        }
+      }
+    }
     const features: MemoryCandidateFeatures[] = candidates
       .map((item) => {
         const semantic = clampScore(cosineSimilarity(queryEmbedding, candidateEmbeddings.get(item.id) ?? []))
@@ -378,7 +443,9 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           ? weightedConceptCoverage(queryConcepts!, itemConcepts!)
           : broadPersonalQuery
             ? importance * 0.6 + confidence * 0.4
-            : 0
+            : structuredPostingIds.has(item.id)
+              ? 0.45 + importance * 0.1
+              : 0
         const lexicalRelevant = lexical >= minLexicalScore
           && strongLexicalOverlap
           && (!hasQueryConcepts || sharedConcept)
@@ -391,8 +458,14 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         // remembers without naming any one semantic field. Only this tightly
         // scoped personal-memory intent may enter on quality priors alone.
         const broadRelevant = broadPersonalQuery && !hasQueryConcepts
-        const structuredRelevant = hasQueryConcepts ? structured > 0 : broadRelevant
-        const relevant = lexicalRelevant || semanticRelevant || structuredRelevant || broadRelevant
+        const structuredPostingHit = !hasQueryConcepts && structuredPostingIds.has(item.id)
+        const structuredRelevant = hasQueryConcepts ? structured > 0 : (broadRelevant || structuredPostingHit)
+        // Sharing a source message with a strong seed is itself the relevance
+        // signal for the episode route: same-burst facts often have no textual
+        // overlap with the query. The bounded neighbour set and the RRF rank
+        // window keep this route from flooding the fused pool.
+        const episodeRelevant = episodeRouteActive && episodeNeighbourIds.has(item.id)
+        const relevant = lexicalRelevant || semanticRelevant || structuredRelevant || broadRelevant || episodeRelevant
         return {
           item,
           semanticScore: semantic,
@@ -407,6 +480,7 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           semanticRelevant,
           structuredRelevant,
           broadRelevant,
+          episodeRelevant,
           relevant,
         }
       })
@@ -441,6 +515,89 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
       onCommittedChange,
       onCommitObserverError,
     )
+  }
+
+  /**
+   * Citable evidence pack for the injected memories, including bounded
+   * one-hop version/conflict neighbours for down-drill.
+   */
+  function buildEvidencePack(pool: RankedMemoryPool, selectedIds: ReadonlySet<string>): MemoryEvidencePackEntry[] {
+    const rankedById = new Map(pool.entries.map(entry => [entry.item.id, entry.item]))
+    return pool.entries
+      .filter(entry => selectedIds.has(entry.item.id))
+      .map((entry, position): MemoryEvidencePackEntry => {
+        const item = entry.item
+        const conflictGroupIds = memoryConflictGroupIds(item, rankedById)
+        return {
+          memoryId: item.id,
+          citation: `M${position + 1}`,
+          ...(item.status ? { status: item.status } : {}),
+          ...(item.origin ? { origin: item.origin } : {}),
+          sourceType: evidenceSourceType(item),
+          confidence: item.confidence,
+          importance: item.importance,
+          ...(item.validFrom === undefined ? {} : { validFrom: item.validFrom }),
+          ...(item.validTo === undefined ? {} : { validTo: item.validTo }),
+          recordedAt: item.createdAt,
+          sensitivity: item.sensitivity,
+          sharePolicy: item.sharePolicy,
+          ...(item.supersedes === undefined ? {} : { supersedes: item.supersedes }),
+          ...(conflictGroupIds.length > 0 ? { conflictGroupIds } : {}),
+        }
+      })
+  }
+
+  function memoryConflictGroupIds(item: IndexedMemory, rankedById: Map<string, IndexedMemory>): string[] {
+    const group = new Set<string>()
+    const pushVersion = (target: IndexedMemory): boolean => {
+      if (target.id === item.id || group.has(target.id) || group.size >= 8)
+        return false
+      if (target.status !== 'active' && target.status !== 'superseded' && target.status !== 'conflicted')
+        return false
+      if (!matchesScope(target.scope, item.scope))
+        return false
+      group.add(target.id)
+      return true
+    }
+    // First hop: same-key versions plus the direct supersede target. These stay
+    // visible only while they are part of the ranked pool.
+    const oneHop: IndexedMemory[] = []
+    if (item.supersedes && rankedById.has(item.supersedes)) {
+      const target = secondary.byId.get(item.supersedes)
+      if (target && pushVersion(target))
+        oneHop.push(target)
+    }
+    if (item.memoryKey) {
+      const versionIds = secondary.byMemoryKey.get(memoryKeyIndexKey(item.scope, item.memoryKey)) ?? []
+      for (const otherId of versionIds) {
+        if (group.size >= 6)
+          break
+        const other = secondary.byId.get(otherId)
+        if (!other)
+          continue
+        if (other.id === item.id || other.memoryKey !== item.memoryKey)
+          continue
+        if (!matchesScope(other.scope, item.scope))
+          continue
+        if (other.status !== 'active' && other.status !== 'superseded' && other.status !== 'conflicted')
+          continue
+        if (!rankedById.has(other.id))
+          continue
+        if (pushVersion(other))
+          oneHop.push(other)
+      }
+    }
+    // Restricted second hop along supersedes chains. Ancestor ids may sit
+    // outside the ranked pool; only their ids are exposed for down-drill,
+    // never their content.
+    for (const member of oneHop) {
+      if (member.supersedes === undefined)
+        continue
+      const ancestor = secondary.byId.get(member.supersedes)
+      if (ancestor)
+        pushVersion(ancestor)
+    }
+    return [...group]
   }
 
   return {
@@ -516,6 +673,28 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           fusionMethod: retrievalFusion === 'rrf-v1' ? MEMORY_RRF_VERSION : 'weighted-linear-v1',
         }
       }
+      // Calibrated abstention gate: a weakly related best candidate must not
+      // be injected as if it were a confident memory.
+      const abstention = calibrateRecallAbstention(
+        pool.queryPlan.intent,
+        pool.entries[0]?.score ?? 0,
+        abstentionCalibration,
+      )
+      if (abstention.abstained) {
+        persistChanges(persistence, index, [...pool.changed.values()], [], 'recall', onCommittedChange, onCommitObserverError)
+        return {
+          memories: [], retrievedMemoryIds: [], injectedMemoryIds: [],
+          candidateCount: pool.entries.length,
+          evaluatedCount: 0, batchesEvaluated: 0, stopReason: 'abstain-low-confidence',
+          queryIntent: pool.queryPlan.intent,
+          candidateBudget: pool.queryPlan.candidateBudget,
+          retrievalRoutes: pool.queryPlan.routes,
+          routeCandidateCounts: pool.routeCandidateCounts,
+          queryPlanVersion: pool.queryPlan.version,
+          fusionMethod: retrievalFusion === 'rrf-v1' ? MEMORY_RRF_VERSION : 'weighted-linear-v1',
+          abstention,
+        }
+      }
       const selectionOptions: AdaptiveMemoryRecallOptions = {
         ...recallOptions,
         initialBatchSize: recallOptions.initialBatchSize ?? pool.queryPlan.selection.initialBatchSize,
@@ -552,6 +731,8 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
         routeCandidateCounts: pool.routeCandidateCounts,
         queryPlanVersion: pool.queryPlan.version,
         fusionMethod: retrievalFusion === 'rrf-v1' ? MEMORY_RRF_VERSION : 'weighted-linear-v1',
+        evidencePack: buildEvidencePack(pool, selectedIds),
+        abstention,
       }
     },
 
@@ -655,7 +836,14 @@ export function createVectorStore(options: VectorStoreOptions = {}) {
           duplicate.validTo = requestedValidTo
         if (metadata?.expiresAt !== undefined)
           duplicate.expiresAt = optionalTimestamp(metadata.expiresAt)
+        const previousMemoryKey = duplicate.memoryKey
         duplicate.memoryKey = memoryKey ?? duplicate.memoryKey
+        if (previousMemoryKey !== duplicate.memoryKey) {
+          if (previousMemoryKey)
+            removeSetValue(secondary.byMemoryKey, memoryKeyIndexKey(duplicate.scope, previousMemoryKey), duplicate.id)
+          if (duplicate.memoryKey)
+            addSetValue(secondary.byMemoryKey, memoryKeyIndexKey(duplicate.scope, duplicate.memoryKey), duplicate.id)
+        }
         duplicate.status = status
         duplicate.supersedes = supersedes ?? duplicate.supersedes
         if (status === 'active') {
@@ -971,6 +1159,16 @@ function isTransientWindowsFileError(error: unknown): boolean {
   return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES'
 }
 
+/** Classify how a stored fact was obtained so evidence packs can label trust. */
+function evidenceSourceType(item: IndexedMemory): MemoryEvidenceSourceType {
+  if (item.origin === 'manual')
+    return 'manual'
+  if (item.origin === 'image')
+    return 'image'
+  const channel = optionalString(item.metadata?.extractionChannel)
+  return channel === 'rules' || channel === 'context-confirmation' ? 'user-statement' : 'inferred'
+}
+
 function toMemoryFragment(item: IndexedMemory, score?: number): MemoryFragment {
   return {
     id: item.id,
@@ -1094,6 +1292,14 @@ function routeIncludes(route: MemoryRetrievalRoute, entry: MemoryCandidateFeatur
     case 'semantic': return entry.semanticRelevant
     case 'structured': return entry.structuredRelevant
     case 'temporal': return entry.relevant && entry.temporalScore > 0
+    // Correction queries explicitly ask for conflicted or replaced versions.
+    case 'correction': return entry.relevant
+      && (entry.item.status === 'conflicted'
+        || entry.item.status === 'superseded'
+        || entry.item.supersedes !== undefined)
+    // Episode queries recall neighbours recorded from the same source
+    // messages as the query's seed facts.
+    case 'episode': return entry.episodeRelevant
   }
 }
 
@@ -1103,12 +1309,30 @@ function routeScore(route: MemoryRetrievalRoute, entry: MemoryCandidateFeatures,
     case 'semantic': return entry.semanticScore
     case 'structured': return entry.structuredScore
     case 'temporal': {
+      if (plan.validBetween) {
+        const start = entry.item.validFrom ?? entry.item.createdAt
+        const dayMs = 86_400_000
+        const distanceDays = start < plan.validBetween.from
+          ? (plan.validBetween.from - start) / dayMs
+          : start >= plan.validBetween.to ? (start - plan.validBetween.to) / dayMs : 0
+        return entry.temporalScore * 0.7 + (1 / (1 + distanceDays / 365)) * 0.3
+      }
       if (plan.asOf !== undefined) {
         const start = entry.item.validFrom ?? entry.item.createdAt
         const distanceDays = Math.abs(plan.asOf - start) / 86_400_000
         return entry.temporalScore * 0.7 + (1 / (1 + distanceDays / 365)) * 0.3
       }
       return entry.temporalScore
+    }
+    case 'correction': {
+      const versionWeight = entry.item.status === 'conflicted'
+        ? 1
+        : entry.item.supersedes !== undefined ? 0.9 : 0.75
+      return versionWeight * 0.7 + clampScore(entry.lexicalScore) * 0.2 + clampScore(entry.semanticScore) * 0.1
+    }
+    case 'episode': {
+      const quality = (entry.importanceScore + entry.confidenceScore) / 2
+      return 0.5 + clampScore(entry.lexicalScore) * 0.3 + quality * 0.2
     }
   }
 }
@@ -1164,8 +1388,10 @@ function createSecondaryIndexes(items: IndexedMemory[]): SecondaryIndexes {
   const secondary: SecondaryIndexes = {
     byId: new Map(),
     exact: new Map(),
+    byMemoryKey: new Map(),
     activeByMemoryKey: new Map(),
     activeByToken: new Map(),
+    activeBySourceMessage: new Map(),
     bm25: createMemoryBm25Index(),
   }
   for (const item of items)
@@ -1176,12 +1402,16 @@ function createSecondaryIndexes(items: IndexedMemory[]): SecondaryIndexes {
 function addMemoryIndexes(secondary: SecondaryIndexes, item: IndexedMemory): void {
   secondary.byId.set(item.id, item)
   addSetValue(secondary.exact, exactContentKey(item.scope, item.content), item.id)
+  if (item.memoryKey)
+    addSetValue(secondary.byMemoryKey, memoryKeyIndexKey(item.scope, item.memoryKey), item.id)
   addActiveIndexes(secondary, item)
 }
 
 function removeMemoryIndexes(secondary: SecondaryIndexes, item: IndexedMemory): void {
   removeActiveIndexes(secondary, item)
   removeSetValue(secondary.exact, exactContentKey(item.scope, item.content), item.id)
+  if (item.memoryKey)
+    removeSetValue(secondary.byMemoryKey, memoryKeyIndexKey(item.scope, item.memoryKey), item.id)
   secondary.byId.delete(item.id)
 }
 
@@ -1191,6 +1421,9 @@ function addActiveIndexes(secondary: SecondaryIndexes, item: IndexedMemory): voi
     return
   if (item.memoryKey)
     addSetValue(secondary.activeByMemoryKey, memoryKeyIndexKey(item.scope, item.memoryKey), item.id)
+  for (const messageId of new Set(item.sourceMessageIds)) {
+    addSetValue(secondary.activeBySourceMessage, sourceMessageIndexKey(item.scope, messageId), item.id)
+  }
   const kind = optionalString(item.metadata?.kind)
   for (const token of new Set(tokenize(item.content))) {
     addSetValue(secondary.activeByToken, tokenIndexKey(item.scope, token), item.id)
@@ -1203,6 +1436,9 @@ function removeActiveIndexes(secondary: SecondaryIndexes, item: IndexedMemory): 
   secondary.bm25.remove(item.id)
   if (item.memoryKey)
     removeSetValue(secondary.activeByMemoryKey, memoryKeyIndexKey(item.scope, item.memoryKey), item.id)
+  for (const messageId of new Set(item.sourceMessageIds)) {
+    removeSetValue(secondary.activeBySourceMessage, sourceMessageIndexKey(item.scope, messageId), item.id)
+  }
   const kind = optionalString(item.metadata?.kind)
   for (const token of new Set(tokenize(item.content))) {
     removeSetValue(secondary.activeByToken, tokenIndexKey(item.scope, token), item.id)
@@ -1295,6 +1531,10 @@ function memoryKeyIndexKey(scope: IndexedMemory['scope'], memoryKey: string): st
   return `${scopeIndexKey(scope)}\u0000${memoryKey}`
 }
 
+function sourceMessageIndexKey(scope: IndexedMemory['scope'], messageId: string): string {
+  return `${scopeIndexKey(scope)}\u0000${messageId}`
+}
+
 function tokenIndexKey(scope: IndexedMemory['scope'], token: string, kind?: string): string {
   return `${scopeIndexKey(scope)}\u0000${kind ?? '*'}\u0000${token}`
 }
@@ -1344,15 +1584,25 @@ function isTemporalCandidate(
   mode: MemoryTemporalMode,
   asOf: number | undefined,
   now: number,
+  validBetween?: TemporalQueryRange,
 ): boolean {
   if (item.status !== 'active' && item.status !== 'superseded')
     return false
+  if (validBetween)
+    return isValidInWindow(item, validBetween)
   const referenceTime = asOf ?? now
   if (mode === 'current')
     return item.status === 'active' && isValidAt(item, referenceTime)
   if (asOf !== undefined)
     return isValidAt(item, referenceTime)
   return true
+}
+
+/** Half-open overlap between the fact validity interval and the query window. */
+function isValidInWindow(item: IndexedMemory, window: TemporalQueryRange): boolean {
+  const start = item.validFrom ?? Number.NEGATIVE_INFINITY
+  const end = item.validTo ?? Number.POSITIVE_INFINITY
+  return start < window.to && end > window.from
 }
 
 function isValidAt(item: IndexedMemory, timestamp: number): boolean {

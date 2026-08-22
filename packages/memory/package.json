@@ -12,7 +12,9 @@
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:stage2-blind": "vitest run src/eval/stage2-external-blind.test.ts --reporter=verbose"
+    "test:stage2-blind": "vitest run src/eval/stage2-external-blind.test.ts --reporter=verbose",
+    "test:stage3-blind": "vitest run src/eval/stage3-external-blind.test.ts --reporter=verbose",
+    "test:stage3-bge": "vitest run src/eval/stage3-bge-comparison.test.ts --reporter=verbose"
   },
   "dependencies": {
     "@deskpet/contracts": "workspace:*",

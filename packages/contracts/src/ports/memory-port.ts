@@ -74,6 +74,51 @@ export interface AdaptiveMemoryRecallOptions extends MemoryRecallOptions {
 export type AdaptiveMemoryRecallStopReason = 'no-candidates' | 'coverage-satisfied'
   | 'score-drop' | 'marginal-gain' | 'character-budget' | 'max-injected'
   | 'max-batches' | 'candidates-exhausted' | 'memory-not-needed'
+  | 'abstain-low-confidence'
+
+/** Deterministic abstention gate applied before adaptive selection. */
+export interface MemoryRecallAbstention {
+  abstained: boolean
+  /** Calibrated minimum fused score required for the detected query intent. */
+  threshold: number
+  bestScore: number
+  version: string
+}
+
+/** Source-type classification used when a memory is injected as evidence. */
+export type MemoryEvidenceSourceType = 'user-statement' | 'manual' | 'image' | 'inferred'
+
+/** One injectable memory rendered as a citable, auditable evidence entry. */
+export interface MemoryEvidencePackEntry {
+  memoryId: string
+  /** Short stable label (for example "M1") the answer model can cite as [M1]. */
+  citation: string
+  status?: MemoryStatus
+  origin?: MemoryOrigin
+  sourceType?: MemoryEvidenceSourceType
+  confidence?: number
+  importance?: number
+  validFrom?: number
+  validTo?: number
+  /** System time at which this version was recorded. */
+  recordedAt?: number
+  sensitivity?: MemorySensitivity
+  sharePolicy?: MemorySharePolicy
+  supersedes?: string
+  /** Bounded one-hop version/conflict neighbours for down-drill, not injected. */
+  conflictGroupIds?: string[]
+}
+
+/** Result of matching recalled memories against the final answer. */
+export type MemoryRecallFeedbackOutcome = 'adopted' | 'corrected' | 'denied' | 'ignored'
+
+export interface MemoryRecallFeedbackReport {
+  query: string
+  scope: MemoryScope
+  outcomes: Array<{ memoryId: string; outcome: MemoryRecallFeedbackOutcome }>
+  /** Model identifier of the answer that produced the feedback, when known. */
+  answerModel?: string
+}
 
 /** Result includes retrieval/injection separation for audit and unbiased usage accounting. */
 export interface AdaptiveMemoryRecallResult {
@@ -96,6 +141,10 @@ export interface AdaptiveMemoryRecallResult {
   routeCandidateCounts?: Record<string, number>
   queryPlanVersion?: string
   fusionMethod?: string
+  /** Citable evidence pack aligned with injectedMemoryIds. */
+  evidencePack?: MemoryEvidencePackEntry[]
+  /** Why the recall abstained or proceeded; present when the calibrated gate ran. */
+  abstention?: MemoryRecallAbstention
 }
 
 /** Isolation boundary for long-term memories. */
@@ -171,6 +220,12 @@ export interface AgentMemoryPort {
     scope: MemoryScope,
     options?: AdaptiveMemoryRecallOptions,
   ) => Promise<AdaptiveMemoryRecallResult>
+  /**
+   * Optional post-answer feedback closure. The runtime reports which injected
+   * memories were adopted (cited), ignored, corrected or denied so shadow audit
+   * layers can record adopted/corrected/denied outcomes.
+   */
+  reportRecallFeedback?: (report: MemoryRecallFeedbackReport) => Promise<void>
   /** Persist one already-sanitized fact. */
   remember: (content: string, scope: MemoryScope, metadata?: Record<string, unknown>) => Promise<void>
   /** Extract and persist durable facts from a completed conversation turn. */

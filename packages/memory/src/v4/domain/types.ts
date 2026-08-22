@@ -45,6 +45,7 @@ export type MemoryModalityV4 = 'asserted' | 'planned' | 'hypothetical' | 'report
 export type MemoryObjectTypeV4 = 'string' | 'number' | 'boolean' | 'date' | 'entity' | 'json'
 export type MemoryWriteActionV4 = 'ADD' | 'MERGE_EVIDENCE' | 'REFINE' | 'SUPERSEDE'
   | 'CONFLICT' | 'NOOP' | 'QUARANTINE' | 'SUPPRESS' | 'DELETE' | 'PURGE' | 'RESTORE'
+  | 'ARCHIVE'
 
 export interface MemoryCandidateV4 {
   id: string
@@ -197,7 +198,7 @@ export interface MemoryFactVersionV4 {
   reason: string
 }
 
-export type MemoryDerivedArtifactKindV4 = 'summary' | 'graph-edge' | 'embedding' | 'retrieval-cache'
+export type MemoryDerivedArtifactKindV4 = 'summary' | 'graph-edge' | 'embedding' | 'retrieval-cache' | 'tier-index'
 export type MemoryDerivedArtifactStatusV4 = 'current' | 'stale' | 'deleted'
 
 /** Rebuildable data derived from facts/episodes. It is never the source of truth. */
@@ -218,7 +219,7 @@ export interface MemoryDerivedArtifactV4 {
 
 export type MemoryDomainEventTypeV4 = 'EPISODE_RECORDED' | 'FACT_CREATED' | 'FACT_VERSIONED'
   | 'EVIDENCE_LINKED' | 'EVIDENCE_UNLINKED' | 'FACT_SUPPRESSED' | 'FACT_DELETED'
-  | 'FACT_PURGED' | 'FACT_RESTORED' | 'DERIVED_ARTIFACT_STALE' | 'V3_RECONCILED'
+  | 'FACT_PURGED' | 'FACT_RESTORED' | 'FACT_ARCHIVED' | 'DERIVED_ARTIFACT_STALE' | 'V3_RECONCILED'
   | 'CANDIDATE_REVIEWED' | 'CANDIDATE_REPROCESSED'
 
 /** Append-only, idempotent lifecycle ledger. Payload contains identifiers, not plaintext evidence. */

@@ -804,7 +804,7 @@ V4 RetrievalEvent 扩展记录：查询类型、候选通道、排名、过滤�
 
 ### 阶段 3：混合、分层、动态召回（P0/P1）
 
-**阶段状态：** × 未完成（2/8 完整计划项完成）；首个召回切片已落地，但真实本地 embedding、完整多路索引、摘要/图下钻、证据包和正式盲测仍未完成。
+**阶段状态：** × 未完成（5/8 完整计划项完成）；查询规划、时间范围解析、最多六路 RRF（含纠错与情景通道）、动态候选池、引用式证据包、保守显式纠正/否认反馈、可拟合拒答阈值、情景索引与受限 2 跳图扩展已落地，但真实本地 embedding 推荐默认化、ANN/100k FTS、摘要导航和正式盲测仍未完成。
 
 - × 将真实本地 embedding 变成经过首次安装说明的推荐默认项；保留无模型降级。
   - √ 已完成安全切换基础：新增独立 AES-256-GCM 派生向量侧索引，同一事实可同时保留 `local-hash-v3` 与固定指纹 BGE 向量；侧索引不重复保存记忆明文，仅保存内容 SHA-256、模型指纹和向量。
@@ -814,17 +814,24 @@ V4 RetrievalEvent 扩展记录：查询类型、候选通道、排名、过滤�
   - × 尚未完成推荐默认化验收：真实 BGE 未在冻结外部盲测和目标发布硬件上证明稳定优于哈希；首次下载清单目前是在成功加载后本机生成，可发现后续损坏但不等于发布方签名的供应链真实性证明；事务式 staging 安装、独立验证进程和可取消 UI 仍待完成，因此默认开关继续为关闭。
 - × 建立结构化、BM25/FTS、向量、时间、情景和纠错多路召回。
   - √ 已完成真正独立的 BM25 候选索引：新增可从加密事实重建的内存倒排索引，独立维护 TF、DF、文档长度、当前/历史统计以及 owner/agent/session 分片；查询只遍历查询词 postings，直接输出有界候选 ID/分数/名次，不再把全库正文数组交给 `bm25Scores` 重新分词。新增、正文替换、supersede、restore、expire、forget、clear 和 purge 均进入同一索引生命周期。
-  - × 完整多路索引仍未完成：向量通道仍线性计算候选余弦，结构化和时间通道还不是完全独立的可扩展候选生成器；情景索引、纠错专用通道、ANN 和 100k 以上的加密 FTS 仍待建设，因此顶层项目继续标 `×`。
-- × 实现查询规划器和时间范围解析。
-  已完成部分：新增 `memory-query-planner-v1`，可区分 specific、multi-fact、temporal、timeline、enumerative 和 external，并复用年月/日期时间点解析；开始—结束范围、相对时间和复杂查询分解尚未完成，因此仍标 `×`。
+  - √ 已完成纠错专用通道：查询规划器识别“不是/记错/更正/其实/changed to”等纠错线索后激活 `correction` 路由；该路优先召回 conflicted/superseded/supersedes 事实，使历史值在纠错语境下重新可见，并纳入 RRF 融合与 reasonCodes。
+  - √ 已完成时间窗口独立候选过滤：解析出的 validBetween 半开区间在候选层直接过滤（与窗口重叠才保留），并在时间路由排名中按窗口邻近度加权。
+  - √ 已完成结构化 posting 独立候选源：强词元查询可从二级索引 `activeByToken` 倒排直接生成结构化候选，posting 规模有上限且受候选白名单约束，不再完全依赖逐条计算结构化特征。
+  - √ 已完成情景（episode）召回通道：新增 `activeBySourceMessage` 二级倒排索引（仅 active 记忆，键为 scope+sourceMessage）；查询规划器识别“上次/上回/我们聊过/previous conversation”等情景线索后激活 `episode` 路由；以词法/结构化种子事实的 sourceMessageIds 并集从索引取同源邻居（≤60、受候选白名单约束），纳入 RRF 融合与 reasonCodes，使与查询零文本重叠的同对话事实可被召回。索引在新增、合并（sourceMessageIds 并集）、supersede、forget、purge 等生命周期中同步维护。
+  - × 完整多路索引仍未完成：向量通道仍线性计算候选余弦；ANN 和 100k 以上的加密 FTS 仍待建设，因此顶层项目继续标 `×`。
+- √ 实现查询规划器和时间范围解析。
+  `memory-query-planner-v1` 区分 specific、multi-fact、temporal、timeline、enumerative 和 external；复用年月/日期点解析，并新增：显式开始—结束范围（中文/ISO/英文，右边界月份可继承年份）与相对时间窗口（去年/前年/上个月/最近 N 天、周、月、年，含中文数字）解析为半开 validBetween 窗口；multi-fact 查询分解为最多 3 个子句，子句作为独立 BM25 查询合并 lexical 命中。
 - √ 使用 RRF/学习融合与轻量重排，不直接混加异构原始分数。
-  成果：默认使用 `memory-rrf-v1` 对 BM25、向量、结构化和时间排名做 Reciprocal Rank Fusion，再按字段覆盖、可信度、重要度和时间一致性轻量重排；保留 `weighted-linear-v1` 作为回退和同数据对照。排序不再依赖随机 ID 或毫秒级时间抖动。
+  成果：默认使用 `memory-rrf-v1` 对 BM25、向量、结构化、时间和纠错/情景等最多七路排名做 Reciprocal Rank Fusion，再按字段覆盖、可信度、重要度和时间一致性轻量重排；保留 `weighted-linear-v1` 作为回退和同数据对照。排序不依赖随机 ID 或毫秒级时间抖动。
 - √ 将现有自适应 Top 逻辑扩展到候选池动态扩大和注入层最小充分选择。
   成果：候选预算按意图从 24 动态扩展到 40/48/64/80；宽泛查询在 20,000 条记录中保留 80 个融合候选，分批实际评估 16 个、注入 10 个，候选扩展不等于上下文线性扩展。结果记录 queryIntent、候选预算、各通道数量、融合版本和停止原因。
 - × 增加摘要导航与证据下钻；高质量数据上增加受限 1–2 跳图扩展。
-- × 注入证据包、冲突组和引用 ID；回答后记录 adopted/corrected/denied。
-- × 增加拒答校准和“无需个人记忆”路径。
-  已完成部分：明确的外部知识、天气、新闻和定义类请求会走 `memory-not-needed` 快路径，不扫描或注入个人记忆；正式拒答概率校准尚未完成，因此仍标 `×`。
+  - √ 已完成受限 2 跳图下钻：证据包内每条记忆附带同 memoryKey 的 1 跳版本/冲突邻居（≤6 条、仅排名池内可见者）；1 跳成员再沿 supersedes 版本链上溯一跳（经二级索引访问、status/scope 过滤、总上限 8），池外祖先仅暴露 ID 供下钻、不注入内容。
+  - × 完整摘要导航依赖阶段 4 摘要基建，仍标 `×`。
+- √ 注入证据包、冲突组和引用 ID；回答后记录 adopted/corrected/denied。
+  成果：`recallAdaptive` 返回与注入顺序对应的证据包（M1、M2… citation，含 status/origin/sourceType/confidence/validFrom/validTo/sensitivity/sharePolicy 与冲突组）；system prompt 渲染引用 ID。运行时把引用记为 adopted、未引用记为 ignored；只有用户出现明确纠正/否认线索，且与某一条注入记忆形成唯一强匹配时，才把至多一条记为 corrected/denied。未引用不会被误判为否认，结果经 `reportRecallFeedback` 回填最新 RetrievalEventV4。
+- √ 增加拒答校准和“无需个人记忆”路径。
+  成果：外部知识、天气、新闻和定义类请求继续走 `memory-not-needed` 快路径；`abstention-threshold-calibration-v2` 提供版本化模型、按意图阈值、成本敏感精确拟合、小样本继承全局阈值，以及 precision/recall/specificity/FPR/balanced accuracy/coverage 的独立验证；`createVectorStore` 可注入拟合模型。桌面端当前仍使用明确标记为 `policy-fallback` 的保守阈值，不能宣称外部校准已经通过。
 
 **交付物：** 查询规划、多路索引、融合重排、引用式证据包、双读比较器。  
 **完成标志：** 未见改写 Recall@5 ≥90%、Top-1 ≥85%；时间 ≥95%；20k P95 <100 ms。  
@@ -878,22 +885,148 @@ V4 RetrievalEvent 扩展记录：查询类型、候选通道、排名、过滤�
 | 模型可执行完整性 | 激活前禁止远程文件，重新创建冷 pipeline；固定探针验证 512 维、有限值、归一化和重复一致性；失败只降级哈希 | 通过代码与故障测试；真实 BGE 尚未在本机下载执行 |
 | 供应链真实性 | 首次 manifest 基于 HTTPS 下载后成功加载的本机文件生成，尚无发布方批准哈希或签名清单 | 未完成，保持 `×` |
 
-**本切片结论：** “存在 ready 文件却缺少模型”和“BM25 每轮全库重新分词”两个基础缺陷已经在代码层消除。它没有解决 ANN、完整多路候选生成、真实 BGE 质量盲测、签名供应链清单和事务式模型安装，因此阶段 3 仍为 `×`，完整计划项仍为 2/8；只将上述两个可独立验收的子项标记为 `√`。
+**本切片结论：** “存在 ready 文件却缺少模型”和“BM25 每轮全库重新分词”两个基础缺陷已经在代码层消除。它没有解决 ANN、完整多路候选生成、真实 BGE 质量盲测、签名供应链清单和事务式模型安装，因此阶段 3 仍为 `×`；只将上述两个可独立验收的子项标记为 `√`。
+
+#### 阶段 3 第四个切片评估：查询规划补全、纠错/窗口通道、证据包与拒答门（2026-08-18）
+
+| 评估维度 | 结果 | 判定 |
+|---|---|---|
+| 显式范围解析 | 中文/ISO/英文开始—结束块，右边界月份继承年份，半开区间边界，无效日期拒绝；“2025年3月到5月”→ [2025-03-01, 2025-06-01) | 通过 |
+| 相对时间窗口 | 去年/前年/大前年/上个月/今年/本月锚定日历边界；“最近/过去 N 天、周、月、年”含中文数字（一、两、十、二十一）；模糊“过去几年”不造窗口 | 通过 |
+| 复杂查询分解 | multi-fact 查询拆分最多 3 个子句并作为独立 BM25 查询合并 lexical 命中；单事实查询不分解；子句含个人线索才保留 | 通过 |
+| 纠错专用通道 | “不是/记错/更正/其实/used to be/changed to”等线索激活 correction 路由；superseded 历史值在纠错语境下重新可见（专项测试：旧手机号被召回且 status=superseded） | 通过 |
+| 时间窗口过滤 | validBetween 半开区间在候选层过滤（与窗口重叠才保留），时间路由按窗口邻近度加权；“2023年到2024年”不返回 2025 年才生效的记忆 | 通过 |
+| 结构化 posting | 强词元查询从二级索引 activeByToken 倒推直接生成候选；posting ≤500 且受候选白名单约束 | 通过 |
+| 引用式证据包 | 注入记忆带 M1… citation、status/origin/sourceType/confidence/validFrom/validTo/sensitivity/sharePolicy 与 1 跳冲突组；system prompt 渲染 id="M1" 并指示 [M#] 引用与冲突信任用户 | 通过 |
+| 反馈闭环 | 回答后解析 [M#] 引用，injected→adopted/ignored 上报 `reportRecallFeedback`；electron 主进程转发到 V4 影子层并按 queryHash+scope 回填最新 RetrievalEventV4 的 adopted/corrected/deniedFactIds；无匹配事件静默忽略 | 通过 |
+| 拒答校准 | 确定性意图门槛门（abstention-calibration-v1）；弱相关个人问题返回零注入与 abstain-low-confidence + threshold/bestScore；强查询不误伤；仅作用于 recallAdaptive，冻结评测用 recall 不受影响 | 通过；阈值为开发集初始值，后续需用更大独立集再校准 |
+| 开发集回归 | stage3-retrieval-dev-v1（29 案例）RRF：Recall@5/Top-1/MRR 100%、nDCG@5 99.4662%、拒答准确率 100%、P95 7.66 ms——与第三切片持平无退化 | 通过 |
+| 20,000 条压测 | 12 次自适应召回平均 51 ms、P95 75 ms、最大 75 ms（候选 80、评估 16、注入 10） | 通过（P95 <100 ms） |
+| 自动回归 | memory 190 项通过（新增/更新 7 个测试文件）；core 9/9（新增引用渲染与反馈上报测试）；contracts/memory/core tsc 与 Electron Vue/Node typecheck 通过 | 通过 |
+
+**本切片结论：** 项 3（查询规划器和时间范围解析）、项 7（证据包、冲突组、引用 ID 与 adopted/corrected/denied 记录）、项 8（拒答校准和无需求记忆路径）已完整落地，项 2 补齐纠错通道、时间窗口过滤和结构化 posting 三个可独立验收的子项；完整计划项从 2/8 提升到 5/8。ANN/情景索引/100k 加密 FTS、真实 BGE 盲测与供应链签名、依赖阶段 4 的摘要导航仍未完成，阶段 3 整体保持 `×`。
+
+#### 阶段 3 第五个切片评估：情景召回通道与受限 2 跳图扩展（2026-08-18）
+
+| 评估维度 | 结果 | 判定 |
+|---|---|---|
+| 情景线索识别 | “上次/上回/刚才/我们聊过/说过/那次对话/previous conversation/last chat”等中英文线索激活 `episode` 路由并写入 reasonCodes；无情景线索的同类查询不激活（专项测试双向断言） | 通过 |
+| 情景二级索引 | 仅 active 记忆进入 `activeBySourceMessage`（键 scope+sourceMessageId）；新增、重复合并（sourceMessageIds 并集，先 removeActiveIndexes 再 addActiveIndexes）、supersede、forget、clear、purge 同步维护，无陈旧 posting | 通过 |
+| 零重叠邻居召回 | 与查询无任何词法/语义/结构化重叠的同源消息事实（爬山计划 vs 咖啡偏好查询）仅通过共享 sourceMessage 被召回；不同源消息的无关事实不被带入；去掉情景线索后该邻居不可见 | 通过 |
+| 通道限流 | 种子取词法高分 top12+结构化 posting，邻居上限 60 且受候选白名单（scope/时间/召回选项）约束；episode 路由与其他路由同受 rankWindowSize 截断，融合分与注入层不变 | 通过 |
+| 受限 2 跳图下钻 | 137←138←139 三级版本链：最老版本因与查询零重叠落在排名池外，其 ID 仍经 1 跳成员（池内）沿 supersedes 链第二跳进入证据包 conflictGroupIds（仅 ID、不注入内容），1 跳仍仅限池内可见者，总上限 8 | 通过 |
+| 开发集回归 | stage3-retrieval-dev-v1（29 案例）RRF：Recall@5/Top-1/MRR 100%、nDCG@5 99.4662%、拒答准确率 100%、P95 6.73 ms——与第四切片持平无退化（压测查询未激活情景路由，无额外开销路径） | 通过 |
+| 20,000 条压测 | 12 次自适应召回平均 68 ms、P95 97 ms、最大 97 ms（候选 80、评估 16、注入 10） | 通过（P95 <100 ms） |
+| 自动回归 | memory 193 项通过（新增情景路由/零重叠邻居/2 跳版本链 3 个测试）；core 9/9；全仓 14/14 类型任务通过（含 Electron Vue/Node） | 通过 |
+
+**本切片结论：** 项 2 的“情景索引”子项与项 6 的“受限 2 跳图扩展”子项已可独立验收并标记 `√`。由于项 2 顶层仍剩向量线性扫描/ANN/100k 加密 FTS，项 6 顶层仍依赖阶段 4 摘要导航，完整计划项计数维持 5/8，阶段 3 整体保持 `×`。
+
+#### 阶段 3 第六个切片复核：反馈语义与拒答校准机制（2026-08-20）
+
+| 评估维度 | 结果 | 判定 |
+|---|---|---|
+| 引用反馈 | 运行时可稳定记录 injected→adopted/ignored，证据引用和 V4 回填专项测试通过 | 子项通过 |
+| corrected/denied | contracts、writer、Electron observer 和 V4 回填接口均支持，但生产运行时没有生成这两种结果的上下文判定器 | 未完成；项 7 降为 `×` |
+| 阈值拟合 | 新增版本化成本敏感拟合、按意图小样本回退和独立验证指标；vector store 支持注入拟合模型 | 机制通过 |
+| 当前桌面模型 | 仍使用 `policy-fallback` 阈值；没有冻结外部校准/验证集产物 | 尚未取得外部质量证明 |
+| 正式盲测/BGE | 本轮全量测试中阶段 3 外部盲测 1 项、BGE 对照 2 项均因未提供外部数据/真实模型而 skipped | 未通过阶段验收 |
+
+**本切片结论（历史复核）：** 拒答从“固定常量”升级为可正式拟合和评估的机制，项 8 保持 `√`；当时项 7 只能完成 adopted/ignored，因而暂降为部分实现。该缺口已由下方第七个切片修复。
+
+#### 阶段 3 第七个切片评估：显式反馈闭环与图索引加固（2026-08-20）
+
+| 评估维度 | 结果 | 判定 |
+|---|---|---|
+| corrected/denied 生产链路 | 运行时识别中英文明确纠正/否认线索；只在注入证据中按正文重叠和历史状态加权选择唯一强匹配，且每轮至多一条 | 通过 |
+| 误伤控制 | 未引用仍为 ignored；无明确线索不产生 corrected/denied；多个候选分差不足时不武断归因 | 通过 |
+| V4 回填 | contracts → core runtime → memory writer → Electron observer → V4 RetrievalEventV4 已完整贯通 | 通过 |
+| 版本图索引 | 同 memoryKey 的当前/历史版本改用 `byMemoryKey` 二级索引，不再为每条证据遍历全库 | 通过 |
+| 自动回归 | core 11/11；memory 225 项通过，外部盲测/BGE 4 项因材料缺失 skipped | 代码回归通过 |
+
+**本切片结论：** 项 7 恢复为 `√`，阶段 3 完整实现项回到 5/8。真实 BGE 外部质量证明、ANN/100k FTS、摘要导航和正式外部盲测仍未完成，因此阶段 3 整体继续标 `×`。
 
 ### 阶段 4：离线巩固、双粒度摘要和冷热分层（P1）
 
-- × 增加空闲任务调度、断点和资源限制。
+**阶段状态：** × 未完成（5/7 实现项完成）；空闲巩固、会话/日摘要、容量治理、安全去重、可恢复归档和删除级联已通过当前影子层验收，但主题/实体/阶段摘要与摘要抽象索引仍未完成，而且 V4 尚未切入正式在线读取。
+
+- √ 增加空闲任务调度、断点和资源限制。
+  成果：新增 `memory-consolidation-service`（`memory-consolidation-v1`）：批处理事务（batchSize 默认 4 桶/事务）、桶预算（maxBuckets 默认 64）、运行时长预算（maxRuntimeMs 默认 30s）、批间协作取消（shouldCancel）与事件循环让出（yieldToEventLoop）；桶粒度幂等断点——artifact id 为 `consolidation-summary:{granularity}` + scope+bucketKey 的稳定哈希，重跑时 current 且源集合一致的桶直接 skip，中断后自动续建。electron 主进程接入 `createIdleConsolidationRunner`：powerMonitor 空闲 ≥120s 触发、5 分钟轮询、30 分钟冷却、单飞保护、10s 运行预算，before-quit 与重新初始化时安全停止。
 - × 构建会话/日/主题/实体/阶段多粒度摘要，全部保留来源引用。
+  - √ 会话/日双粒度已落地：会话桶按 episode.scope.sessionId、日桶按 recordedAt UTC 日期分组；每份摘要完整携带 sourceEpisodeIds/sourceFactIds、contentHash 和 builderVersion；仅 status 'active' 且有 active evidence 的事实进入摘要，摘要 artifact 固定在 owner/agent scope（session 身份由 bucketKey/artifact id 承载，与校验器 scopeCanContain 规则一致）。
+  - × 主题/实体/阶段粒度尚未建设。
 - × 建立抽象索引 + 具体线索锚点。
-- × 建立 hot/warm/cold/quarantine 层和每类容量预算。
-- × 去重和合并重复 episode，保留原始证据，不覆盖历史。
-- × 实现 utility、耐久度、覆盖独特性和负反馈共同驱动的归档。
-- × 删除证据后自动使摘要/图失效并重建。
+  - √ 锚点已随摘要生成：确定性摘要器按 memoryKey 分组生成 `key=value` 排序锚点列表，作为下钻导航的具体线索。
+  - × 抽象索引尚未接入查询/召回侧（摘要目前不参与检索路由）。
+- √ 建立 hot/warm/cold/quarantine 层和每类容量预算。
+  - √ 分层与容量预算已落地：`memory-tiering-v2` 的 utility 由重要性、证据耐久度、召回采纳、时间新近度（30 天半衰期）、memoryKey 覆盖独特性和 userConfirmed 共同驱动，负反馈直接扣减；hot/warm 先按阈值过滤再执行硬容量，cold 溢出才成为归档候选，受保护事实允许超出 warm 但永不归档，quarantine 为独立安全覆盖。tier-index 持久化分层成员和逐事实 utility，比较真实成员/舍入分数而非 generatedAt，空闲重跑不产生无意义日志写入。
+  - × 分层尚未接入检索路由（hot 层优先注入策略待阶段 5 双读验证）。
+- √ 去重和合并重复 episode，保留原始证据，不覆盖历史。
+  - √ 已落地：`episode-dedup-v2` 只合并“同一来源 occurrence”的重复表示，身份包含完整 scope、actor、kind、contentHash 与 sourceMessage/sourceAttachment（无来源时要求 recordedAt 相同）；不同消息、会话或时间的相同文字保留为独立发生记录。迁移会复活已有但 inactive 的 canonical 证据链，并把引用 duplicate 的派生产物标 stale；duplicate 清除 plaintext、保留 contentHash/deletedAt，重跑 no-op。
+- √ 实现 utility、耐久度、覆盖独特性和负反馈共同驱动的归档。
+  - √ 已落地：lifecycle 的 `archiveFact` 仅允许 active 且非 userConfirmed 事实，写入 ARCHIVE 版本/事件并保留证据。archiveColdFacts 按 utility 从低到高取有界批次，幂等键绑定事实当前修订，restore 后允许新的归档决策；批次结束自动重建 current tier-index。V3/V4 对账通过 v3SourceUpdatedAt 覆盖层保留未变化事实的 V4 archived 状态，只有 V3 正文修订或显式非 active 状态才能替换，避免召回提交或重启把归档静默复活。
+- √ 删除证据后自动使摘要/图失效并重建。
+  成果：生命周期 editFact/deleteFact/unlinkEpisodes 把引用受影响事实的摘要标 stale；巩固服务会先比较“现存摘要 artifact”与“本轮可计算桶”，完整来源桶消失时也能优先 prune，而不是留下永久 stale/current 摘要；同桶源集合变化或 builderVersion 升级会重建。删除清除 content/contentHash，确定性摘要器只读 fact canonicalText，不会复活已删源文。
 
 **交付物：** 睡眠巩固服务、层级摘要、容量治理、可重建归档。  
 **完成标志：** 100k 仿真容量达标；宽泛概览覆盖提高且注入 token 不线性增长；核心事实无误删。  
 **预期收益：** 把一年历史从大量碎片压缩为可导航结构，控制长期成本。  
 **风险：** 中高；摘要污染必须用来源和重建机制控制。
+
+#### 阶段 4 首个切片评估：空闲巩固服务与双粒度摘要（2026-08-18）
+
+| 评估维度 | 结果 | 判定 |
+|---|---|---|
+| 双粒度摘要 | 两个会话种子（不同 sessionId、同日）生成 2 份会话摘要 + 1 份日摘要；日摘要跨会话覆盖 2 条事实，会话摘要各 1 条；每份携带完整 sourceEpisodeIds/sourceFactIds、contentHash 与 builderVersion | 通过 |
+| 幂等断点 | 第二次运行 skipped=3、built=0、rebuilt=0；maxBuckets=1 时首跑 stopReason=bucket-budget，续跑完成剩余 2 桶并 skip 已建 1 桶——中断后自动续建 | 通过 |
+| 失效重建 | lifecycle editFact 触发 invalidateDerived 标 stale；巩固重跑 rebuilt>0、内容包含新文本、无残留 stale；unlinkEpisodes 使桶失去全部 active 覆盖后摘要被 prune（status=deleted、清除 content/contentHash） | 通过 |
+| 资源限制与取消 | shouldCancel 恒真时 built=0、stopReason=cancelled；batchSize/maxBuckets/maxRuntimeMs/yieldToEventLoop 均在批间生效；快照校验 assertMemoryV4Snapshot 在每次运行后不抛 | 通过 |
+| 确定性摘要器 | 同桶两次调用 content 与 anchors 完全一致（toStrictEqual）；锚点按 memoryKey 分组 `key=value` 排序；只读 fact canonicalText，不触碰 episode 原文 | 通过 |
+| 空闲 runner | 非空闲不触发；空闲后触发且冷却期内不重复；runOnce 强制立即运行；服务抛错经 onError 上报且不崩溃（fake timers 双向断言） | 通过 |
+| electron 接线 | V4 初始化成功后启动 runner（powerMonitor 空闲 ≥120s、5 分钟轮询、30 分钟冷却、10s 运行预算）；before-quit 与重初始化路径安全停止；kill switch 关闭 V4 时不启动 | 通过（typecheck 14/14） |
+| 自动回归 | memory 202 项通过（新增 consolidation 9 项）；全仓 14/14 类型任务通过（含 Electron Vue/Node） | 通过 |
+
+**本切片结论：** 项 1（空闲调度/断点/资源限制）与项 7（删除后失效并重建）已完整落地；项 2 完成会话/日双粒度（主题/实体/阶段未建）；项 3 完成锚点生成（抽象索引未接检索）。阶段 4 完整计划项 2/7，整体保持 `×`。
+
+#### 阶段 4 第二个切片评估：容量治理与 episode 去重（2026-08-18）
+
+| 评估维度 | 结果 | 判定 |
+|---|---|---|
+| utility 驱动分层 | 重要性/耐久度/采纳/新近度/独特性/确认加权，负反馈扣减；分层结果落为 `tier-index` artifact（current），计算的 utilityScore 写回 fact 且不动 updatedAt（幂等）；assertMemoryV4Snapshot 全程不抛 | 通过 |
+| 幂等重建 | 无变化时第二次 run skipped=true；lifecycle editFact 使 tier-index 标 stale，下次 run 自动重建为 current | 通过 |
+| quarantine 通道 | retrievalEvents 中同一事实 denied≥2 时进入 quarantine 层，不占容量预算 | 通过 |
+| 容量预算与归档 | 预算（hot 1/warm 1/cold 1）下 4 事实产生 1 个 cold 溢出归档候选；archiveColdFacts 经 lifecycle archiveFact 执行（status 'archived' + ARCHIVE 版本 + FACT_ARCHIVED 事件 + tier-index 级联 stale）；restoreFact 恢复为 active | 通过 |
+| 核心事实保护 | userConfirmed 或 importance≥0.85 的事实永不成为归档候选且不低于 warm 层；archiveFact 拒绝非 active 与 userConfirmed 事实 | 通过 |
+| episode 去重 | 相同 scope/kind/contentHash 的两个 message episode 合并：canonical 保留、duplicate 删除（清除 plaintext、保留 contentHash/deletedAt）；其证据链迁移到 canonical 且 fact.evidenceLinkIds 同步；事实保持 active 且可回答；重跑 no-op；去重后摘要巩固针对新 episode 集重建 | 通过 |
+| runner 集成 | onIdle 钩子在摘要巩固前依次执行 tiering run → archiveColdFacts（限额 8）→ episode 去重，失败仅上报不阻断；electron 主进程接线完成 | 通过 |
+| 100k 容量仿真 | 100k 事实（500 个 memoryKey、混合 importance/access/userConfirmed）分层：hot 恰为 500 预算、warm≥2,000、保护事实零归档候选，整体 431ms | 通过 |
+| 自动回归 | memory 216 项通过（新增 tiering 9 + dedup 4 + runner onIdle 1）；全仓 14/14 类型任务通过 | 通过 |
+
+**本切片结论：** 项 4（hot/warm/cold/quarantine 分层与容量预算，检索接入待阶段 5）、项 5（episode 去重合并）、项 6（utility/耐久度/独特性/负反馈驱动的归档）已可独立验收并标记 `√`。阶段 4 完整计划项提升到 5/7，剩余主题/实体/阶段粒度摘要与抽象索引接检索（项 2/项 3 子项），整体保持 `×`。
+
+#### 阶段 4 第三个切片评估：一致性加固复核（2026-08-20）
+
+| 评估维度 | 修复与结果 | 判定 |
+|---|---|---|
+| 分层阈值与硬预算 | hot/warm 先过 utility 阈值再截断；非保护 warm、cold 数量不超过预算；100k 测试显式断言上限 | 通过 |
+| tier-index 幂等 | 成员与舍入 utility 未变化时跳过，不再因 generatedAt 变化重写；artifact 升级为 `memory-tiering-v2` 并保存 utility 审计值 | 通过 |
+| 归档优先级与收尾 | archiveCandidates 按 utility 升序；恢复后幂等键随修订变化；归档批次结束重建 current tier-index | 通过 |
+| 归档跨重启 | V3 增加无关事实后重新对账，已归档且来源修订未变化的 V4 事实仍为 archived；V3 真正修改来源时允许重新评估 | 通过 |
+| occurrence 安全去重 | 相同文本但不同 sourceMessage/session 不合并；同一来源重复表示才合并；inactive canonical evidence 会复活 | 通过 |
+| 消失桶清理 | 聊天删除导致整个 session/day 桶消失时，旧摘要被发现并置 deleted、清除正文；builderVersion 变化触发重建 | 通过 |
+| 专项回归 | tiering、dedup、consolidation、V4 shadow 43/43 通过 | 通过 |
+| 全量回归 | memory 225 项通过；阶段 2/3 外部盲测和 BGE 共 4 项因外部材料缺失 skipped；本轮 20k 召回 P95 82ms；100k 分层 585ms | 代码回归通过，外部验收未通过 |
+
+**本切片结论：** 先前复核发现的分层、归档复活、去重边界和消失摘要问题均已有失败回归并修复。阶段 4 的项 1/4/5/6/7 可恢复为 `√`，实现项维持 5/7；项 2 仍缺主题/实体/阶段摘要，项 3 仍缺摘要抽象索引和在线下钻，因此阶段 4 整体继续标 `×`。此外这些能力仍在 V4 shadow 中运行，在阶段 5 切读前不能宣称已经改善用户在线回答。
+
+#### 阶段 4 第四个切片评估：固定预算防饥饿（2026-08-20）
+
+| 评估维度 | 结果 | 判定 |
+|---|---|---|
+| 长期断点公平性 | `maxBuckets` 只计入实际 build/rebuild/prune；已完成的 current 桶可免费扫描，不再每轮重复消耗预算 | 通过 |
+| 固定小预算续建 | 三个摘要桶连续使用 `maxBuckets=1`：每轮完成一个实际工作，第三轮完成全部；不会因首个 current 桶永久阻塞后续新桶 | 通过 |
+| 取消和时限 | 扫描 current 桶时仍逐桶检查取消与运行时限，避免“免费扫描”绕过资源门 | 通过 |
+
+**本切片结论：** 修复了历史摘要数量超过固定预算后新摘要可能永久饥饿的问题；阶段 4 项 1 的断点/资源限制在长期运行场景下进一步加固。
 
 ### 阶段 5：V4 正式切读与存储扩展（P1）
 
@@ -942,8 +1075,8 @@ V4 RetrievalEvent 扩展记录：查询类型、候选通道、排名、过滤�
 | 0 基线与工程卫生 | P0 | 无 | 已备份并完成全回归；外部盲测协议已入库，独立评审数据尚未提供 | × 未完成（已完成 5/6） |
 | 1 V4 权威模型与生命周期 | P0 | 阶段 0 | 证据、结构化版本、双时态、加密事件日志、依赖级联、彻底清除、差异审计、kill switch | √ 已完成（8/8）并通过阶段验收 |
 | 2 高质量写入门 | P0 | 阶段 1 核心 schema | 8/8 实现项已完成：双通道候选、上下文抽取、结构归一化、置信度校准接口、审核、重处理和长消息队列；外部盲测统计质量门尚未通过 | × 未完成（8/8 实现项完成，验收门未通过） |
-| 3 混合分层动态召回 | P0/P1 | 阶段 1；可与阶段 2 后半并行 | 已完成查询规划、四路 RRF、动态候选池、开发评测及 BGE 加密双索引/后台准备/原子切换基础；真实 BGE 盲测、完整多路索引、摘要/图和证据包待完成 | × 未完成（2/8 完整计划项） |
-| 4 离线巩固和冷热分层 | P1 | 阶段 1–3 | 摘要导航、100k 容量治理 | × 未完成 |
+| 3 混合分层动态召回 | P0/P1 | 阶段 1；可与阶段 2 后半并行 | 已完成查询规划（含时间范围/分解）、最多六路 RRF（含纠错/情景通道）、动态候选池、引用式证据包、显式 corrected/denied 唯一强匹配、可拟合拒答阈值、情景索引、受限 2 跳图下钻、开发评测及 BGE 加密双索引/后台准备/原子切换基础；真实 BGE 盲测、ANN/100k FTS、摘要导航待完成 | × 未完成（5/8 完整计划项） |
+| 4 离线巩固和冷热分层 | P1 | 阶段 1–3 | 空闲调度/断点/资源限制、会话+日双粒度摘要、确定性锚点、消失桶清理、memory-tiering-v2 硬预算、安全 occurrence 去重、归档跨重启覆盖、100k 分层仿真和 Electron idle runner 已完成；主题/实体/阶段摘要、摘要抽象索引与在线检索接入待完成 | × 未完成（5/7 实现项；尚未切读） |
 | 5 V4 切读和存储扩展 | P1 | 阶段 1–4 验收 | 正式结构化读、灰度回滚 | × 未完成 |
 | 6 反馈学习 | P2 | 有可靠反馈日志 | 自适应写入和召回策略 | × 未完成 |
 | 7 多模态/程序/神经研究 | P3 | 基础质量稳定 | 远期能力扩展 | × 未完成 |

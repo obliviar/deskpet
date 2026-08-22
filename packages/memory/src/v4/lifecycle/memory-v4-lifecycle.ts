@@ -51,6 +51,11 @@ export interface MemoryV4LifecycleService {
     scope: MemoryV4Scope,
     options: { reason: string; idempotencyKey: string },
   ) => MemoryV4LifecycleResult
+  archiveFact: (
+    factId: string,
+    scope: MemoryV4Scope,
+    options: { reason: string; idempotencyKey: string },
+  ) => MemoryV4LifecycleResult
   unlinkEpisodes: (
     episodeIds: string[],
     scope: MemoryV4Scope,
@@ -223,12 +228,45 @@ export function createMemoryV4LifecycleService(
         delete fact.invalidatedAt
         fact.updatedAt = timestamp
         const version = appendVersion(draft, fact, 'RESTORE', timestamp, operation.reason)
+        const stale = invalidateDerived(draft, fact.id, timestamp, operation.idempotencyKey)
+          + invalidateTierIndexes(draft, fact.scope, timestamp, operation.idempotencyKey)
         appendEvent(draft, {
           idempotencyKey: operation.idempotencyKey,
           type: 'FACT_RESTORED', scope, factId, createdAt: timestamp, actor: 'user',
-          payload: { operation: 'RESTORE', version, reactivatedEvidence },
+          payload: { operation: 'RESTORE', version, reactivatedEvidence, stale },
         })
-        return result(fact.id, version, 0, 0, 0)
+        return result(fact.id, version, 0, stale, 0)
+      })
+    },
+
+    archiveFact(factId, rawScope, operation) {
+      const scope = normalizeMemoryV4Scope(rawScope)
+      if (!operation.reason.trim() || !operation.idempotencyKey.trim())
+        throw new Error('Memory V4 archival requires a reason and idempotency key')
+      const existing = resultForDuplicate(repository.snapshot(), operation.idempotencyKey, factId)
+      if (existing)
+        return existing
+      return repository.transaction((draft) => {
+        const fact = requireFact(draft, factId, scope)
+        if (fact.status !== 'active')
+          throw new Error(`Memory V4 fact ${factId} cannot be archived from status ${fact.status}`)
+        if (fact.userConfirmed)
+          throw new Error(`Memory V4 fact ${factId} is user-confirmed and cannot be auto-archived`)
+        const timestamp = monotonicNow(now(), fact.updatedAt)
+        // Archival keeps every evidence link active: the fact leaves the
+        // retrieval surface without losing its auditable provenance, and
+        // restoreFact re-enters it without evidence reactivation work.
+        fact.status = 'archived'
+        fact.invalidatedAt = timestamp
+        fact.updatedAt = timestamp
+        const version = appendVersion(draft, fact, 'ARCHIVE', timestamp, operation.reason)
+        const stale = invalidateDerived(draft, fact.id, timestamp, operation.idempotencyKey)
+        appendEvent(draft, {
+          idempotencyKey: operation.idempotencyKey,
+          type: 'FACT_ARCHIVED', scope, factId, createdAt: timestamp, actor: 'system',
+          payload: { operation: 'ARCHIVE', version, stale },
+        })
+        return result(fact.id, version, 0, stale, 0)
       })
     },
 
@@ -336,6 +374,30 @@ function invalidateDerived(
       idempotencyKey: `${idempotencyKey}:artifact:${artifact.id}`,
       type: 'DERIVED_ARTIFACT_STALE', scope: artifact.scope, factId,
       createdAt: timestamp, actor: 'system', payload: { artifactId: artifact.id, purge },
+    })
+  }
+  return changed
+}
+
+function invalidateTierIndexes(
+  draft: MemoryV4Snapshot,
+  scope: MemoryV4Scope,
+  timestamp: number,
+  idempotencyKey: string,
+): number {
+  let changed = 0
+  for (const artifact of draft.derivedArtifacts) {
+    if (artifact.kind !== 'tier-index' || artifact.status !== 'current'
+      || artifact.scope.ownerId !== scope.ownerId || artifact.scope.agentId !== scope.agentId)
+      continue
+    artifact.status = 'stale'
+    artifact.updatedAt = Math.max(artifact.updatedAt, timestamp)
+    artifact.invalidatedAt = artifact.updatedAt
+    changed += 1
+    appendEvent(draft, {
+      idempotencyKey: `${idempotencyKey}:tier-index:${artifact.id}`,
+      type: 'DERIVED_ARTIFACT_STALE', scope: artifact.scope,
+      createdAt: timestamp, actor: 'system', payload: { artifactId: artifact.id, restore: true },
     })
   }
   return changed

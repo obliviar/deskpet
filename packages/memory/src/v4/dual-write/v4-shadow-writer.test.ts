@@ -5,6 +5,7 @@ import type { V3MemoryCommit, V3MemoryRecord } from '../../long-term/vector-stor
 import { assertMemoryV4Snapshot } from '../domain/validation'
 import { createMemoryV4Repository } from '../repository/memory-v4-repository'
 import type { MemoryV4Persistence } from '../repository/memory-v4-repository'
+import { createMemoryV4LifecycleService } from '../lifecycle/memory-v4-lifecycle'
 import { createV4ShadowWriter } from './v4-shadow-writer'
 
 const scope = { ownerId: 'stage2-user', agentId: 'deskpet' }
@@ -198,6 +199,84 @@ describe('Memory V4 stage-two shadow writer', () => {
     expect(event.injectedFactIds).toEqual([m2.id])
     expect(event.queryHash).toMatch(/^[a-f0-9]{64}$/u)
     expect(JSON.stringify(event)).not.toContain('我喜欢什么')
+    expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
+  })
+
+  it('backfills adopted/corrected/denied outcomes onto the latest matching retrieval event', () => {
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    const shadow = createV4ShadowWriter({ repository, now: () => NOW + 1, flushDelayMs: 10_000 })
+    shadow.enqueueCommit(commit([record({ id: 'm1', origin: 'manual' }), record({ id: 'm2', origin: 'manual', content: '用户喜欢茶' })]))
+    shadow.enqueueRetrieval({
+      query: '我喜欢什么？',
+      scope,
+      retrievedMemoryIds: ['m1', 'm2'],
+      injectedMemoryIds: ['m1', 'm2'],
+      queryType: 'adaptive',
+    })
+    shadow.enqueueRetrievalFeedback({
+      query: '我喜欢什么？',
+      scope,
+      adoptedMemoryIds: ['m1'],
+      deniedMemoryIds: ['m2'],
+      answerModel: 'test-model',
+    })
+    shadow.flush()
+
+    const snapshot = repository.snapshot()
+    const event = snapshot.retrievalEvents.at(-1)!
+    const m1 = snapshot.facts.find(item => item.metadata?.v3SourceId === 'm1')!
+    const m2 = snapshot.facts.find(item => item.metadata?.v3SourceId === 'm2')!
+    expect(event.adoptedFactIds).toEqual([m1.id])
+    expect(event.correctedFactIds).toEqual([])
+    expect(event.deniedFactIds).toEqual([m2.id])
+    expect(event.answerModel).toBe('test-model')
+    expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
+  })
+
+  it('preserves V4 archival across startup reconciliation after unrelated V3 changes', async () => {
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    const shadow = createV4ShadowWriter({ repository, now: () => NOW + 10, flushDelayMs: 10_000 })
+    let payload = ''
+    let memoryKey = 'preference.first'
+    const store = createVectorStore({
+      persistence: { load: () => undefined, save: next => { payload = next } },
+      onCommittedChange: shadow.enqueueCommit,
+    })
+    const writer = createMemoryWriter({
+      store,
+      extractor: turn => [{ content: `${memoryKey}:${turn.userMessage}`, metadata: {
+        kind: 'preference', memoryKey, cardinality: 'multiple' as const,
+        confidence: 0.95, importance: 0.2, extractionChannel: 'rules', extractorVersion: 'test-rules',
+      } }],
+      onCaptured: shadow.enqueueCapture,
+    })
+    await writer.capture({ userMessage: '第一条', assistantMessage: '', metadata: { sessionId: 's1', sourceMessageIds: ['m1'] } }, scope)
+    shadow.flush()
+    shadow.reconcileV3Payload(payload)
+    const target = repository.snapshot().facts.find(fact => fact.memoryKey === memoryKey)!
+    createMemoryV4LifecycleService(repository, { now: () => NOW + 100 }).archiveFact(target.id, target.scope, {
+      reason: 'capacity archive test',
+      idempotencyKey: 'archive-before-restart',
+    })
+
+    memoryKey = 'preference.second'
+    await writer.capture({ userMessage: '第二条', assistantMessage: '', metadata: { sessionId: 's2', sourceMessageIds: ['m2'] } }, scope)
+    shadow.flush()
+    createV4ShadowWriter({ repository, now: () => NOW + 200, flushDelayMs: 10_000 }).reconcileV3Payload(payload)
+
+    expect(repository.snapshot().facts.find(fact => fact.id === target.id)?.status).toBe('archived')
+    expect(() => assertMemoryV4Snapshot(repository.snapshot())).not.toThrow()
+  })
+
+  it('ignores retrieval feedback when no matching event exists', () => {
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    const shadow = createV4ShadowWriter({ repository, now: () => NOW + 1, flushDelayMs: 10_000 })
+    shadow.enqueueCommit(commit([record({ id: 'm1', origin: 'manual' })]))
+    shadow.enqueueRetrievalFeedback({ query: '从未问过的问题', scope, adoptedMemoryIds: ['m1'] })
+    shadow.flush()
+
+    const snapshot = repository.snapshot()
+    expect(snapshot.retrievalEvents).toHaveLength(0)
     expect(() => assertMemoryV4Snapshot(snapshot)).not.toThrow()
   })
 

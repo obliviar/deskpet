@@ -1,8 +1,15 @@
-import { createHash } from 'node:crypto'
 import type { MemoryCapture } from '@deskpet/contracts'
+import {
+  BLIND_PACK_SCHEMA_VERSION,
+  fingerprintJson,
+  requireCommit,
+  requireOnlyKeys,
+  requireText,
+  requireTimestamp,
+} from './blind-pack-common'
 import type { MemoryStage2EvalCase, MemoryStage2EvalExpectedFact } from './stage2-write-eval'
 
-export const MEMORY_STAGE2_BLIND_SCHEMA_VERSION = 1 as const
+export const MEMORY_STAGE2_BLIND_SCHEMA_VERSION = BLIND_PACK_SCHEMA_VERSION
 
 export interface MemoryStage2BlindCase {
   id: string
@@ -38,7 +45,7 @@ export interface MemoryStage2BlindLabelPack {
 /** Fingerprint excludes labels and is stable across JSON key ordering. */
 export function fingerprintMemoryStage2BlindCasePack(pack: MemoryStage2BlindCasePack): string {
   assertCasePack(pack)
-  return createHash('sha256').update(canonicalJson(pack), 'utf-8').digest('hex')
+  return fingerprintJson(pack)
 }
 
 /** Join a public prompt-only pack with a separately supplied private answer pack. */
@@ -127,38 +134,4 @@ function assertLabelPack(value: MemoryStage2BlindLabelPack): void {
         throw new Error(`Blind memory label ${label.id} has invalid action`)
     }
   }
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object')
-    return JSON.stringify(value)
-  if (Array.isArray(value))
-    return `[${value.map(canonicalJson).join(',')}]`
-  return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
-    .join(',')}}`
-}
-
-function requireText(value: unknown, label: string): asserts value is string {
-  if (typeof value !== 'string' || !value.trim())
-    throw new Error(`Blind memory ${label} must be a non-empty string`)
-}
-
-function requireTimestamp(value: unknown, label: string): asserts value is string {
-  requireText(value, label)
-  if (!Number.isFinite(Date.parse(value)))
-    throw new Error(`Blind memory ${label} must be an ISO timestamp`)
-}
-
-function requireCommit(value: unknown): asserts value is string {
-  requireText(value, 'label.implementationCommit')
-  if (!/^[a-f0-9]{7,64}$/iu.test(value))
-    throw new Error('Blind memory label.implementationCommit must be a Git commit id')
-}
-
-function requireOnlyKeys(value: Record<string, unknown>, allowed: string[], label: string): void {
-  const extras = Object.keys(value).filter(key => !allowed.includes(key))
-  if (extras.length > 0)
-    throw new Error(`Blind memory ${label} contains unsupported fields: ${extras.join(', ')}`)
 }

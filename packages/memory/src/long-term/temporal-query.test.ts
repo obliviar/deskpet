@@ -49,4 +49,46 @@ describe('temporal query planner', () => {
       asOf: Date.UTC(2023, 0, 1),
     })).toEqual({ mode: 'historical', asOf: Date.UTC(2023, 0, 1) })
   })
+
+  it('parses explicit start-end ranges as half-open windows', () => {
+    expect(planTemporalQuery('2023年到2025年我在哪里工作')).toEqual({
+      mode: 'historical',
+      validBetween: { from: Date.UTC(2023, 0, 1), to: Date.UTC(2026, 0, 1) },
+    })
+    expect(planTemporalQuery('2025年3月到5月我住了哪里')).toEqual({
+      mode: 'historical',
+      validBetween: { from: Date.UTC(2025, 2, 1), to: Date.UTC(2025, 5, 1) },
+    })
+    expect(planTemporalQuery('2025-01-10到2025-02-20的行程')).toEqual({
+      mode: 'historical',
+      validBetween: { from: Date.UTC(2025, 0, 10), to: Date.UTC(2025, 1, 21) },
+    })
+  })
+
+  it('parses relative time windows anchored at a deterministic asOf', () => {
+    const asOf = Date.UTC(2025, 5, 15, 12)
+    expect(planTemporalQuery('去年我在哪里工作', { asOf })).toEqual({
+      mode: 'historical',
+      validBetween: { from: Date.UTC(2024, 0, 1), to: Date.UTC(2025, 0, 1) },
+    })
+    expect(planTemporalQuery('上个月我做了什么', { asOf })).toEqual({
+      mode: 'historical',
+      validBetween: { from: Date.UTC(2025, 4, 1), to: Date.UTC(2025, 5, 1) },
+    })
+    expect(planTemporalQuery('最近30天我学到了什么', { asOf })).toEqual({
+      mode: 'historical',
+      validBetween: { from: asOf - 30 * 86_400_000, to: asOf },
+    })
+    expect(planTemporalQuery('过去两年我的项目变化', { asOf })).toEqual({
+      mode: 'historical',
+      validBetween: { from: asOf - Math.round(2 * 365.25 * 86_400_000), to: asOf },
+    })
+    // Chinese relative years anchor to calendar-year boundaries.
+    expect(planTemporalQuery('前年我在哪里工作', { asOf })).toEqual({
+      mode: 'historical',
+      validBetween: { from: Date.UTC(2023, 0, 1), to: Date.UTC(2024, 0, 1) },
+    })
+    // Vague wording must not invent a window.
+    expect(planTemporalQuery('过去几年我的项目变化', { asOf })).toEqual({ mode: 'historical', asOf })
+  })
 })

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, desktopCapturer, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, desktopCapturer, powerMonitor, safeStorage, shell } from 'electron'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
@@ -8,9 +8,13 @@ import { createOpenAILlm } from '@deskpet/llm-openai'
 import {
   createEncryptedFilePersistence,
   createEncryptedV4Persistence,
+  createIdleConsolidationRunner,
   createJournaledV4Persistence,
   auditV3V4Consistency,
+  createMemoryConsolidationService,
+  createMemoryTieringService,
   createMemoryV4LifecycleService,
+  mergeDuplicateEpisodes,
   createMemoryCandidateReviewService,
   createMemoryEmbeddingIndex,
   createLocalMemoryCandidateVerifier,
@@ -30,6 +34,7 @@ import {
 import type {
   JournaledV4Persistence,
   EncryptedMemoryPersistence,
+  IdleConsolidationRunner,
   MemoryCandidate,
   MemoryExtractor,
   MemoryV4LifecycleService,
@@ -263,11 +268,14 @@ let memoryV4Repository: MemoryV4Repository | undefined
 let memoryV4Lifecycle: MemoryV4LifecycleService | undefined
 let memoryCandidateReview: MemoryCandidateReviewService | undefined
 let memoryV4Persistence: JournaledV4Persistence | undefined
+let memoryV4ConsolidationRunner: IdleConsolidationRunner | undefined
 let memoryStore: VectorStore | undefined
 let memoryV4Error = ''
 let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
 let memoryV4Audit: ReturnType<typeof auditV3V4Consistency> | undefined
 const localMemoryScope = { ownerId: 'local-user', agentId: 'deskpet' }
+/** System idle seconds before offline memory consolidation may run. */
+const MEMORY_CONSOLIDATION_IDLE_SECONDS = 120
 const memoryStoragePath = join(userDataDir, 'memories.enc')
 const memoryKeyPath = join(userDataDir, 'memory-key.json')
 const memoryEmbeddingStoragePath = join(userDataDir, 'memory-embeddings.enc')
@@ -386,6 +394,8 @@ function initializeMemory(): void {
   memoryV4Shadow = undefined
   memoryV4Repository = undefined
   memoryV4Lifecycle = undefined
+  memoryV4ConsolidationRunner?.stop()
+  memoryV4ConsolidationRunner = undefined
   memoryCandidateReview = undefined
   memoryV4Persistence = undefined
   memoryStore = undefined
@@ -479,6 +489,29 @@ function initializeMemory(): void {
         memoryV4Shadow?.flush()
       },
       onSourceUnlinkObserverError: error => writeBootLog(`Memory V4 source unlink enqueue failed: ${errorMessage(error)}`),
+      onRecallFeedback: (report) => {
+        const adopted: string[] = []
+        const corrected: string[] = []
+        const denied: string[] = []
+        for (const entry of report.outcomes) {
+          if (entry.outcome === 'adopted')
+            adopted.push(entry.memoryId)
+          else if (entry.outcome === 'corrected')
+            corrected.push(entry.memoryId)
+          else if (entry.outcome === 'denied')
+            denied.push(entry.memoryId)
+        }
+        memoryV4Shadow?.enqueueRetrievalFeedback({
+          query: report.query,
+          scope: report.scope,
+          ...(adopted.length > 0 ? { adoptedMemoryIds: adopted } : {}),
+          ...(corrected.length > 0 ? { correctedMemoryIds: corrected } : {}),
+          ...(denied.length > 0 ? { deniedMemoryIds: denied } : {}),
+          ...(report.answerModel ? { answerModel: report.answerModel } : {}),
+        })
+        memoryV4Shadow?.flush()
+      },
+      onRecallFeedbackObserverError: error => writeBootLog(`Memory V4 retrieval feedback enqueue failed: ${errorMessage(error)}`),
       onBackgroundCaptureError: error => writeBootLog(`Memory background capture failed: ${errorMessage(error)}`),
     })
     memoryLegacyMigrated = persistence.wasLegacyMigrated()
@@ -529,6 +562,34 @@ function initializeMemory(): void {
         writeBootLog(`Memory V4 dual-write ready: ${memoryV4Reconciliation.mirroredCount}/${memoryV4Reconciliation.sourceCount} facts reconciled, ${memoryV4Reconciliation.deletedCount} tombstoned`)
         writeBootLog(`Memory V4 diff audit: ${(memoryV4Audit.consistency * 100).toFixed(4)}% exact, ${memoryV4Audit.issues.length} issues`)
       }
+      // Stage-four offline consolidation: rebuild session/day summaries in
+      // derivedArtifacts while the user is idle. Runs are idempotent, so an
+      // interrupted pass simply resumes on the next idle window. The idle pass
+      // first refreshes capacity tiering, archives a bounded batch of cold
+      // overflow facts and merges duplicate episodes, then consolidates
+      // summaries against the cleaned-up graph.
+      const tiering = createMemoryTieringService(v4Repository)
+      memoryV4ConsolidationRunner = createIdleConsolidationRunner({
+        service: createMemoryConsolidationService(v4Repository),
+        scope: localMemoryScope,
+        isIdle: () => app.isReady() && powerMonitor.getSystemIdleTime() >= MEMORY_CONSOLIDATION_IDLE_SECONDS,
+        intervalMs: 5 * 60_000,
+        cooldownMs: 30 * 60_000,
+        runOptions: { maxRuntimeMs: 10_000 },
+        onIdle: async () => {
+          const tieringReport = await tiering.run(localMemoryScope)
+          writeBootLog(`Memory V4 tiering: hot ${tieringReport.tierCounts.hot}, warm ${tieringReport.tierCounts.warm}, cold ${tieringReport.tierCounts.cold}, quarantine ${tieringReport.tierCounts.quarantine}, ${tieringReport.archiveCandidates.length} archive candidates`)
+          const archived = await tiering.archiveColdFacts(localMemoryScope, { maxArchives: 8 })
+          if (archived.archived.length > 0)
+            writeBootLog(`Memory V4 archived ${archived.archived.length} cold facts (${archived.failed.length} failed)`)
+          const dedup = mergeDuplicateEpisodes(v4Repository, localMemoryScope)
+          if (dedup.mergedEpisodes > 0)
+            writeBootLog(`Memory V4 episode dedup merged ${dedup.mergedEpisodes} duplicates (${dedup.migratedEvidence} evidence links migrated)`)
+        },
+        onError: error => writeBootLog(`Memory V4 idle consolidation failed: ${errorMessage(error)}`),
+      })
+      memoryV4ConsolidationRunner.start()
+      writeBootLog('Memory V4 idle consolidation runner started')
     }
     catch (error) {
       // V4 remains a shadow copy in stage two. Its failure must never disable
@@ -1213,6 +1274,7 @@ app.on('window-all-closed', () => {
 
 let memoryShutdownComplete = false
 app.on('before-quit', (event) => {
+  memoryV4ConsolidationRunner?.stop()
   if (!memoryShutdownComplete && (memory?.pendingCaptureCount() ?? 0) > 0) {
     event.preventDefault()
     void memory!.flushPendingCaptures()

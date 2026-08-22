@@ -17,7 +17,7 @@ const CARDINALITIES = ['single', 'multiple', 'set'] as const
 const POLARITIES = ['positive', 'negative', 'unknown'] as const
 const MODALITIES = ['asserted', 'planned', 'hypothetical', 'reported', 'inferred', 'unknown'] as const
 const OBJECT_TYPES = ['string', 'number', 'boolean', 'date', 'entity', 'json'] as const
-const WRITE_ACTIONS = ['ADD', 'MERGE_EVIDENCE', 'REFINE', 'SUPERSEDE', 'CONFLICT', 'NOOP', 'QUARANTINE', 'SUPPRESS', 'DELETE', 'PURGE', 'RESTORE'] as const
+const WRITE_ACTIONS = ['ADD', 'MERGE_EVIDENCE', 'REFINE', 'SUPERSEDE', 'CONFLICT', 'NOOP', 'QUARANTINE', 'SUPPRESS', 'DELETE', 'PURGE', 'RESTORE', 'ARCHIVE'] as const
 const CANDIDATE_STATUSES = ['pending', 'accepted', 'rejected', 'quarantined'] as const
 const FACT_STATUSES = ['active', 'superseded', 'conflicted', 'quarantined', 'expired', 'orphaned', 'archived', 'suppressed', 'deleted'] as const
 const VERIFICATION_STATES = ['verified', 'pending', 'legacy-unverified', 'rejected'] as const
@@ -25,9 +25,9 @@ const FACT_ORIGINS = ['automatic', 'manual', 'image'] as const
 const EVIDENCE_ROLES = ['supports', 'references', 'legacy-derived'] as const
 const EVIDENCE_STRENGTHS = ['direct', 'reference-only', 'legacy-derived'] as const
 const EPISODE_PROVENANCE = ['native-v4', 'v3-reference', 'v3-derived-record'] as const
-const DERIVED_KINDS = ['summary', 'graph-edge', 'embedding', 'retrieval-cache'] as const
+const DERIVED_KINDS = ['summary', 'graph-edge', 'embedding', 'retrieval-cache', 'tier-index'] as const
 const DERIVED_STATUSES = ['current', 'stale', 'deleted'] as const
-const DOMAIN_EVENT_TYPES = ['EPISODE_RECORDED', 'FACT_CREATED', 'FACT_VERSIONED', 'EVIDENCE_LINKED', 'EVIDENCE_UNLINKED', 'FACT_SUPPRESSED', 'FACT_DELETED', 'FACT_PURGED', 'FACT_RESTORED', 'DERIVED_ARTIFACT_STALE', 'V3_RECONCILED', 'CANDIDATE_REVIEWED', 'CANDIDATE_REPROCESSED'] as const
+const DOMAIN_EVENT_TYPES = ['EPISODE_RECORDED', 'FACT_CREATED', 'FACT_VERSIONED', 'EVIDENCE_LINKED', 'EVIDENCE_UNLINKED', 'FACT_SUPPRESSED', 'FACT_DELETED', 'FACT_PURGED', 'FACT_RESTORED', 'FACT_ARCHIVED', 'DERIVED_ARTIFACT_STALE', 'V3_RECONCILED', 'CANDIDATE_REVIEWED', 'CANDIDATE_REPROCESSED'] as const
 const DOMAIN_EVENT_ACTORS = ['system', 'user', 'migration'] as const
 
 export function assertMemoryV4Snapshot(value: unknown): asserts value is MemoryV4Snapshot {

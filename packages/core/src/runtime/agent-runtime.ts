@@ -1,8 +1,11 @@
 import type {
+  AdaptiveMemoryRecallResult,
   AgentContextPort,
   AgentForegroundStreamPort,
   AgentLLMPort,
   AgentMemoryPort,
+  MemoryEvidencePackEntry,
+  MemoryRecallFeedbackOutcome,
   MemoryScope,
   AgentSessionPort,
   AgentToolPort,
@@ -207,11 +210,16 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
 
     // Recall long-term memories relevant to this message.
     let memories
+    let adaptiveResult: AdaptiveMemoryRecallResult | undefined
     if (deps.memory) {
       try {
-        memories = options?.memoryTopK !== undefined || !deps.memory.recallAdaptive
-          ? await deps.memory.recall(userMessage, memoryScope, options?.memoryTopK ?? 5)
-          : (await deps.memory.recallAdaptive(userMessage, memoryScope)).memories
+        if (options?.memoryTopK !== undefined || !deps.memory.recallAdaptive) {
+          memories = await deps.memory.recall(userMessage, memoryScope, options?.memoryTopK ?? 5)
+        }
+        else {
+          adaptiveResult = await deps.memory.recallAdaptive(userMessage, memoryScope)
+          memories = adaptiveResult.memories
+        }
       }
       catch (err) {
         console.error('[deskpet] memory recall failed:', err)
@@ -242,6 +250,7 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
     const systemPrompt = buildSystemPrompt({
       persona: deps.persona.systemPrompt,
       memories,
+      evidencePack: adaptiveResult?.evidencePack,
       contexts: deps.context?.snapshot(),
       extra: deps.persona.extraInstructions,
     })
@@ -301,6 +310,10 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
       }
       appendSessionMessage(sessionId, assistantItem)
 
+      // Close the retrieval-feedback loop: citations [M#] in the answer mark
+      // injected memories as adopted; the rest are reported as ignored.
+      await reportMemoryRecallFeedback(deps.memory, userMessage, memoryScope, model, adaptiveResult, result.text)
+
       await hooks.emitAfterSendHooks(result.text, ctx)
       return result
     }
@@ -310,6 +323,131 @@ export function createAgentRuntime(deps: AgentRuntimeDeps) {
   }
 
   return { send, hooks }
+}
+
+/**
+ * Reports post-answer citation outcomes for injected memories. Bracketed ids
+ * such as [M1] in the final answer map to adopted; every other injected
+ * evidence entry is reported as ignored. Failures never break the chat turn.
+ */
+async function reportMemoryRecallFeedback(
+  memory: AgentMemoryPort | undefined,
+  query: string,
+  scope: MemoryScope,
+  model: string,
+  adaptiveResult: AdaptiveMemoryRecallResult | undefined,
+  answer: string,
+): Promise<void> {
+  const evidencePack = adaptiveResult?.evidencePack
+  if (!memory || !memory.reportRecallFeedback || !adaptiveResult || !evidencePack || evidencePack.length === 0)
+    return
+  const injected = new Set(adaptiveResult.injectedMemoryIds)
+  if (injected.size === 0)
+    return
+  const outcomes = classifyRecallFeedbackOutcomes(query, answer, adaptiveResult)
+  if (outcomes.length === 0)
+    return
+  try {
+    await memory.reportRecallFeedback({ query, scope, outcomes, answerModel: model })
+  }
+  catch (err) {
+    console.error('[deskpet] memory recall feedback failed:', err)
+  }
+}
+
+/**
+ * Conservative explicit-feedback classifier. It records at most one
+ * correction/denial per turn and only when a strong user cue uniquely matches
+ * an injected memory. Lack of a citation is never interpreted as denial.
+ */
+export function classifyRecallFeedbackOutcomes(
+  query: string,
+  answer: string,
+  adaptiveResult: AdaptiveMemoryRecallResult,
+): Array<{ memoryId: string; outcome: MemoryRecallFeedbackOutcome }> {
+  const evidencePack = adaptiveResult.evidencePack ?? []
+  const injected = new Set(adaptiveResult.injectedMemoryIds)
+  const cited = citedMemoryIds(answer, evidencePack)
+  const memories = new Map(adaptiveResult.memories.map(memory => [memory.id, memory]))
+  const explicitOutcome = explicitFeedbackOutcome(query)
+  let explicitMemoryId: string | undefined
+
+  if (explicitOutcome) {
+    const ranked = evidencePack
+      .filter(entry => injected.has(entry.memoryId))
+      .map((entry) => {
+        const memory = memories.get(entry.memoryId)
+        const overlap = memory ? feedbackOverlap(query, memory.content) : 0
+        const historicalBoost = entry.status === 'superseded' || entry.status === 'conflicted' ? 0.25 : 0
+        return { memoryId: entry.memoryId, score: overlap + historicalBoost }
+      })
+      .sort((left, right) => right.score - left.score || left.memoryId.localeCompare(right.memoryId))
+    const best = ranked[0]
+    const runnerUp = ranked[1]
+    const minimum = ranked.length === 1 ? 0.12 : 0.24
+    if (best && best.score >= minimum && (!runnerUp || best.score - runnerUp.score >= 0.12))
+      explicitMemoryId = best.memoryId
+  }
+
+  return evidencePack
+    .filter(entry => injected.has(entry.memoryId))
+    .map(entry => ({
+      memoryId: entry.memoryId,
+      outcome: entry.memoryId === explicitMemoryId
+        ? explicitOutcome!
+        : cited.has(entry.memoryId)
+          ? 'adopted'
+          : 'ignored',
+    }))
+}
+
+function citedMemoryIds(answer: string, evidencePack: MemoryEvidencePackEntry[]): Set<string> {
+  const byCitation = new Map(evidencePack.map(entry => [entry.citation.toUpperCase(), entry.memoryId]))
+  const ids = new Set<string>()
+  for (const match of answer.matchAll(/\[(M\d{1,3})\]/gi)) {
+    const memoryId = byCitation.get((match[1] ?? '').toUpperCase())
+    if (memoryId)
+      ids.add(memoryId)
+  }
+  return ids
+}
+
+function explicitFeedbackOutcome(query: string): 'corrected' | 'denied' | undefined {
+  const normalized = query.normalize('NFKC')
+  const correction = /(?:更正(?:为|成)?|改成|应该是|其实是|并非.{0,24}而是|不是.{0,24}而是|记错.{0,24}(?:应该|其实|是|为)|changed\s+to|should\s+be|actually\s+(?:it\s+)?is|not.{0,40}but)/iu
+  if (correction.test(normalized))
+    return 'corrected'
+  const denial = /(?:我(?:从来)?没(?:有)?说过|不是我的|这(?:条|个)记忆(?:不对|错了)|记错(?:了|啦)?|别再记|删除(?:这条|这个)?记忆|忘掉这条|never\s+said|not\s+mine|forget\s+that|that(?:'s|\s+is)\s+wrong)/iu
+  return denial.test(normalized) ? 'denied' : undefined
+}
+
+function feedbackOverlap(left: string, right: string): number {
+  const leftTokens = feedbackTokens(left)
+  const rightTokens = feedbackTokens(right)
+  if (leftTokens.size === 0 || rightTokens.size === 0)
+    return 0
+  let shared = 0
+  for (const token of leftTokens) {
+    if (rightTokens.has(token))
+      shared += 1
+  }
+  return shared / Math.min(leftTokens.size, rightTokens.size)
+}
+
+function feedbackTokens(value: string): Set<string> {
+  const normalized = value.normalize('NFKC').toLocaleLowerCase()
+  const tokens = new Set<string>()
+  for (const match of normalized.matchAll(/[a-z0-9@._+-]{2,}|[\p{Script=Han}]{2,}/gu)) {
+    const part = match[0]!
+    if (/^[\p{Script=Han}]+$/u.test(part)) {
+      for (let index = 0; index < part.length - 1; index += 1)
+        tokens.add(part.slice(index, index + 2))
+    }
+    else {
+      tokens.add(part)
+    }
+  }
+  return tokens
 }
 
 function buildMemoryCaptureContext(history: ChatHistoryItem[]): NonNullable<import('@deskpet/contracts').MemoryCapture['context']> {

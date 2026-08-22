@@ -58,6 +58,54 @@ export type {
   V4ShadowCapture,
   V4ShadowReconciliationResult,
   V4ShadowRetrieval,
+  V4ShadowRetrievalFeedback,
   V4ShadowWriter,
   V4ShadowWriterOptions,
 } from './dual-write/v4-shadow-writer'
+export {
+  MEMORY_CONSOLIDATION_SERVICE_VERSION,
+  MEMORY_DETERMINISTIC_SUMMARIZER_VERSION,
+  createDeterministicSummarizer,
+  createIdleConsolidationRunner,
+  createMemoryConsolidationService,
+} from './consolidation/memory-consolidation-service'
+export type {
+  ConsolidationBucket,
+  ConsolidationGranularity,
+  ConsolidationRunOptions,
+  ConsolidationRunReport,
+  ConsolidationScopeFilter,
+  ConsolidationStopReason,
+  ConsolidationSummarizer,
+  ConsolidationSummaryOutput,
+  IdleConsolidationRunner,
+  IdleConsolidationRunnerOptions,
+  MemoryConsolidationService,
+  MemoryConsolidationServiceOptions,
+} from './consolidation/memory-consolidation-service'
+export { MEMORY_EPISODE_DEDUP_VERSION, findDuplicateEpisodeGroups, mergeDuplicateEpisodes } from './consolidation/episode-dedup'
+export type {
+  EpisodeDedupGroup,
+  EpisodeDedupOptions,
+  EpisodeDedupReport,
+  EpisodeDedupScopeFilter,
+} from './consolidation/episode-dedup'
+export {
+  MEMORY_TIERING_SERVICE_VERSION,
+  assignTiers,
+  computeFactUtility,
+  createMemoryTieringService,
+} from './consolidation/memory-tiering-service'
+export type {
+  ArchiveColdFactsOptions,
+  ArchiveColdFactsReport,
+  FactUtilityBreakdown,
+  FactUtilitySignals,
+  MemoryTier,
+  MemoryTieringService,
+  MemoryTieringServiceOptions,
+  TierAssignmentView,
+  TierCapacityBudgets,
+  TieringOptions,
+  TieringRunReport,
+} from './consolidation/memory-tiering-service'

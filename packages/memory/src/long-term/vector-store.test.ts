@@ -631,6 +631,131 @@ describe('persistent vector store', () => {
     expect(items.filter(item => item.content.includes('爵士'))).toHaveLength(1)
     expect(items.filter(item => item.content.includes('香菜'))).toHaveLength(2)
   })
+
+  it('filters candidates to a parsed validity window for range queries', async () => {
+    const store = createVectorStore({
+      embeddingModel: 'test-v1',
+      minScore: 0,
+      embedder: temporalEmbedder,
+    })
+    const scope = { ownerId: 'window-range', agentId: 'deskpet' }
+    await store.remember('用户2023年住在北京', scope, {
+      kind: 'location', validFrom: Date.UTC(2023, 0, 1), validTo: Date.UTC(2024, 0, 1),
+    })
+    await store.remember('用户2025年住在上海', scope, {
+      kind: 'location', validFrom: Date.UTC(2025, 0, 1),
+    })
+
+    const result = await store.recallAdaptive('2023年到2024年我在哪里住', scope)
+    expect(result.memories.map(item => item.content)).toEqual(['用户2023年住在北京'])
+  })
+
+  it('abstains from injecting weakly related personal memories', async () => {
+    const store = createVectorStore({
+      embeddingModel: 'test-v1',
+      minScore: 0,
+      embedder: testEmbedder,
+    })
+    const scope = { ownerId: 'abstain-weak', agentId: 'deskpet' }
+    await store.remember('Alice likes coffee', scope)
+
+    const result = await store.recallAdaptive('我的宠物叫什么名字', scope)
+    expect(result.memories).toEqual([])
+    expect(result.stopReason).toBe('abstain-low-confidence')
+    expect(result.abstention?.abstained).toBe(true)
+    expect(result.abstention?.version).toBe('abstention-threshold-calibration-v2:policy-fallback')
+  })
+
+  it('returns a citation evidence pack for injected memories', async () => {
+    const store = createVectorStore({
+      embeddingModel: 'test-v1',
+      minScore: 0,
+      embedder: testEmbedder,
+    })
+    const scope = { ownerId: 'evidence-pack', agentId: 'deskpet' }
+    await store.remember('用户姓名/名字：小秦', scope, { kind: 'identity', importance: 1 })
+
+    const result = await store.recallAdaptive('我叫什么名字？', scope)
+    expect(result.memories).toHaveLength(1)
+    expect(result.evidencePack?.map(entry => entry.citation)).toEqual(['M1'])
+    expect(result.evidencePack?.[0]?.memoryId).toBe(result.memories[0]?.id)
+    expect(result.evidencePack?.[0]?.sourceType).toBeDefined()
+    expect(result.abstention?.abstained).toBe(false)
+  })
+
+  it('recalls superseded history through the correction route', async () => {
+    const store = createVectorStore({
+      embeddingModel: 'test-v1',
+      minScore: 0,
+      embedder: testEmbedder,
+    })
+    const scope = { ownerId: 'correction-route', agentId: 'deskpet' }
+    const phoneMetadata = {
+      kind: 'identity', memoryKey: 'profile.phone', cardinality: 'single' as const,
+      confidence: 0.95, importance: 1,
+    }
+    await store.remember('用户手机号：13800000000', scope, phoneMetadata)
+    await store.remember('用户手机号：13900000000', scope, phoneMetadata)
+    const listed = await store.list(scope)
+    expect(listed.filter(item => item.status === 'superseded')).toHaveLength(1)
+
+    const result = await store.recallAdaptive('我不是说过我的手机号换了吗，以前的是什么', scope)
+    expect(result.memories.some(item => item.content.includes('13800000000'))).toBe(true)
+    expect(result.memories.some(item => item.status === 'superseded')).toBe(true)
+  })
+
+  it('recalls same-episode neighbours through the episode route', async () => {
+    const store = createVectorStore({
+      embeddingModel: 'test-v1',
+      minScore: 0,
+      embedder: episodeEmbedder,
+    })
+    const scope = { ownerId: 'episode-route', agentId: 'deskpet' }
+    await store.remember('用户喜欢拿铁咖啡', scope, { sourceMessageIds: ['msg-42'] })
+    await store.remember('用户提到周末要去爬山锻炼', scope, { sourceMessageIds: ['msg-42'] })
+    await store.remember('用户讨厌下雨天', scope, { sourceMessageIds: ['msg-99'] })
+
+    const result = await store.recallAdaptive('我们上次聊过的咖啡偏好是什么', scope)
+    expect(result.retrievalRoutes).toContain('episode')
+    expect(result.routeCandidateCounts?.episode).toBeGreaterThanOrEqual(2)
+
+    // The hiking fact has no textual or semantic overlap with the query and
+    // only enters through the shared source message.
+    const neighbours = await store.recall('我们上次聊过的咖啡偏好是什么', scope, 5)
+    expect(neighbours.some(item => item.content.includes('爬山'))).toBe(true)
+    expect(neighbours.every(item => !item.content.includes('下雨天'))).toBe(true)
+
+    const plain = await store.recall('哪种咖啡是我的最爱', scope, 5)
+    expect(plain.some(item => item.content.includes('爬山'))).toBe(false)
+  })
+
+  it('exposes a two-hop supersedes chain in the evidence pack conflict group', async () => {
+    const store = createVectorStore({
+      embeddingModel: 'test-v1',
+      minScore: 0,
+      embedder: phoneChainEmbedder,
+    })
+    const scope = { ownerId: 'two-hop-chain', agentId: 'deskpet' }
+    const phoneMetadata = {
+      kind: 'identity', memoryKey: 'profile.phone', cardinality: 'single' as const,
+      confidence: 0.95, importance: 1,
+    }
+    // Version chain: 137… (oldest, no 手机号 token overlap) ← 138… ← 139… (current).
+    await store.remember('联系方式：13700000000', scope, phoneMetadata)
+    await store.remember('用户手机号：13800000000', scope, phoneMetadata)
+    await store.remember('用户手机号：13900000000', scope, phoneMetadata)
+    const listed = await store.list(scope)
+    expect(listed.filter(item => item.status === 'superseded')).toHaveLength(2)
+    const oldest = listed.find(item => item.content.includes('13700000000'))
+    expect(oldest).toBeDefined()
+
+    const result = await store.recallAdaptive('我不是说过我的手机号换了吗，以前的是什么', scope)
+    // The oldest version is outside the ranked pool (no query overlap), yet its
+    // id must still be offered for down-drill through the restricted second hop.
+    const conflictIds = result.evidencePack?.flatMap(entry => entry.conflictGroupIds ?? []) ?? []
+    expect(conflictIds).toContain(oldest!.id)
+    expect(result.memories.some(item => item.id === oldest!.id)).toBe(false)
+  })
 })
 
 function temporaryFile(): string {
@@ -662,6 +787,14 @@ async function temporalEmbedder(text: string): Promise<number[]> {
   if (text.includes('上海') || text.includes('当前') || text.includes('现在'))
     return [0, 1, 0]
   return [0, 0, 1]
+}
+
+async function episodeEmbedder(text: string): Promise<number[]> {
+  return /咖啡|拿铁/.test(text) ? [1, 0] : [0, 1]
+}
+
+async function phoneChainEmbedder(text: string): Promise<number[]> {
+  return text.includes('手机') ? [1, 0] : [0, 1]
 }
 
 function createTestVector(text: string): number[] {

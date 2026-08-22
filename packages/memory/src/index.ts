@@ -89,6 +89,19 @@ export type {
   MemoryCalibrationStatus,
   MemoryConfidenceCalibrator,
 } from './long-term/confidence-calibration'
+export {
+  DEFAULT_RECALL_ABSTENTION_CALIBRATION,
+  MEMORY_ABSTENTION_CALIBRATION_VERSION,
+  calibrateRecallAbstention,
+  evaluateRecallAbstentionCalibration,
+  fitRecallAbstentionCalibration,
+} from './long-term/abstention-calibration'
+export type {
+  FitRecallAbstentionCalibrationOptions,
+  RecallAbstentionCalibrationMetrics,
+  RecallAbstentionCalibrationModel,
+  RecallAbstentionCalibrationSample,
+} from './long-term/abstention-calibration'
 export { planTemporalQuery } from './long-term/temporal-query'
 export type { TemporalQueryPlan } from './long-term/temporal-query'
 export { isBroadPersonalMemoryQuery, selectAdaptiveRecall } from './long-term/adaptive-recall'
@@ -117,6 +130,19 @@ export type {
   MemoryStage3RetrievalEvalReport,
   MemoryStage3RetrievalMetrics,
 } from './eval/stage3-retrieval-eval'
+export {
+  MEMORY_STAGE3_BLIND_SCHEMA_VERSION,
+  assembleMemoryStage3BlindCases,
+  fingerprintMemoryStage3BlindCasePack,
+} from './eval/stage3-blind-eval'
+export type {
+  MemoryStage3BlindAssembled,
+  MemoryStage3BlindCase,
+  MemoryStage3BlindCasePack,
+  MemoryStage3BlindFact,
+  MemoryStage3BlindLabel,
+  MemoryStage3BlindLabelPack,
+} from './eval/stage3-blind-eval'
 export type {
   MemoryStage2BlindCase,
   MemoryStage2BlindCasePack,

@@ -1,4 +1,10 @@
-import type { AgentMemoryPort, MemoryCapture, MemoryScope, MemorySourceSyncResult } from '@deskpet/contracts'
+import type {
+  AgentMemoryPort,
+  MemoryCapture,
+  MemoryRecallFeedbackReport,
+  MemoryScope,
+  MemorySourceSyncResult,
+} from '@deskpet/contracts'
 import type { V3MemoryRecord, VectorStore } from './vector-store'
 import { extractMemoryCandidates, isSafeMemoryContent } from './memory-extractor'
 import type { MemoryCandidate, MemoryExtractor } from './memory-extractor'
@@ -37,6 +43,9 @@ export interface MemoryWriterOptions {
   onCaptureObserverError?: (error: unknown, commit: MemoryCaptureCommit) => void
   onSourcesUnlinked?: (commit: MemorySourceUnlinkCommit) => void
   onSourceUnlinkObserverError?: (error: unknown, commit: MemorySourceUnlinkCommit) => void
+  /** Post-answer observer used by the V4 shadow to close the adopted/corrected/denied loop. */
+  onRecallFeedback?: (report: MemoryRecallFeedbackReport) => void
+  onRecallFeedbackObserverError?: (error: unknown, report: MemoryRecallFeedbackReport) => void
   /** Maximum characters extracted synchronously per segment. */
   maximumSegmentCharacters?: number
   /** Queue backpressure threshold. Overflow waits for the current queue instead of being dropped. */
@@ -58,6 +67,8 @@ export function createMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
     onCaptureObserverError,
     onSourcesUnlinked,
     onSourceUnlinkObserverError,
+    onRecallFeedback,
+    onRecallFeedbackObserverError,
   } = options
   const maximumQueuedSegments = Math.max(1, Math.floor(options.maximumQueuedSegments ?? 64))
   let pendingCaptureSegments = 0
@@ -192,6 +203,32 @@ export function createMemoryWriter(options: MemoryWriterOptions): MemoryWriter {
     },
     clear: store.clear,
     count: store.count,
+    async reportRecallFeedback(report: MemoryRecallFeedbackReport): Promise<void> {
+      const outcomes = report.outcomes
+        .filter(entry => !!entry && typeof entry.memoryId === 'string' && entry.memoryId.trim())
+      if (!onRecallFeedback || outcomes.length === 0)
+        return
+      const normalized: MemoryRecallFeedbackReport = {
+        query: report.query,
+        scope: report.scope,
+        outcomes: outcomes.map(entry => ({
+          memoryId: entry.memoryId.trim(),
+          outcome: entry.outcome,
+        })),
+        ...(report.answerModel ? { answerModel: report.answerModel } : {}),
+      }
+      try {
+        onRecallFeedback(normalized)
+      }
+      catch (error) {
+        try {
+          onRecallFeedbackObserverError?.(error, normalized)
+        }
+        catch {
+          // Feedback diagnostics must never fail the finished answer turn.
+        }
+      }
+    },
     async capture(turn, scope): Promise<number> {
       const plan = planMemoryCapture(turn, options.maximumSegmentCharacters)
       if (plan.length === 0)

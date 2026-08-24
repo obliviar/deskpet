@@ -96,6 +96,21 @@ export {
   computeFactUtility,
   createMemoryTieringService,
 } from './consolidation/memory-tiering-service'
+export {
+  MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION,
+  MEMORY_V4_SHADOW_RETRIEVER_VERSION,
+  createMemoryV4ShadowRetriever,
+  createV3V4ShadowComparator,
+} from './retrieval/memory-v4-shadow-retriever'
+export type {
+  MemoryV4ShadowRecallHit,
+  MemoryV4ShadowRecallOptions,
+  MemoryV4ShadowRecallResult,
+  MemoryV4ShadowRetriever,
+  V3V4ShadowComparator,
+  V3V4ShadowComparison,
+  V3V4ShadowComparisonStatus,
+} from './retrieval/memory-v4-shadow-retriever'
 export type {
   ArchiveColdFactsOptions,
   ArchiveColdFactsReport,

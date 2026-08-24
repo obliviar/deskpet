@@ -8,10 +8,10 @@ import type {
 } from '../domain/types'
 import type { MemoryV4Repository } from '../repository/memory-v4-repository'
 
-export const MEMORY_CONSOLIDATION_SERVICE_VERSION = 'memory-consolidation-v1'
-export const MEMORY_DETERMINISTIC_SUMMARIZER_VERSION = 'deterministic-summarizer-v1'
+export const MEMORY_CONSOLIDATION_SERVICE_VERSION = 'memory-consolidation-v2'
+export const MEMORY_DETERMINISTIC_SUMMARIZER_VERSION = 'deterministic-summarizer-v2'
 
-export type ConsolidationGranularity = 'session' | 'day'
+export type ConsolidationGranularity = 'session' | 'day' | 'topic' | 'entity' | 'stage'
 
 /** One consolidation unit: the episodes and facts that a summary must cover. */
 export interface ConsolidationBucket {
@@ -327,9 +327,14 @@ export function createDeterministicSummarizer(): ConsolidationSummarizer {
     const anchors = [...grouped.entries()]
       .map(([key, values]) => `${key}=${[...new Set(values)].join(' | ')}`)
       .sort()
-    const label = bucket.granularity === 'session'
-      ? `会话 ${bucket.bucketKey}`
-      : `日期 ${bucket.bucketKey}`
+    const labels: Record<ConsolidationGranularity, string> = {
+      session: '会话',
+      day: '日期',
+      topic: '主题',
+      entity: '实体',
+      stage: '阶段',
+    }
+    const label = `${labels[bucket.granularity]} ${bucket.bucketKey}`
     const recorded = bucket.episodes.map(episode => episode.recordedAt)
     const range = recorded.length > 0
       ? `${new Date(Math.min(...recorded)).toISOString()} ~ ${new Date(Math.max(...recorded)).toISOString()}`
@@ -465,16 +470,54 @@ function collectBuckets(
 ): ConsolidationBucket[] {
   const factsById = new Map(snapshot.facts.map(fact => [fact.id, fact]))
   const factIdsByEpisode = new Map<string, Set<string>>()
+  const episodesByFact = new Map<string, MemoryEpisodeV4[]>()
+  const episodesById = new Map(snapshot.episodes.map(episode => [episode.id, episode]))
   for (const link of snapshot.evidenceLinks) {
     if (!link.active)
       continue
     const ids = factIdsByEpisode.get(link.episodeId) ?? new Set<string>()
     ids.add(link.factId)
     factIdsByEpisode.set(link.episodeId, ids)
+    const episode = episodesById.get(link.episodeId)
+    if (episode && episode.contentState !== 'deleted') {
+      const evidence = episodesByFact.get(link.factId) ?? []
+      if (!evidence.some(item => item.id === episode.id))
+        evidence.push(episode)
+      episodesByFact.set(link.factId, evidence)
+    }
   }
 
   const buckets = new Map<string, ConsolidationBucket>()
   for (const granularity of granularities) {
+    if (granularity === 'topic' || granularity === 'entity' || granularity === 'stage') {
+      for (const fact of snapshot.facts) {
+        if (fact.status !== 'active' || !matchesScopeFilter(fact.scope, filter))
+          continue
+        const evidence = (episodesByFact.get(fact.id) ?? [])
+          .filter(episode => matchesScopeFilter(episode.scope, filter))
+        // A summary is a derived navigation aid, never a source of truth. Do
+        // not create one when the fact has no live evidence to down-drill to.
+        if (evidence.length === 0)
+          continue
+        const bucketScope = { ownerId: fact.scope.ownerId, agentId: fact.scope.agentId }
+        const bucketKey = hierarchicalBucketKey(granularity, fact)
+        const mapKey = `${granularity}\0${scopeKey(bucketScope)}\0${bucketKey}`
+        const bucket: ConsolidationBucket = buckets.get(mapKey) ?? {
+          granularity,
+          bucketKey,
+          scope: bucketScope,
+          episodes: [],
+          facts: [],
+        }
+        bucket.facts.push(fact)
+        for (const episode of evidence) {
+          if (!bucket.episodes.some(item => item.id === episode.id))
+            bucket.episodes.push(episode)
+        }
+        buckets.set(mapKey, bucket)
+      }
+      continue
+    }
     for (const episode of snapshot.episodes) {
       if (episode.contentState === 'deleted' || !matchesScopeFilter(episode.scope, filter))
         continue
@@ -524,7 +567,13 @@ function indexSummaries(
 
 /** The granularity is encoded in the stable artifact id namespace. */
 function summaryGranularity(artifact: MemoryDerivedArtifactV4): ConsolidationGranularity {
-  return artifact.id.startsWith('consolidation-summary:session:') ? 'session' : 'day'
+  for (const granularity of ALL_GRANULARITIES) {
+    if (artifact.id.startsWith(`consolidation-summary:${granularity}:`))
+      return granularity
+  }
+  // Pre-v2 artifacts only used session/day. Treat an unknown legacy namespace
+  // as day so it can still be discovered and pruned rather than leaked.
+  return 'day'
 }
 
 function summaryArtifactId(bucket: ConsolidationBucket): string {
@@ -549,9 +598,26 @@ function scopeCanContain(container: MemoryV4Scope, contained: MemoryV4Scope): bo
 
 function normalizeGranularities(value?: readonly ConsolidationGranularity[]): ConsolidationGranularity[] {
   const granularities = [...new Set(value ?? ['session', 'day'] as const)]
-  if (granularities.length === 0 || granularities.some(item => item !== 'session' && item !== 'day'))
-    throw new Error('Consolidation granularity must be a non-empty subset of session and day')
+  if (granularities.length === 0 || granularities.some(item => !ALL_GRANULARITIES.includes(item)))
+    throw new Error('Consolidation granularity must be a non-empty subset of session, day, topic, entity and stage')
   return granularities
+}
+
+const ALL_GRANULARITIES: readonly ConsolidationGranularity[] = [
+  'session', 'day', 'topic', 'entity', 'stage',
+]
+
+function hierarchicalBucketKey(
+  granularity: 'topic' | 'entity' | 'stage',
+  fact: MemoryFactV4,
+): string {
+  if (granularity === 'entity')
+    return fact.subjectId
+  if (granularity === 'stage')
+    return utcQuarterKey(fact.validFrom ?? fact.recordedAt)
+  const candidate = (fact.memoryKey || fact.predicate || 'general').normalize('NFKC').toLocaleLowerCase()
+  const segment = candidate.split(/[.:/\\\s_-]+/u).find(Boolean)
+  return segment || 'general'
 }
 
 function summarizerVersion(summarizer: ConsolidationSummarizer): string {
@@ -572,6 +638,11 @@ function sameMembers(left: readonly string[], right: readonly string[]): boolean
 
 function utcDayKey(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(0, 10)
+}
+
+function utcQuarterKey(timestamp: number): string {
+  const date = new Date(timestamp)
+  return `${date.getUTCFullYear()}-Q${Math.floor(date.getUTCMonth() / 3) + 1}`
 }
 
 function clampInteger(value: number, minimum: number, maximum: number): number {

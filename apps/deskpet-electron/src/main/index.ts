@@ -14,6 +14,8 @@ import {
   createMemoryConsolidationService,
   createMemoryTieringService,
   createMemoryV4LifecycleService,
+  createMemoryV4ShadowRetriever,
+  createV3V4ShadowComparator,
   mergeDuplicateEpisodes,
   createMemoryCandidateReviewService,
   createMemoryEmbeddingIndex,
@@ -41,6 +43,8 @@ import type {
   MemoryCandidateReviewService,
   MemoryEmbeddingIndex,
   MemoryV4Repository,
+  MemoryV4ShadowRetriever,
+  V3V4ShadowComparator,
   VectorStore,
   V4ShadowWriter,
 } from '@deskpet/memory'
@@ -269,6 +273,8 @@ let memoryV4Lifecycle: MemoryV4LifecycleService | undefined
 let memoryCandidateReview: MemoryCandidateReviewService | undefined
 let memoryV4Persistence: JournaledV4Persistence | undefined
 let memoryV4ConsolidationRunner: IdleConsolidationRunner | undefined
+let memoryV4ShadowRetriever: MemoryV4ShadowRetriever | undefined
+let memoryV4ShadowComparator: V3V4ShadowComparator = createV3V4ShadowComparator()
 let memoryStore: VectorStore | undefined
 let memoryV4Error = ''
 let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
@@ -396,6 +402,8 @@ function initializeMemory(): void {
   memoryV4Lifecycle = undefined
   memoryV4ConsolidationRunner?.stop()
   memoryV4ConsolidationRunner = undefined
+  memoryV4ShadowRetriever = undefined
+  memoryV4ShadowComparator = createV3V4ShadowComparator()
   memoryCandidateReview = undefined
   memoryV4Persistence = undefined
   memoryStore = undefined
@@ -534,6 +542,7 @@ function initializeMemory(): void {
       })
       const v4Repository = createMemoryV4Repository({ persistence: v4Persistence })
       memoryV4Repository = v4Repository
+      memoryV4ShadowRetriever = createMemoryV4ShadowRetriever(v4Repository)
       memoryV4Lifecycle = createMemoryV4LifecycleService(v4Repository)
       memoryCandidateReview = createMemoryCandidateReviewService(v4Repository)
       memoryV4Persistence = v4Persistence
@@ -562,7 +571,8 @@ function initializeMemory(): void {
         writeBootLog(`Memory V4 dual-write ready: ${memoryV4Reconciliation.mirroredCount}/${memoryV4Reconciliation.sourceCount} facts reconciled, ${memoryV4Reconciliation.deletedCount} tombstoned`)
         writeBootLog(`Memory V4 diff audit: ${(memoryV4Audit.consistency * 100).toFixed(4)}% exact, ${memoryV4Audit.issues.length} issues`)
       }
-      // Stage-four offline consolidation: rebuild session/day summaries in
+      // Stage-four offline consolidation: rebuild session/day/topic/entity/
+      // temporal-stage summaries in
       // derivedArtifacts while the user is idle. Runs are idempotent, so an
       // interrupted pass simply resumes on the next idle window. The idle pass
       // first refreshes capacity tiering, archives a bounded batch of cold
@@ -575,7 +585,10 @@ function initializeMemory(): void {
         isIdle: () => app.isReady() && powerMonitor.getSystemIdleTime() >= MEMORY_CONSOLIDATION_IDLE_SECONDS,
         intervalMs: 5 * 60_000,
         cooldownMs: 30 * 60_000,
-        runOptions: { maxRuntimeMs: 10_000 },
+        runOptions: {
+          granularity: ['session', 'day', 'topic', 'entity', 'stage'],
+          maxRuntimeMs: 10_000,
+        },
         onIdle: async () => {
           const tieringReport = await tiering.run(localMemoryScope)
           writeBootLog(`Memory V4 tiering: hot ${tieringReport.tierCounts.hot}, warm ${tieringReport.tierCounts.warm}, cold ${tieringReport.tierCounts.cold}, quarantine ${tieringReport.tierCounts.quarantine}, ${tieringReport.archiveCandidates.length} archive candidates`)
@@ -620,6 +633,36 @@ function isStageOneV4Shadow(snapshot: ReturnType<ReturnType<typeof createMemoryV
   return empty || migrationOnly
 }
 
+function scheduleV4ShadowComparison(
+  query: string,
+  scope: { ownerId: string; agentId?: string; sessionId?: string },
+  v3RetrievedIds: readonly string[],
+  v3InjectedIds: readonly string[],
+): void {
+  const retriever = memoryV4ShadowRetriever
+  if (!retriever)
+    return
+  // Run after the V3 result has been selected. This task never blocks prompt
+  // construction and its result is never exposed to the answer model.
+  setImmediate(() => {
+    try {
+      const v4 = retriever.recall(query, {
+        scope,
+        limit: Math.max(1, Math.min(50, v3RetrievedIds.length || 10)),
+        sharePolicies: ['allow-remote'],
+        sensitivities: memorySettings.remotePolicy === 'allow-private'
+          ? ['normal', 'private']
+          : ['normal'],
+      })
+      memoryV4ShadowComparator.compare(query, v3RetrievedIds, v3InjectedIds, v4)
+    }
+    catch (error) {
+      memoryV4ShadowComparator.recordFailure(query, error)
+      writeBootLog(`Memory V4 shadow read comparison failed: ${errorMessage(error)}`)
+    }
+  })
+}
+
 function memoryForRemoteRuntime() {
   if (!memory)
     return undefined
@@ -643,6 +686,7 @@ function memoryForRemoteRuntime() {
         queryType: 'fixed',
         answerModel: apiConfig.model,
       })
+      scheduleV4ShadowComparison(query, scope, recalled.map(item => item.id), recalled.map(item => item.id))
       return recalled
     },
     async recallAdaptive(query: string, scope: Parameters<typeof localMemory.recall>[1]) {
@@ -667,6 +711,7 @@ function memoryForRemoteRuntime() {
         queryType: 'adaptive',
         answerModel: apiConfig.model,
       })
+      scheduleV4ShadowComparison(query, scope, recalled.retrievedMemoryIds, recalled.injectedMemoryIds)
       return recalled
     },
   }
@@ -949,6 +994,11 @@ function setupIPC() {
       error: memoryV4Error,
       killSwitchEnabled: !config.memoryV4ShadowEnabled,
       audit: memoryV4Audit,
+      shadowRead: {
+        index: memoryV4ShadowRetriever?.indexStatus(),
+        comparison: memoryV4ShadowComparator.status(),
+        authoritativeAnswerSource: 'v3',
+      },
     },
     settings: memorySettings,
     semantic: {
@@ -980,6 +1030,11 @@ function setupIPC() {
       error: memoryV4Error,
       killSwitchEnabled: !config.memoryV4ShadowEnabled,
       audit: memoryV4Audit,
+      shadowRead: {
+        index: memoryV4ShadowRetriever?.indexStatus(),
+        comparison: memoryV4ShadowComparator.status(),
+        authoritativeAnswerSource: 'v3',
+      },
     },
     settings: memorySettings,
     semantic: {

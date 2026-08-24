@@ -79,6 +79,24 @@ describe('memory consolidation service', () => {
     expect(() => assertMemoryV4Snapshot(repository.snapshot())).not.toThrow()
   })
 
+  it('builds topic, entity and temporal-stage summaries as traceable navigation layers', async () => {
+    const repository = await seedTwoSessions()
+    const service = createMemoryConsolidationService(repository)
+
+    const report = await service.consolidate(scope, {
+      granularity: ['session', 'day', 'topic', 'entity', 'stage'],
+    })
+
+    expect(report.built).toBe(7)
+    const summaries = service.listSummaries(scope)
+    expect(summaries.filter(item => item.id.startsWith('consolidation-summary:topic:'))).toHaveLength(2)
+    expect(summaries.filter(item => item.id.startsWith('consolidation-summary:entity:'))).toHaveLength(1)
+    expect(summaries.filter(item => item.id.startsWith('consolidation-summary:stage:'))).toHaveLength(1)
+    expect(summaries.map(item => item.content ?? '').join('\n')).toContain('[阶段 ')
+    expect(summaries.every(item => item.sourceFactIds.length > 0 && item.sourceEpisodeIds.length > 0)).toBe(true)
+    expect(() => assertMemoryV4Snapshot(repository.snapshot())).not.toThrow()
+  })
+
   it('is idempotent: a second pass skips every current bucket', async () => {
     const repository = await seedTwoSessions()
     const service = createMemoryConsolidationService(repository)

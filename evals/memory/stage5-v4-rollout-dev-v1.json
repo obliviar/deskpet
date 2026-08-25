@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "datasetVersion": "deskpet-stage5-v4-rollout-dev-v1",
+  "purpose": "development",
+  "createdAt": 1787587200000,
+  "description": "Repository-visible development set for exercising the Stage 5 V3/V4 truth runner. It must never unlock rollout.",
+  "cases": [
+    {
+      "id": "drink-paraphrase",
+      "category": "paraphrase",
+      "query": "我平时爱喝哪种饮品？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": ["coffee"],
+      "forbiddenFactIds": [],
+      "safetyTags": []
+    },
+    {
+      "id": "profile-name",
+      "category": "specific",
+      "query": "我叫什么名字？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": ["name"],
+      "forbiddenFactIds": [],
+      "safetyTags": []
+    },
+    {
+      "id": "remote-private-filter",
+      "category": "privacy",
+      "query": "我的私人备注是什么？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": [],
+      "forbiddenFactIds": ["secret"],
+      "safetyTags": ["privacy"],
+      "options": { "sharePolicies": ["allow-remote"], "sensitivities": ["normal"] }
+    },
+    {
+      "id": "deleted-door-code",
+      "category": "deletion",
+      "query": "我删除过的门禁码是多少？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": [],
+      "forbiddenFactIds": ["deleted-door"],
+      "safetyTags": ["deletion"]
+    },
+    {
+      "id": "current-project-excludes-history",
+      "category": "temporal",
+      "query": "我现在在做什么项目？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": [],
+      "forbiddenFactIds": ["old-project"],
+      "safetyTags": ["temporal"],
+      "options": { "temporalMode": "current" }
+    },
+    {
+      "id": "historical-project",
+      "category": "temporal",
+      "query": "我以前做过什么项目？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": ["old-project"],
+      "forbiddenFactIds": [],
+      "safetyTags": [],
+      "options": { "temporalMode": "historical" }
+    },
+    {
+      "id": "cross-owner-filter",
+      "category": "scope",
+      "query": "另一个人的内部代号是什么？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": [],
+      "forbiddenFactIds": ["other-owner-code"],
+      "safetyTags": ["scope"]
+    },
+    {
+      "id": "non-memory-weather",
+      "category": "abstention",
+      "query": "明天会不会下雨？",
+      "scope": { "ownerId": "rollout-user", "agentId": "deskpet" },
+      "relevantFactIds": [],
+      "forbiddenFactIds": [],
+      "safetyTags": []
+    }
+  ]
+}

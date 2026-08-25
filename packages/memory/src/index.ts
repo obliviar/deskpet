@@ -131,6 +131,37 @@ export type {
   MemoryStage3RetrievalMetrics,
 } from './eval/stage3-retrieval-eval'
 export {
+  DEFAULT_MEMORY_V4_ROLLOUT_GATE_POLICY,
+  MEMORY_STAGE5_V4_ROLLOUT_DATASET_SCHEMA_VERSION,
+  MEMORY_STAGE5_V4_ROLLOUT_EVAL_VERSION,
+  MEMORY_STAGE5_V4_ROLLOUT_GATE_VERSION,
+  MEMORY_STAGE5_V4_ROLLOUT_TRANSITION_VERSION,
+  evaluateMemoryV4RolloutGate,
+  fingerprintMemoryV4RolloutDataset,
+  parseMemoryV4RolloutDataset,
+  recommendMemoryV4RolloutTransition,
+  runMemoryV4RolloutEvaluation,
+} from './eval/stage5-v4-rollout-eval'
+export type {
+  MemoryV4RolloutDataset,
+  MemoryV4RolloutDatasetPurpose,
+  MemoryV4RolloutEvalCase,
+  MemoryV4RolloutEvaluationReport,
+  MemoryV4RolloutGateCheck,
+  MemoryV4RolloutGateDecision,
+  MemoryV4RolloutGatePolicy,
+  MemoryV4RolloutGateReport,
+  MemoryV4RolloutProportionInterval,
+  MemoryV4RolloutQuery,
+  MemoryV4RolloutRetrievalResult,
+  MemoryV4RolloutRetrievalStrategy,
+  MemoryV4RolloutSafetyTag,
+  MemoryV4RolloutStage,
+  MemoryV4RolloutStrategyMetrics,
+  MemoryV4RolloutStrategyReport,
+  MemoryV4RolloutTransition,
+} from './eval/stage5-v4-rollout-eval'
+export {
   MEMORY_STAGE3_BLIND_SCHEMA_VERSION,
   assembleMemoryStage3BlindCases,
   fingerprintMemoryStage3BlindCasePack,

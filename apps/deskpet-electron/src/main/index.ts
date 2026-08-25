@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, desktopCapturer, powerMonitor, safeStorage, shell } from 'electron'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createHmac, randomBytes } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 
 import { createAgentRuntime, createSessionManager, createChatHooks } from '@deskpet/core'
@@ -15,6 +16,8 @@ import {
   createMemoryTieringService,
   createMemoryV4LifecycleService,
   createMemoryV4ShadowRetriever,
+  createMemoryV4ShadowEvaluationStore,
+  createMemoryV4ShadowTaskQueue,
   createV3V4ShadowComparator,
   mergeDuplicateEpisodes,
   createMemoryCandidateReviewService,
@@ -43,7 +46,9 @@ import type {
   MemoryCandidateReviewService,
   MemoryEmbeddingIndex,
   MemoryV4Repository,
+  MemoryV4ShadowEvaluationStore,
   MemoryV4ShadowRetriever,
+  MemoryV4ShadowTaskQueue,
   V3V4ShadowComparator,
   VectorStore,
   V4ShadowWriter,
@@ -275,6 +280,16 @@ let memoryV4Persistence: JournaledV4Persistence | undefined
 let memoryV4ConsolidationRunner: IdleConsolidationRunner | undefined
 let memoryV4ShadowRetriever: MemoryV4ShadowRetriever | undefined
 let memoryV4ShadowComparator: V3V4ShadowComparator = createV3V4ShadowComparator()
+interface MemoryV4ShadowComparisonTask {
+  query: string
+  scope: { ownerId: string; agentId?: string; sessionId?: string }
+  v3RetrievedIds: readonly string[]
+  v3InjectedIds: readonly string[]
+}
+let memoryV4ShadowEvaluationPersistence: EncryptedMemoryPersistence | undefined
+let memoryV4ShadowEvaluationStore: MemoryV4ShadowEvaluationStore | undefined
+let memoryV4ShadowTaskQueue: MemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTask> | undefined
+let memoryV4ShadowEvaluationError = ''
 let memoryStore: VectorStore | undefined
 let memoryV4Error = ''
 let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
@@ -291,6 +306,8 @@ const memoryV4StoragePath = join(userDataDir, 'memory-v4.enc')
 const memoryV4BackupPath = join(userDataDir, 'memory-v4.enc.backup')
 const memoryV4JournalPath = join(userDataDir, 'memory-v4.enc.journal')
 const memoryV4KeyPath = join(userDataDir, 'memory-v4-key.json')
+const memoryV4ShadowEvaluationPath = join(userDataDir, 'memory-v4-shadow-eval.enc')
+const memoryV4ShadowEvaluationKeyPath = join(userDataDir, 'memory-v4-shadow-eval-key.json')
 let semanticModelProgress: SemanticModelProgress = { status: 'idle' }
 let semanticPreparationPromise: Promise<void> | undefined
 let imageMemoryProgress: { status: string; progress?: number } = { status: 'idle' }
@@ -387,12 +404,37 @@ function createConfiguredMemoryExtractor(): MemoryExtractor {
   }
 }
 
+function createV4ShadowQueryHasher(): (query: string) => string {
+  const slot = 'memory-v4-shadow-eval-hmac-key'
+  const stored = persist.loadJson<{ version?: unknown; protectedKey?: unknown }>(slot, {})
+  let key: Buffer
+  if (stored.version === 1 && typeof stored.protectedKey === 'string') {
+    key = Buffer.from(safeStorage.decryptString(Buffer.from(stored.protectedKey, 'base64')), 'base64')
+  }
+  else {
+    key = randomBytes(32)
+    persist.saveJson(slot, {
+      version: 1,
+      protectedKey: safeStorage.encryptString(key.toString('base64')).toString('base64'),
+    })
+  }
+  if (key.length !== 32)
+    throw new Error('V4 shadow evaluation HMAC key has an invalid length')
+  return query => createHmac('sha256', key).update(query.normalize('NFKC')).digest('hex')
+}
+
 function initializeMemory(): void {
   try {
     memoryV4Shadow?.flush()
   }
   catch (error) {
     writeBootLog(`Memory V4 shadow flush before reinitialize failed: ${errorMessage(error)}`)
+  }
+  try {
+    memoryV4ShadowEvaluationStore?.flush()
+  }
+  catch (error) {
+    writeBootLog(`Memory V4 shadow evaluation flush before reinitialize failed: ${errorMessage(error)}`)
   }
   memory = undefined
   memoryPersistence = undefined
@@ -402,8 +444,13 @@ function initializeMemory(): void {
   memoryV4Lifecycle = undefined
   memoryV4ConsolidationRunner?.stop()
   memoryV4ConsolidationRunner = undefined
+  memoryV4ShadowTaskQueue?.stop()
+  memoryV4ShadowTaskQueue = undefined
   memoryV4ShadowRetriever = undefined
   memoryV4ShadowComparator = createV3V4ShadowComparator()
+  memoryV4ShadowEvaluationPersistence = undefined
+  memoryV4ShadowEvaluationStore = undefined
+  memoryV4ShadowEvaluationError = ''
   memoryCandidateReview = undefined
   memoryV4Persistence = undefined
   memoryStore = undefined
@@ -542,7 +589,8 @@ function initializeMemory(): void {
       })
       const v4Repository = createMemoryV4Repository({ persistence: v4Persistence })
       memoryV4Repository = v4Repository
-      memoryV4ShadowRetriever = createMemoryV4ShadowRetriever(v4Repository)
+      const shadowRetriever = createMemoryV4ShadowRetriever(v4Repository)
+      memoryV4ShadowRetriever = shadowRetriever
       memoryV4Lifecycle = createMemoryV4LifecycleService(v4Repository)
       memoryCandidateReview = createMemoryCandidateReviewService(v4Repository)
       memoryV4Persistence = v4Persistence
@@ -571,6 +619,66 @@ function initializeMemory(): void {
         writeBootLog(`Memory V4 dual-write ready: ${memoryV4Reconciliation.mirroredCount}/${memoryV4Reconciliation.sourceCount} facts reconciled, ${memoryV4Reconciliation.deletedCount} tombstoned`)
         writeBootLog(`Memory V4 diff audit: ${(memoryV4Audit.consistency * 100).toFixed(4)}% exact, ${memoryV4Audit.issues.length} issues`)
       }
+      try {
+        const evaluationPersistence = createEncryptedFilePersistence({
+          encryptedPath: memoryV4ShadowEvaluationPath,
+          keyPath: memoryV4ShadowEvaluationKeyPath,
+          protectKey: key => safeStorage.encryptString(key.toString('base64')),
+          unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
+        })
+        const evaluationStore = createMemoryV4ShadowEvaluationStore({
+          persistence: evaluationPersistence,
+          maxRecords: 4_096,
+          flushDelayMs: 5_000,
+          encrypted: true,
+          onPersistenceError: (error) => {
+            memoryV4ShadowEvaluationError = errorMessage(error)
+            writeBootLog(`Memory V4 shadow evaluation persistence failed: ${memoryV4ShadowEvaluationError}`)
+          },
+        })
+        memoryV4ShadowEvaluationPersistence = evaluationPersistence
+        memoryV4ShadowEvaluationStore = evaluationStore
+        memoryV4ShadowComparator = createV3V4ShadowComparator({
+          queryHasher: createV4ShadowQueryHasher(),
+          sink: evaluationStore,
+          onSinkError: (error) => {
+            memoryV4ShadowEvaluationError = errorMessage(error)
+            writeBootLog(`Memory V4 shadow evaluation persistence failed: ${memoryV4ShadowEvaluationError}`)
+          },
+        })
+        writeBootLog(`Memory V4 persistent shadow evaluation ready: ${evaluationStore.status().comparisons} comparisons retained`)
+      }
+      catch (error) {
+        memoryV4ShadowEvaluationPersistence = undefined
+        memoryV4ShadowEvaluationStore = undefined
+        memoryV4ShadowEvaluationError = errorMessage(error)
+        memoryV4ShadowComparator = createV3V4ShadowComparator()
+        writeBootLog(`Memory V4 persistent shadow evaluation disabled: ${memoryV4ShadowEvaluationError}`)
+      }
+      memoryV4ShadowTaskQueue = createMemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTask>({
+        maxPending: 4,
+        maxQueueAgeMs: 10_000,
+        maxTaskMs: 1_000,
+        run: (task) => {
+          try {
+            const v4 = shadowRetriever.recall(task.query, {
+              scope: task.scope,
+              limit: Math.max(1, Math.min(50, task.v3RetrievedIds.length || 10)),
+              sharePolicies: ['allow-remote'],
+              sensitivities: memorySettings.remotePolicy === 'allow-private'
+                ? ['normal', 'private']
+                : ['normal'],
+            })
+            memoryV4ShadowComparator.compare(task.query, task.v3RetrievedIds, task.v3InjectedIds, v4)
+          }
+          catch (error) {
+            memoryV4ShadowComparator.recordFailure(task.query, error)
+            throw error
+          }
+        },
+        onError: error => writeBootLog(`Memory V4 shadow read comparison failed: ${errorMessage(error)}`),
+        onDrop: reason => writeBootLog(`Memory V4 shadow comparison dropped: ${reason}`),
+      })
       // Stage-four offline consolidation: rebuild session/day/topic/entity/
       // temporal-stage summaries in
       // derivedArtifacts while the user is idle. Runs are idempotent, so an
@@ -639,27 +747,16 @@ function scheduleV4ShadowComparison(
   v3RetrievedIds: readonly string[],
   v3InjectedIds: readonly string[],
 ): void {
-  const retriever = memoryV4ShadowRetriever
-  if (!retriever)
+  const queue = memoryV4ShadowTaskQueue
+  if (!queue)
     return
-  // Run after the V3 result has been selected. This task never blocks prompt
-  // construction and its result is never exposed to the answer model.
-  setImmediate(() => {
-    try {
-      const v4 = retriever.recall(query, {
-        scope,
-        limit: Math.max(1, Math.min(50, v3RetrievedIds.length || 10)),
-        sharePolicies: ['allow-remote'],
-        sensitivities: memorySettings.remotePolicy === 'allow-private'
-          ? ['normal', 'private']
-          : ['normal'],
-      })
-      memoryV4ShadowComparator.compare(query, v3RetrievedIds, v3InjectedIds, v4)
-    }
-    catch (error) {
-      memoryV4ShadowComparator.recordFailure(query, error)
-      writeBootLog(`Memory V4 shadow read comparison failed: ${errorMessage(error)}`)
-    }
+  // The bounded queue runs after V3 selection, never contributes to the model
+  // prompt and drops overload/stale work instead of delaying future chat turns.
+  queue.enqueue({
+    query,
+    scope,
+    v3RetrievedIds: [...v3RetrievedIds],
+    v3InjectedIds: [...v3InjectedIds],
   })
 }
 
@@ -996,7 +1093,11 @@ function setupIPC() {
       audit: memoryV4Audit,
       shadowRead: {
         index: memoryV4ShadowRetriever?.indexStatus(),
-        comparison: memoryV4ShadowComparator.status(),
+        currentSession: memoryV4ShadowComparator.status(),
+        persistentEvaluation: memoryV4ShadowEvaluationStore?.status(),
+        queue: memoryV4ShadowTaskQueue?.status(),
+        evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
+        evaluationError: memoryV4ShadowEvaluationError,
         authoritativeAnswerSource: 'v3',
       },
     },
@@ -1032,7 +1133,11 @@ function setupIPC() {
       audit: memoryV4Audit,
       shadowRead: {
         index: memoryV4ShadowRetriever?.indexStatus(),
-        comparison: memoryV4ShadowComparator.status(),
+        currentSession: memoryV4ShadowComparator.status(),
+        persistentEvaluation: memoryV4ShadowEvaluationStore?.status(),
+        queue: memoryV4ShadowTaskQueue?.status(),
+        evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
+        evaluationError: memoryV4ShadowEvaluationError,
         authoritativeAnswerSource: 'v3',
       },
     },
@@ -1219,7 +1324,9 @@ function setupIPC() {
   ipcMain.handle('memory:clear', async () => {
     if (!memory)
       return { ok: false, error: '长期记忆已关闭。' }
+    memoryV4ShadowTaskQueue?.clearPending()
     await memory.clear(localMemoryScope)
+    memoryV4ShadowEvaluationStore?.clear()
     return { ok: true, count: 0 }
   })
 
@@ -1233,7 +1340,9 @@ function setupIPC() {
   })
 
   ipcMain.handle('app:reset', async () => {
+    memoryV4ShadowTaskQueue?.clearPending()
     await memory?.clear(localMemoryScope)
+    memoryV4ShadowEvaluationStore?.clear()
     sessionStore.getSessionMessages('default').splice(0)
     sessionPersistence?.save('{}')
     persist.saveJson('settings', { agentName: null, firstRunAt: null })
@@ -1330,6 +1439,13 @@ app.on('window-all-closed', () => {
 let memoryShutdownComplete = false
 app.on('before-quit', (event) => {
   memoryV4ConsolidationRunner?.stop()
+  memoryV4ShadowTaskQueue?.stop()
+  try {
+    memoryV4ShadowEvaluationStore?.flush()
+  }
+  catch (error) {
+    writeBootLog(`Memory V4 shadow evaluation final flush failed: ${errorMessage(error)}`)
+  }
   if (!memoryShutdownComplete && (memory?.pendingCaptureCount() ?? 0) > 0) {
     event.preventDefault()
     void memory!.flushPendingCaptures()

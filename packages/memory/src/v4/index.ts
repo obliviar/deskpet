@@ -109,8 +109,25 @@ export type {
   MemoryV4ShadowRetriever,
   V3V4ShadowComparator,
   V3V4ShadowComparison,
+  V3V4ShadowComparisonSink,
   V3V4ShadowComparisonStatus,
+  V3V4ShadowFailure,
 } from './retrieval/memory-v4-shadow-retriever'
+export {
+  MEMORY_V4_SHADOW_EVALUATION_SCHEMA_VERSION,
+  MEMORY_V4_SHADOW_EVALUATION_VERSION,
+  MEMORY_V4_SHADOW_TASK_QUEUE_VERSION,
+  createMemoryV4ShadowEvaluationStore,
+  createMemoryV4ShadowTaskQueue,
+} from './evaluation/memory-v4-shadow-evaluation'
+export type {
+  MemoryV4ShadowEvaluationPersistence,
+  MemoryV4ShadowEvaluationStatus,
+  MemoryV4ShadowEvaluationStore,
+  MemoryV4ShadowMetricRollup,
+  MemoryV4ShadowTaskQueue,
+  MemoryV4ShadowTaskQueueStatus,
+} from './evaluation/memory-v4-shadow-evaluation'
 export type {
   ArchiveColdFactsOptions,
   ArchiveColdFactsReport,

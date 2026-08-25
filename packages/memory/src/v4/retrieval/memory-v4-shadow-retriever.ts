@@ -320,6 +320,12 @@ export function createMemoryV4ShadowRetriever(
 export interface V3V4ShadowComparison {
   queryHash: string
   comparedAt: number
+  queryIntent: string
+  retrievalRoutes: string[]
+  snapshotRevision: number
+  candidateCount: number
+  summaryCandidates: number
+  indexRebuildCount: number
   v3RetrievedCount: number
   v3InjectedCount: number
   v4RetrievedCount: number
@@ -333,6 +339,18 @@ export interface V3V4ShadowComparison {
   temporalFiltered: number
 }
 
+export interface V3V4ShadowFailure {
+  queryHash: string
+  errorName: string
+  errorFingerprint: string
+  failedAt: number
+}
+
+export interface V3V4ShadowComparisonSink {
+  recordComparison: (comparison: V3V4ShadowComparison) => void
+  recordFailure: (failure: V3V4ShadowFailure) => void
+}
+
 export interface V3V4ShadowComparisonStatus {
   version: typeof MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION
   comparisons: number
@@ -341,7 +359,7 @@ export interface V3V4ShadowComparisonStatus {
   averageAgreementPrecisionAtK: number
   averageV4LatencyMs: number
   last?: V3V4ShadowComparison
-  lastFailure?: { queryHash: string; message: string; failedAt: number }
+  lastFailure?: V3V4ShadowFailure
 }
 
 export interface V3V4ShadowComparator {
@@ -351,8 +369,15 @@ export interface V3V4ShadowComparator {
 }
 
 /** In-memory, plaintext-free rollout telemetry for V3/V4 dual-read. */
-export function createV3V4ShadowComparator(options: { now?: () => number } = {}): V3V4ShadowComparator {
+export function createV3V4ShadowComparator(options: {
+  now?: () => number
+  /** Product builds use a per-installation HMAC; SHA-256 remains a deterministic test fallback. */
+  queryHasher?: (query: string) => string
+  sink?: V3V4ShadowComparisonSink
+  onSinkError?: (error: unknown) => void
+} = {}): V3V4ShadowComparator {
   const now = options.now ?? Date.now
+  const queryHasher = options.queryHasher ?? sha256
   let comparisons = 0
   let failures = 0
   let recallTotal = 0
@@ -368,8 +393,14 @@ export function createV3V4ShadowComparator(options: { now?: () => number } = {})
       const overlapCount = [...v3].filter(id => v4Ids.has(id)).length
       const union = new Set([...v3, ...v4Ids]).size
       const comparison: V3V4ShadowComparison = {
-        queryHash: sha256(query),
+        queryHash: queryHasher(query.normalize('NFKC')),
         comparedAt: now(),
+        queryIntent: v4.queryIntent,
+        retrievalRoutes: [...v4.routes],
+        snapshotRevision: v4.snapshotRevision,
+        candidateCount: v4.candidateCount,
+        summaryCandidates: v4.summaryCandidates,
+        indexRebuildCount: v4.index.rebuildCount,
         v3RetrievedCount: v3.size,
         v3InjectedCount: new Set(v3InjectedIds).size,
         v4RetrievedCount: v4Ids.size,
@@ -386,15 +417,19 @@ export function createV3V4ShadowComparator(options: { now?: () => number } = {})
       precisionTotal += comparison.v3AgreementPrecisionAtK
       latencyTotal += comparison.v4LatencyMs
       last = comparison
+      notifySink(() => options.sink?.recordComparison(comparison), options.onSinkError)
       return comparison
     },
     recordFailure(query, error) {
       failures += 1
+      const errorMessage = error instanceof Error ? error.message : String(error)
       lastFailure = {
-        queryHash: sha256(query),
-        message: error instanceof Error ? error.message : String(error),
+        queryHash: queryHasher(query.normalize('NFKC')),
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+        errorFingerprint: sha256(errorMessage),
         failedAt: now(),
       }
+      notifySink(() => options.sink?.recordFailure(lastFailure!), options.onSinkError)
     },
     status: () => ({
       version: MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION,
@@ -406,6 +441,20 @@ export function createV3V4ShadowComparator(options: { now?: () => number } = {})
       ...(last ? { last } : {}),
       ...(lastFailure ? { lastFailure } : {}),
     }),
+  }
+}
+
+function notifySink(action: () => void, onError: ((error: unknown) => void) | undefined): void {
+  try {
+    action()
+  }
+  catch (error) {
+    try {
+      onError?.(error)
+    }
+    catch {
+      // Evaluation telemetry must not escape into the answer path.
+    }
   }
 }
 

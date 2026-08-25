@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createMemoryConsolidationService } from '../consolidation/memory-consolidation-service'
 import { migrateV3PayloadToV4 } from '../migration/v3-to-v4'
 import { createMemoryV4Repository } from '../repository/memory-v4-repository'
@@ -134,7 +134,12 @@ describe('V3/V4 shadow comparator', () => {
     const repository = await seedRepository()
     const retriever = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
     const recalled = retriever.recall('我喜欢喝什么？', { scope, limit: 3 })
-    const comparator = createV3V4ShadowComparator({ now: () => NOW + 100 })
+    const sink = { recordComparison: vi.fn(), recordFailure: vi.fn() }
+    const comparator = createV3V4ShadowComparator({
+      now: () => NOW + 100,
+      queryHasher: () => 'a'.repeat(64),
+      sink,
+    })
 
     const comparison = comparator.compare('我喜欢喝什么？', ['coffee'], ['coffee'], recalled)
     expect(comparison).toMatchObject({
@@ -142,7 +147,13 @@ describe('V3/V4 shadow comparator', () => {
       v3AgreementRecallAtK: 1,
       v3AgreementPrecisionAtK: 1 / 3,
     })
-    expect(comparison.queryHash).toMatch(/^[a-f0-9]{64}$/u)
+    expect(comparison.queryHash).toBe('a'.repeat(64))
+    expect(comparison).toMatchObject({
+      queryIntent: recalled.queryIntent,
+      snapshotRevision: recalled.snapshotRevision,
+      candidateCount: recalled.candidateCount,
+    })
+    expect(sink.recordComparison).toHaveBeenCalledWith(comparison)
     expect(JSON.stringify(comparator.status())).not.toContain('喜欢喝什么')
   })
 

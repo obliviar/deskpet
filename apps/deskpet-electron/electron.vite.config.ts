@@ -10,7 +10,17 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin({
       exclude: ['@deskpet/core', '@deskpet/llm-openai', '@deskpet/memory', '@deskpet/tools'],
     })],
-    build: { outDir: resolve(__dirname, 'dist/main'), rollupOptions: { external: ['electron'] } },
+    build: {
+      outDir: resolve(__dirname, 'dist/main'),
+      rollupOptions: {
+        external: ['electron'],
+        input: {
+          index: resolve(__dirname, 'src/main/index.ts'),
+          'memory-v4-shadow-worker': resolve(__dirname, 'src/main/memory-v4-shadow-worker.ts'),
+        },
+        output: { entryFileNames: '[name].js' },
+      },
+    },
   },
   preload: {
     build: {

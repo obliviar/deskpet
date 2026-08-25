@@ -15,7 +15,6 @@ import {
   createMemoryConsolidationService,
   createMemoryTieringService,
   createMemoryV4LifecycleService,
-  createMemoryV4ShadowRetriever,
   createMemoryV4ShadowEvaluationStore,
   createMemoryV4ShadowTaskQueue,
   createV3V4ShadowComparator,
@@ -48,7 +47,6 @@ import type {
   MemoryEmbeddingIndex,
   MemoryV4Repository,
   MemoryV4ShadowEvaluationStore,
-  MemoryV4ShadowRetriever,
   MemoryV4ShadowTaskQueue,
   V3V4ShadowComparator,
   VectorStore,
@@ -66,6 +64,10 @@ import {
   SEMANTIC_MEMORY_MODEL,
 } from './semantic-memory'
 import type { SemanticModelProgress } from './semantic-memory'
+import {
+  createMemoryV4ShadowWorkerClient,
+  type MemoryV4ShadowWorkerClient,
+} from './memory-v4-shadow-worker-client'
 
 // Some Windows systems cannot initialize Electron's GPU subprocess. Disable
 // hardware acceleration before app readiness so the packaged app still starts.
@@ -279,9 +281,10 @@ let memoryV4Lifecycle: MemoryV4LifecycleService | undefined
 let memoryCandidateReview: MemoryCandidateReviewService | undefined
 let memoryV4Persistence: JournaledV4Persistence | undefined
 let memoryV4ConsolidationRunner: IdleConsolidationRunner | undefined
-let memoryV4ShadowRetriever: MemoryV4ShadowRetriever | undefined
+let memoryV4ShadowWorkerClient: MemoryV4ShadowWorkerClient | undefined
 let memoryV4ShadowComparator: V3V4ShadowComparator = createV3V4ShadowComparator()
 interface MemoryV4ShadowComparisonTask {
+  generation: number
   query: string
   scope: { ownerId: string; agentId?: string; sessionId?: string }
   v3RetrievedIds: readonly string[]
@@ -290,6 +293,7 @@ interface MemoryV4ShadowComparisonTask {
 let memoryV4ShadowEvaluationPersistence: EncryptedMemoryPersistence | undefined
 let memoryV4ShadowEvaluationStore: MemoryV4ShadowEvaluationStore | undefined
 let memoryV4ShadowTaskQueue: MemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTask> | undefined
+let memoryV4ShadowGeneration = 0
 let memoryV4ShadowEvaluationError = ''
 let memoryStore: VectorStore | undefined
 let memoryV4Error = ''
@@ -425,6 +429,7 @@ function createV4ShadowQueryHasher(): (query: string) => string {
 }
 
 function initializeMemory(): void {
+  memoryV4ShadowGeneration += 1
   try {
     memoryV4Shadow?.flush()
   }
@@ -447,7 +452,8 @@ function initializeMemory(): void {
   memoryV4ConsolidationRunner = undefined
   memoryV4ShadowTaskQueue?.stop()
   memoryV4ShadowTaskQueue = undefined
-  memoryV4ShadowRetriever = undefined
+  memoryV4ShadowWorkerClient?.stop()
+  memoryV4ShadowWorkerClient = undefined
   memoryV4ShadowComparator = createV3V4ShadowComparator()
   memoryV4ShadowEvaluationPersistence = undefined
   memoryV4ShadowEvaluationStore = undefined
@@ -590,8 +596,6 @@ function initializeMemory(): void {
       })
       const v4Repository = createMemoryV4Repository({ persistence: v4Persistence })
       memoryV4Repository = v4Repository
-      const shadowRetriever = createMemoryV4ShadowRetriever(v4Repository)
-      memoryV4ShadowRetriever = shadowRetriever
       memoryV4Lifecycle = createMemoryV4LifecycleService(v4Repository)
       memoryCandidateReview = createMemoryCandidateReviewService(v4Repository)
       memoryV4Persistence = v4Persistence
@@ -620,6 +624,12 @@ function initializeMemory(): void {
         writeBootLog(`Memory V4 dual-write ready: ${memoryV4Reconciliation.mirroredCount}/${memoryV4Reconciliation.sourceCount} facts reconciled, ${memoryV4Reconciliation.deletedCount} tombstoned`)
         writeBootLog(`Memory V4 diff audit: ${(memoryV4Audit.consistency * 100).toFixed(4)}% exact, ${memoryV4Audit.issues.length} issues`)
       }
+      const shadowWorkerClient = createMemoryV4ShadowWorkerClient({
+        workerPath: join(moduleDir, 'memory-v4-shadow-worker.js'),
+        getSnapshot: () => v4Repository.snapshot(),
+        timeoutMs: 1_000,
+      })
+      memoryV4ShadowWorkerClient = shadowWorkerClient
       try {
         const evaluationPersistence = createEncryptedFilePersistence({
           encryptedPath: memoryV4ShadowEvaluationPath,
@@ -659,10 +669,12 @@ function initializeMemory(): void {
       memoryV4ShadowTaskQueue = createMemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTask>({
         maxPending: 4,
         maxQueueAgeMs: 10_000,
-        maxTaskMs: 1_000,
-        run: (task) => {
+        maxTaskMs: 1_250,
+        run: async (task) => {
+          if (task.generation !== memoryV4ShadowGeneration)
+            return
           try {
-            const v4 = shadowRetriever.recall(task.query, {
+            const v4 = await shadowWorkerClient.recall(task.query, {
               scope: task.scope,
               limit: Math.max(1, Math.min(50, task.v3RetrievedIds.length || 10)),
               sharePolicies: ['allow-remote'],
@@ -670,9 +682,13 @@ function initializeMemory(): void {
                 ? ['normal', 'private']
                 : ['normal'],
             })
+            if (task.generation !== memoryV4ShadowGeneration)
+              return
             memoryV4ShadowComparator.compare(task.query, task.v3RetrievedIds, task.v3InjectedIds, v4)
           }
           catch (error) {
+            if (task.generation !== memoryV4ShadowGeneration)
+              return
             memoryV4ShadowComparator.recordFailure(task.query, error)
             throw error
           }
@@ -716,6 +732,10 @@ function initializeMemory(): void {
     catch (error) {
       // V4 remains a shadow copy in stage two. Its failure must never disable
       // the verified V3 runtime or overwrite the V3 source.
+      memoryV4ShadowTaskQueue?.stop()
+      memoryV4ShadowTaskQueue = undefined
+      memoryV4ShadowWorkerClient?.stop()
+      memoryV4ShadowWorkerClient = undefined
       memoryV4Shadow = undefined
       memoryV4Error = errorMessage(error)
       writeBootLog(`Memory V4 shadow initialization failed: ${memoryV4Error}`)
@@ -754,11 +774,18 @@ function scheduleV4ShadowComparison(
   // The bounded queue runs after V3 selection, never contributes to the model
   // prompt and drops overload/stale work instead of delaying future chat turns.
   queue.enqueue({
+    generation: memoryV4ShadowGeneration,
     query,
     scope,
     v3RetrievedIds: [...v3RetrievedIds],
     v3InjectedIds: [...v3InjectedIds],
   })
+}
+
+function invalidateMemoryV4ShadowComparisons(): void {
+  memoryV4ShadowGeneration += 1
+  memoryV4ShadowTaskQueue?.clearPending()
+  memoryV4ShadowWorkerClient?.cancelAll()
 }
 
 function memoryForRemoteRuntime() {
@@ -900,6 +927,8 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
   if (!purgeConfirmation.consume(id, token, phrase))
     return { ok: false as const, error: '确认已失效或确认短语不正确，请重新发起。' }
 
+  // Destroy any worker-held snapshot before removing recoverable copies.
+  invalidateMemoryV4ShadowComparisons()
   memoryV4Shadow?.flush()
   const snapshot = memoryV4Repository.snapshot()
   const fact = snapshot.facts.find(entry => entry.metadata?.v3SourceId === id)
@@ -1093,7 +1122,8 @@ function setupIPC() {
       killSwitchEnabled: !config.memoryV4ShadowEnabled,
       audit: memoryV4Audit,
       shadowRead: {
-        index: memoryV4ShadowRetriever?.indexStatus(),
+        index: memoryV4ShadowWorkerClient?.status().lastIndex,
+        worker: memoryV4ShadowWorkerClient?.status(),
         currentSession: memoryV4ShadowComparator.status(),
         persistentEvaluation: memoryV4ShadowEvaluationStore?.status(),
         queue: memoryV4ShadowTaskQueue?.status(),
@@ -1134,7 +1164,8 @@ function setupIPC() {
       killSwitchEnabled: !config.memoryV4ShadowEnabled,
       audit: memoryV4Audit,
       shadowRead: {
-        index: memoryV4ShadowRetriever?.indexStatus(),
+        index: memoryV4ShadowWorkerClient?.status().lastIndex,
+        worker: memoryV4ShadowWorkerClient?.status(),
         currentSession: memoryV4ShadowComparator.status(),
         persistentEvaluation: memoryV4ShadowEvaluationStore?.status(),
         queue: memoryV4ShadowTaskQueue?.status(),
@@ -1327,7 +1358,7 @@ function setupIPC() {
   ipcMain.handle('memory:clear', async () => {
     if (!memory)
       return { ok: false, error: '长期记忆已关闭。' }
-    memoryV4ShadowTaskQueue?.clearPending()
+    invalidateMemoryV4ShadowComparisons()
     await memory.clear(localMemoryScope)
     memoryV4ShadowEvaluationStore?.clear()
     return { ok: true, count: 0 }
@@ -1343,7 +1374,7 @@ function setupIPC() {
   })
 
   ipcMain.handle('app:reset', async () => {
-    memoryV4ShadowTaskQueue?.clearPending()
+    invalidateMemoryV4ShadowComparisons()
     await memory?.clear(localMemoryScope)
     memoryV4ShadowEvaluationStore?.clear()
     sessionStore.getSessionMessages('default').splice(0)
@@ -1377,9 +1408,21 @@ function createWindow() {
     // normal launches and lets CI/debug runs verify the renderer plus memory
     // initialization without leaving Electron processes behind.
     if (process.env.DESKPET_SMOKE_TEST === 'true') {
-      const purgeId = process.env.DESKPET_SMOKE_PURGE_ID?.trim()
-      if (purgeId) {
-        void (async () => {
+      void (async () => {
+        if (memoryV4ShadowWorkerClient) {
+          const result = await memoryV4ShadowWorkerClient.recall('我叫什么名字？', {
+            scope: localMemoryScope,
+            limit: 3,
+            sharePolicies: ['allow-remote'],
+            sensitivities: ['normal'],
+          })
+          writeBootLog(`Memory V4 worker smoke completed: revision ${result.snapshotRevision}, ${result.hits.length} hits`)
+        }
+        else {
+          writeBootLog('Memory V4 worker smoke skipped: shadow runtime unavailable')
+        }
+        const purgeId = process.env.DESKPET_SMOKE_PURGE_ID?.trim()
+        if (purgeId) {
           const prepared = await prepareMemoryPurge(purgeId)
           if (!prepared.ok)
             throw new Error(prepared.error)
@@ -1387,17 +1430,13 @@ function createWindow() {
           if (!result.ok)
             throw new Error(result.error)
           writeBootLog(`smoke purge report: ${JSON.stringify(result.report)}`)
-          writeBootLog('smoke test completed')
-          setTimeout(() => app.quit(), 100)
-        })().catch((error) => {
-          writeBootLog(`smoke purge failed: ${errorMessage(error)}`)
-          app.exit(2)
-        })
-      }
-      else {
+        }
         writeBootLog('smoke test completed')
         setTimeout(() => app.quit(), 100)
-      }
+      })().catch((error) => {
+        writeBootLog(`smoke test failed: ${errorMessage(error)}`)
+        app.exit(2)
+      })
     }
   })
   mainWindow.webContents.on('did-fail-load', (_event, code, description) => {
@@ -1442,7 +1481,9 @@ app.on('window-all-closed', () => {
 let memoryShutdownComplete = false
 app.on('before-quit', (event) => {
   memoryV4ConsolidationRunner?.stop()
+  memoryV4ShadowGeneration += 1
   memoryV4ShadowTaskQueue?.stop()
+  memoryV4ShadowWorkerClient?.stop()
   try {
     memoryV4ShadowEvaluationStore?.flush()
   }

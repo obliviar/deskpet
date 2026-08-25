@@ -15,6 +15,10 @@ if (-not $SkipBuild) {
     throw "Electron build failed with exit code $LASTEXITCODE"
   }
 }
+$workerBundle = Join-Path $appDirectory 'dist\main\memory-v4-shadow-worker.js'
+if (-not (Test-Path -LiteralPath $workerBundle)) {
+  throw "Memory V4 worker bundle not found: $workerBundle"
+}
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("deskpet-v4-smoke-{0}" -f [guid]::NewGuid().ToString('N'))
 $dataPath = Join-Path $testRoot 'data'
@@ -195,8 +199,11 @@ try {
   if ((Select-String -Path $logPath -Pattern 'renderer finished loading').Count -ne 7) {
     throw 'The Electron renderer did not finish loading on all seven launches.'
   }
+  if ((Select-String -Path $logPath -Pattern 'Memory V4 worker smoke completed').Count -lt 4) {
+    throw 'The isolated Memory V4 worker did not execute on every healthy shadow launch.'
+  }
 
-  Write-Output 'Memory V4 Electron smoke test passed: migration, journal replay, 100% diff audit, strong-confirm zero-residual purge, post-purge restart, encrypted artifacts, renderer startup, and safe V4/embedding-index/model-integrity failure fallbacks.'
+  Write-Output 'Memory V4 Electron smoke test passed: isolated worker execution, migration, journal replay, 100% diff audit, strong-confirm zero-residual purge, post-purge restart, encrypted artifacts, renderer startup, and safe V4/embedding-index/model-integrity failure fallbacks.'
 }
 finally {
   Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_SMOKE_PURGE_ID,Env:DESKPET_MEMORY -ErrorAction SilentlyContinue

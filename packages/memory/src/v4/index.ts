@@ -98,6 +98,7 @@ export {
 } from './consolidation/memory-tiering-service'
 export {
   DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION,
+  MEMORY_V4_LOCAL_CALIBRATION_DATASET_FINGERPRINT,
   MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION,
   MEMORY_V4_SHADOW_RETRIEVER_VERSION,
   createMemoryV4ShadowRetriever,
@@ -130,6 +131,16 @@ export type {
   MemoryV4ShadowTaskQueue,
   MemoryV4ShadowTaskQueueStatus,
 } from './evaluation/memory-v4-shadow-evaluation'
+export {
+  MEMORY_V4_ABSOLUTE_EVIDENCE_SCORE_VERSION,
+  MEMORY_V4_LOCAL_CALIBRATION_VERSION,
+  fitMemoryV4LocalCalibration,
+} from './evaluation/memory-v4-local-calibration'
+export type {
+  MemoryV4CalibrationObservation,
+  MemoryV4LocalCalibrationArtifact,
+  MemoryV4LocalCalibrationOptions,
+} from './evaluation/memory-v4-local-calibration'
 export type {
   ArchiveColdFactsOptions,
   ArchiveColdFactsReport,

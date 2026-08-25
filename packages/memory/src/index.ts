@@ -45,6 +45,14 @@ export type {
 export { createEncryptedFilePersistence } from './long-term/encrypted-persistence'
 export type { EncryptedFilePersistenceOptions, EncryptedMemoryPersistence } from './long-term/encrypted-persistence'
 export { createLocalEmbedding, LOCAL_EMBEDDING_MODEL } from './long-term/local-embedding'
+export {
+  MEMORY_SPARSE_VECTOR_CANDIDATE_INDEX_VERSION,
+  createSparseVectorCandidateIndex,
+} from './long-term/sparse-vector-candidate-index'
+export type {
+  SparseVectorCandidateIndex,
+  SparseVectorSearchHit,
+} from './long-term/sparse-vector-candidate-index'
 
 export {
   createMemoryWriter,

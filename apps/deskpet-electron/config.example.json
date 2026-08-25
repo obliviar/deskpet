@@ -4,5 +4,6 @@
   "model": "deepseek-v4-pro",
   "memoryEnabled": true,
   "memoryV4ShadowEnabled": true,
+  "memoryV4InternalReviewEnabled": false,
   "embeddingModel": "local-hash-v3"
 }

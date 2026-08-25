@@ -8,6 +8,29 @@ interface Message {
   content: string
   id: string
   hasImage?: boolean
+  memoryReview?: MemoryV4InternalCandidateReview
+}
+
+interface MemoryV4InternalCandidateReview {
+  mode: 'internal-candidate'
+  authoritativeAnswerSource: 'v3'
+  v4InfluencedAnswer: false
+  v3: { retrievedCount: number; injectedCount: number }
+  v4: {
+    abstained: boolean
+    bestEvidenceScore: number
+    threshold: number
+    calibrationVersion: string
+    candidates: Array<{
+      factId: string
+      content: string
+      score: number
+      routes: string[]
+      status: string
+      verificationState: string
+    }>
+  }
+  agreement: { overlapCount: number; recallAtK: number; precisionAtK: number; jaccard: number }
 }
 
 interface Theme {
@@ -883,6 +906,8 @@ async function send() {
     else if (!assistantMsg.content && result.text) {
       assistantMsg.content = result.text
     }
+    if (result?.memoryReview)
+      assistantMsg.memoryReview = result.memoryReview
     if (autoSpeak.value) {
       nextTick(() => speak(assistantMsg.content))
     }
@@ -1450,9 +1475,36 @@ async function doReset() {
         <p>你的 AI 桌面助手，输入消息开始对话</p>
       </div>
       <div v-for="msg in messages" :key="msg.id" :class="['message', msg.role]">
-        <div class="bubble">
-          <span v-if="msg.hasImage" class="img-tag">📷 识屏</span>
-          {{ msg.content || (msg.role === 'assistant' && isLoading ? '...' : '') }}
+        <div class="message-body">
+          <div class="bubble">
+            <span v-if="msg.hasImage" class="img-tag">📷 识屏</span>
+            {{ msg.content || (msg.role === 'assistant' && isLoading ? '...' : '') }}
+          </div>
+          <details v-if="msg.memoryReview" class="v4-internal-review">
+            <summary>
+              V4 内部候选 · 不参与正式回答 ·
+              {{ msg.memoryReview.v4.abstained ? '已拒答' : `${msg.memoryReview.v4.candidates.length} 条证据` }}
+            </summary>
+            <div class="v4-review-warning">
+              当前回复仍完全由 V3 记忆生成；这里仅用于本地比较，不会再次发送给模型。
+            </div>
+            <div class="v4-review-metrics">
+              <span>V3 注入 {{ msg.memoryReview.v3.injectedCount }}</span>
+              <span>V4 最佳证据 {{ Math.round(msg.memoryReview.v4.bestEvidenceScore * 100) }}%</span>
+              <span>拒答门槛 {{ Math.round(msg.memoryReview.v4.threshold * 100) }}%</span>
+              <span>重合 {{ msg.memoryReview.agreement.overlapCount }}</span>
+            </div>
+            <div v-for="candidate in msg.memoryReview.v4.candidates" :key="candidate.factId" class="v4-review-candidate">
+              <div>{{ candidate.content }}</div>
+              <small>
+                证据 {{ Math.round(candidate.score * 100) }}% · {{ candidate.status }} ·
+                {{ candidate.routes.join(' + ') }}
+              </small>
+            </div>
+            <div v-if="msg.memoryReview.v4.candidates.length === 0" class="v4-review-empty">
+              V4 判断当前没有足够可靠的长期记忆。
+            </div>
+          </details>
         </div>
         <button v-if="!isLoading" class="rollback-btn" title="从这条消息撤回" @click="rollback(msg.id)">↩</button>
       </div>
@@ -1639,6 +1691,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .message { display: flex; max-width: 85%; }
 .message.user { align-self: flex-end; }
 .message.assistant { align-self: flex-start; }
+.message-body { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
 
 .bubble { padding: 10px 16px; border-radius: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; font-size: 14px; }
 .message.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
@@ -1648,6 +1701,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .rollback-btn { opacity: 0; transition: opacity 0.15s; background: transparent; color: var(--text-muted); border: 1px solid var(--border); border-radius: 6px; width: 26px; height: 26px; cursor: pointer; font-size: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; align-self: center; margin: 0 4px; }
 .rollback-btn:hover { background: var(--surface); color: var(--text); border-color: var(--text-muted); }
 .message:hover .rollback-btn { opacity: 1; }
+.v4-internal-review { max-width: 620px; padding: 7px 9px; border: 1px dashed rgba(217,119,87,0.55); border-radius: 8px; background: rgba(217,119,87,0.07); color: var(--text-muted); font-size: 10px; }
+.v4-internal-review summary { cursor: pointer; color: #d97757; font-weight: 600; }
+.v4-review-warning { margin-top: 7px; line-height: 1.45; }
+.v4-review-metrics { display: flex; flex-wrap: wrap; gap: 5px 10px; margin-top: 7px; }
+.v4-review-candidate { margin-top: 7px; padding: 7px; border-radius: 6px; background: var(--surface); color: var(--text); line-height: 1.4; }
+.v4-review-candidate small { display: block; margin-top: 4px; color: var(--text-muted); }
+.v4-review-empty { margin-top: 7px; color: var(--text-muted); }
 
 /* Image preview */
 .image-preview { display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: var(--surface); border-top: 1px solid var(--border); }

@@ -20,6 +20,7 @@ describe('memory query planner', () => {
     expect(broad.candidateBudget).toBe(80)
     expect(broad.selection.maxInjected).toBe(10)
     expect(timeline.intent).toBe('timeline')
+    expect(timeline.temporalMode).toBe('all')
     expect(timeline.routes).toContain('temporal')
     expect(timeline.candidateBudget).toBeGreaterThan(24)
   })
@@ -46,6 +47,7 @@ describe('memory query planner', () => {
     const plan = planMemoryQuery('项目是什么', { temporalMode: 'all' })
     expect(plan.temporalMode).toBe('all')
     expect(plan.intent).toBe('temporal')
+    expect(planMemoryQuery('回顾我的项目变化', { temporalMode: 'current' }).temporalMode).toBe('current')
   })
 
   it('adds a correction route for correction-cue queries', () => {
@@ -69,6 +71,7 @@ describe('memory query planner', () => {
   })
 
   it('decomposes multi-fact queries and keeps single-fact queries intact', () => {
+    expect(planMemoryQuery('我的鞋码以及宠物分别是什么？').intent).toBe('multi-fact')
     expect(decomposeQuery('我的生日是什么时候以及我最喜欢的颜色是什么')).toEqual([
       '我的生日是什么时候',
       '我最喜欢的颜色是什么',

@@ -55,6 +55,13 @@ export function planMemoryQuery(
   const concepts = [...new Set(localSemanticConcepts(normalized))].sort()
   const broad = isBroadPersonalMemoryQuery(normalized)
   const timeline = TIMELINE_CUE.test(normalized)
+  const namedMultiFact = concepts.length > 1
+  const temporalMode: MemoryTemporalMode = timeline
+    && options.temporalMode === undefined
+    && temporal.asOf === undefined
+    && temporal.validBetween === undefined
+    ? 'all'
+    : temporal.mode
   const hasPersonalCue = PERSONAL_CUE.test(normalized)
   const clearlyExternal = EXTERNAL_KNOWLEDGE_CUE.test(normalized)
     && !hasPersonalCue
@@ -67,11 +74,11 @@ export function planMemoryQuery(
     intent = 'external'
   else if (timeline)
     intent = 'timeline'
-  else if (broad)
+  else if (broad && !namedMultiFact)
     intent = 'enumerative'
   else if (temporal.validBetween !== undefined || temporal.mode !== 'current' || temporal.asOf !== undefined)
     intent = 'temporal'
-  else if (concepts.length > 1 || MULTI_FACT_CUE.test(normalized))
+  else if (namedMultiFact || MULTI_FACT_CUE.test(normalized))
     intent = 'multi-fact'
   else
     intent = 'specific'
@@ -93,7 +100,7 @@ export function planMemoryQuery(
   const budget = intentBudget(intent)
   const reasonCodes = [
     `intent:${intent}`,
-    `temporal:${temporal.mode}`,
+    `temporal:${temporalMode}`,
     ...(concepts.length > 0 ? [`concept-count:${concepts.length}`] : []),
     ...(broad ? ['broad-personal-query'] : []),
     ...(timeline ? ['timeline-cue'] : []),
@@ -108,7 +115,7 @@ export function planMemoryQuery(
     version: MEMORY_QUERY_PLANNER_VERSION,
     intent,
     requiresMemory,
-    temporalMode: temporal.mode,
+    temporalMode,
     ...(temporal.asOf === undefined ? {} : { asOf: temporal.asOf }),
     ...(temporal.validBetween === undefined ? {} : { validBetween: temporal.validBetween }),
     concepts,

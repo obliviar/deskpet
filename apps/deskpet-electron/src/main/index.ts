@@ -68,6 +68,7 @@ import {
   createMemoryV4ShadowWorkerClient,
   type MemoryV4ShadowWorkerClient,
 } from './memory-v4-shadow-worker-client'
+import { createMemoryV4InternalReviewController } from './memory-v4-internal-review'
 
 // Some Windows systems cannot initialize Electron's GPU subprocess. Disable
 // hardware acceleration before app readiness so the packaged app still starts.
@@ -118,6 +119,9 @@ const config = {
   memoryV4ShadowEnabled: process.env.DESKPET_MEMORY_V4_SHADOW
     ? process.env.DESKPET_MEMORY_V4_SHADOW !== 'false'
     : (fileConfig.memoryV4ShadowEnabled !== false),
+  memoryV4InternalReviewEnabled: process.env.DESKPET_MEMORY_V4_INTERNAL_REVIEW
+    ? process.env.DESKPET_MEMORY_V4_INTERNAL_REVIEW === 'true'
+    : (fileConfig.memoryV4InternalReviewEnabled === true),
   embeddingApiKey: process.env.DESKPET_EMBEDDING_API_KEY || fileConfig.embeddingApiKey || process.env.OPENAI_API_KEY || fileConfig.apiKey || '',
   embeddingBaseURL: process.env.DESKPET_EMBEDDING_BASE_URL || fileConfig.embeddingBaseURL || process.env.OPENAI_BASE_URL || fileConfig.baseURL || undefined,
   embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || fileConfig.embeddingModel || LOCAL_EMBEDDING_MODEL,
@@ -289,12 +293,17 @@ interface MemoryV4ShadowComparisonTask {
   scope: { ownerId: string; agentId?: string; sessionId?: string }
   v3RetrievedIds: readonly string[]
   v3InjectedIds: readonly string[]
+  internalReviewRequestId?: string
 }
 let memoryV4ShadowEvaluationPersistence: EncryptedMemoryPersistence | undefined
 let memoryV4ShadowEvaluationStore: MemoryV4ShadowEvaluationStore | undefined
 let memoryV4ShadowTaskQueue: MemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTask> | undefined
 let memoryV4ShadowGeneration = 0
 let memoryV4ShadowEvaluationError = ''
+const memoryV4InternalReview = createMemoryV4InternalReviewController({
+  enabled: config.memoryV4InternalReviewEnabled,
+  timeoutMs: 1_500,
+})
 let memoryStore: VectorStore | undefined
 let memoryV4Error = ''
 let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
@@ -430,6 +439,7 @@ function createV4ShadowQueryHasher(): (query: string) => string {
 
 function initializeMemory(): void {
   memoryV4ShadowGeneration += 1
+  memoryV4InternalReview.cancelAll()
   try {
     memoryV4Shadow?.flush()
   }
@@ -671,8 +681,11 @@ function initializeMemory(): void {
         maxQueueAgeMs: 10_000,
         maxTaskMs: 1_250,
         run: async (task) => {
-          if (task.generation !== memoryV4ShadowGeneration)
+          if (task.generation !== memoryV4ShadowGeneration) {
+            if (task.internalReviewRequestId)
+              memoryV4InternalReview.drop(task.internalReviewRequestId, 'generation-invalidated')
             return
+          }
           try {
             const v4 = await shadowWorkerClient.recall(task.query, {
               scope: task.scope,
@@ -682,11 +695,25 @@ function initializeMemory(): void {
                 ? ['normal', 'private']
                 : ['normal'],
             })
-            if (task.generation !== memoryV4ShadowGeneration)
+            if (task.generation !== memoryV4ShadowGeneration) {
+              if (task.internalReviewRequestId)
+                memoryV4InternalReview.drop(task.internalReviewRequestId, 'generation-invalidated')
               return
-            memoryV4ShadowComparator.compare(task.query, task.v3RetrievedIds, task.v3InjectedIds, v4)
+            }
+            const comparison = memoryV4ShadowComparator.compare(
+              task.query,
+              task.v3RetrievedIds,
+              task.v3InjectedIds,
+              v4,
+            )
+            if (task.internalReviewRequestId) {
+              memoryV4InternalReview.complete(task.internalReviewRequestId, comparison, v4)
+              writeBootLog('Memory V4 internal candidate review completed; V3 remained authoritative')
+            }
           }
           catch (error) {
+            if (task.internalReviewRequestId)
+              memoryV4InternalReview.drop(task.internalReviewRequestId, 'worker-failure')
             if (task.generation !== memoryV4ShadowGeneration)
               return
             memoryV4ShadowComparator.recordFailure(task.query, error)
@@ -694,8 +721,14 @@ function initializeMemory(): void {
           }
         },
         onError: error => writeBootLog(`Memory V4 shadow read comparison failed: ${errorMessage(error)}`),
-        onDrop: reason => writeBootLog(`Memory V4 shadow comparison dropped: ${reason}`),
+        onDrop: (reason, task) => {
+          if (task.internalReviewRequestId)
+            memoryV4InternalReview.drop(task.internalReviewRequestId, reason)
+          writeBootLog(`Memory V4 shadow comparison dropped: ${reason}`)
+        },
       })
+      if (config.memoryV4InternalReviewEnabled)
+        writeBootLog('Memory V4 internal candidate review enabled; V3 remains authoritative')
       // Stage-four offline consolidation: rebuild session/day/topic/entity/
       // temporal-stage summaries in
       // derivedArtifacts while the user is idle. Runs are idempotent, so an
@@ -771,6 +804,7 @@ function scheduleV4ShadowComparison(
   const queue = memoryV4ShadowTaskQueue
   if (!queue)
     return
+  const internalReviewRequestId = memoryV4InternalReview.claim(query)
   // The bounded queue runs after V3 selection, never contributes to the model
   // prompt and drops overload/stale work instead of delaying future chat turns.
   queue.enqueue({
@@ -779,11 +813,13 @@ function scheduleV4ShadowComparison(
     scope,
     v3RetrievedIds: [...v3RetrievedIds],
     v3InjectedIds: [...v3InjectedIds],
+    ...(internalReviewRequestId ? { internalReviewRequestId } : {}),
   })
 }
 
 function invalidateMemoryV4ShadowComparisons(): void {
   memoryV4ShadowGeneration += 1
+  memoryV4InternalReview.cancelAll()
   memoryV4ShadowTaskQueue?.clearPending()
   memoryV4ShadowWorkerClient?.cancelAll()
 }
@@ -1004,13 +1040,21 @@ function setupIPC() {
   ipcMain.handle('chat:send', async (_event, message: string, attachments?: { type: 'image'; data: string; mimeType: string }[]) => {
     if (!apiConfig.apiKey.trim())
       return { ok: false, error: '尚未配置 API Key，请点击右上角“API 设置”。' }
+    const internalReview = memoryV4InternalReview.begin(message)
     try {
       const result = await runtime.send('default', message, attachments && attachments.length > 0
         ? { attachments, input: { type: 'image' } }
         : undefined)
-      return { ok: true, text: result.text, toolCalls: result.toolCalls }
+      const memoryReview = await internalReview?.finish()
+      return {
+        ok: true,
+        text: result.text,
+        toolCalls: result.toolCalls,
+        ...(memoryReview ? { memoryReview } : {}),
+      }
     }
     catch (error) {
+      await internalReview?.finish()
       writeBootLog(`chat request failed: ${errorMessage(error)}`)
       return { ok: false, error: errorMessage(error) }
     }
@@ -1131,6 +1175,8 @@ function setupIPC() {
         evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
         evaluationError: memoryV4ShadowEvaluationError,
         authoritativeAnswerSource: 'v3',
+        rolloutStage: 'shadow',
+        internalReview: memoryV4InternalReview.status(),
       },
     },
     settings: memorySettings,
@@ -1173,6 +1219,8 @@ function setupIPC() {
         evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
         evaluationError: memoryV4ShadowEvaluationError,
         authoritativeAnswerSource: 'v3',
+        rolloutStage: 'shadow',
+        internalReview: memoryV4InternalReview.status(),
       },
     },
     settings: memorySettings,

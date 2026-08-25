@@ -144,7 +144,7 @@ describe('Memory V4 read-only shadow retrieval', () => {
     expect(recalled.hits[0]?.routes).toContain('fact-lexical')
     expect(recalled.abstention).toMatchObject({
       abstained: false,
-      version: 'memory-v4-absolute-evidence-v1:policy-fallback',
+      version: 'memory-v4-local-calibration-v1:deskpet-v4-local-synthetic-calibration-v1',
     })
   })
 
@@ -204,7 +204,7 @@ describe('V3/V4 shadow comparator', () => {
       v4Abstained: false,
       v4BestEvidenceScore: recalled.abstention?.bestScore,
       v4AbstentionThreshold: recalled.abstention?.threshold,
-      v4AbstentionVersion: 'memory-v4-absolute-evidence-v1:policy-fallback',
+      v4AbstentionVersion: 'memory-v4-local-calibration-v1:deskpet-v4-local-synthetic-calibration-v1',
     })
     expect(comparison.queryHash).toBe('a'.repeat(64))
     expect(comparison).toMatchObject({

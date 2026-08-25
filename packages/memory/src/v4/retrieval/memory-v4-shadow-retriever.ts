@@ -8,6 +8,7 @@ import { createMemoryBm25Index, tokenizeBm25 } from '../../long-term/bm25-index'
 import { createLocalEmbedding } from '../../long-term/local-embedding'
 import { planMemoryQuery } from '../../long-term/memory-query-planner'
 import { reciprocalRankFusion } from '../../long-term/reciprocal-rank-fusion'
+import { createSparseVectorCandidateIndex } from '../../long-term/sparse-vector-candidate-index'
 import type {
   MemoryDerivedArtifactV4,
   MemoryFactV4,
@@ -19,16 +20,19 @@ import type { MemoryV4Repository } from '../repository/memory-v4-repository'
 
 export const MEMORY_V4_SHADOW_RETRIEVER_VERSION = 'memory-v4-shadow-retriever-v2'
 export const MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION = 'memory-v3-v4-shadow-comparator-v1'
+export const MEMORY_V4_LOCAL_CALIBRATION_DATASET_FINGERPRINT = 'e039d598c093be3b22d4727762fdcaf0db0da3f41715d3e1a50f3d505e160899'
 export const DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION: RecallAbstentionCalibrationModel = {
-  version: 'memory-v4-absolute-evidence-v1:policy-fallback',
-  defaultThreshold: 0.36,
+  version: 'memory-v4-local-calibration-v1:deskpet-v4-local-synthetic-calibration-v1',
+  defaultThreshold: 0.45778665141358,
   thresholds: {
-    specific: 0.42,
-    'multi-fact': 0.34,
-    temporal: 0.30,
-    timeline: 0.24,
-    enumerative: 0.20,
+    enumerative: 0.36,
+    'multi-fact': 0.59778665141358,
+    specific: 0.583808110636619,
+    temporal: 0.5519159852738316,
+    timeline: 0.5,
   },
+  datasetVersion: 'deskpet-v4-local-synthetic-calibration-v1',
+  sampleCount: 700,
 }
 
 const MIN_LEXICAL_CANDIDATE_SCORE = 0.12
@@ -101,12 +105,10 @@ export interface MemoryV4ShadowRetrieverOptions {
 
 interface IndexedSummary {
   artifact: MemoryDerivedArtifactV4
-  vector: number[]
 }
 
 interface IndexedFact {
   fact: MemoryFactV4
-  vector: number[]
   sourceMemoryId?: string
 }
 
@@ -124,6 +126,8 @@ export function createMemoryV4ShadowRetriever(
     ?? DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION
   const summaryLexical = createMemoryBm25Index({ tokenizer: tokenizeV4Evidence })
   const factLexical = createMemoryBm25Index({ tokenizer: tokenizeV4Evidence })
+  const summarySemantic = createSparseVectorCandidateIndex()
+  const factSemantic = createSparseVectorCandidateIndex()
   const summaries = new Map<string, IndexedSummary>()
   const facts = new Map<string, IndexedFact>()
   let indexedRevision: number | undefined
@@ -141,11 +145,15 @@ export function createMemoryV4ShadowRetriever(
     facts.clear()
     summaryLexical.clear()
     factLexical.clear()
+    summarySemantic.clear()
+    factSemantic.clear()
 
     for (const artifact of snapshot.derivedArtifacts) {
       if (artifact.kind !== 'summary' || artifact.status !== 'current' || !artifact.content)
         continue
-      summaries.set(artifact.id, { artifact, vector: createLocalEmbedding(artifact.content) })
+      const vector = createLocalEmbedding(artifact.content)
+      summaries.set(artifact.id, { artifact })
+      summarySemantic.upsert(artifact.id, vector)
       summaryLexical.upsert({
         id: artifact.id,
         content: artifact.content,
@@ -158,13 +166,14 @@ export function createMemoryV4ShadowRetriever(
       if (!indexableFact(fact))
         continue
       const content = `${fact.memoryKey} ${fact.predicate} ${fact.canonicalText}`
+      const vector = createLocalEmbedding(content)
       const legacySourceId = legacySourceIds.get(fact.id)
       const v3SourceId = sourceMemoryId(fact) ?? legacySourceId
       facts.set(fact.id, {
         fact,
-        vector: createLocalEmbedding(content),
         ...(v3SourceId ? { sourceMemoryId: v3SourceId } : {}),
       })
+      factSemantic.upsert(fact.id, vector)
       factLexical.upsert({
         id: fact.id,
         content,
@@ -237,12 +246,15 @@ export function createMemoryV4ShadowRetriever(
       minScore: MIN_LEXICAL_CANDIDATE_SCORE,
     })
     const queryVector = createLocalEmbedding(normalizedQuery)
-    const summarySemanticHits = [...summaries.values()]
-      .filter(indexed => matchesScope(indexed.artifact.scope, recallOptions.scope))
-      .map(indexed => ({ indexed, score: cosine(queryVector, indexed.vector) }))
-      .filter(item => item.score >= MIN_SEMANTIC_CANDIDATE_SCORE)
-      .sort((left, right) => right.score - left.score || left.indexed.artifact.id.localeCompare(right.indexed.artifact.id))
-      .slice(0, candidateBudget)
+    const summarySemanticHits = summarySemantic.search(queryVector, {
+      limit: candidateBudget,
+      minScore: MIN_SEMANTIC_CANDIDATE_SCORE,
+      allow: id => summaries.get(id)?.artifact
+        ? matchesScope(summaries.get(id)!.artifact.scope, recallOptions.scope)
+        : false,
+    }).flatMap(hit => summaries.get(hit.id)
+      ? [{ indexed: summaries.get(hit.id)!, score: hit.score }]
+      : [])
     const summaryLexicalScores = new Map(summaryLexicalHits.map(hit => [hit.id, hit.score]))
     const summarySemanticScores = new Map(summarySemanticHits.map(hit => [hit.indexed.artifact.id, hit.score]))
     const fusedSummaries = reciprocalRankFusion<MemoryDerivedArtifactV4>([
@@ -292,21 +304,31 @@ export function createMemoryV4ShadowRetriever(
       minScore: MIN_LEXICAL_CANDIDATE_SCORE,
       allow: id => allowedFacts.has(id),
     })
-    const semanticHits = [...allowedFacts]
-      .flatMap(id => facts.get(id) ? [facts.get(id)!] : [])
-      .map(indexed => ({ indexed, score: cosine(queryVector, indexed.vector) }))
-      .filter(item => item.score >= MIN_SEMANTIC_CANDIDATE_SCORE)
-      .sort((left, right) => right.score - left.score || left.indexed.fact.id.localeCompare(right.indexed.fact.id))
-      .slice(0, candidateBudget)
-    const structuredHits = [...allowedFacts]
-      .flatMap(id => facts.get(id) ? [facts.get(id)!.fact] : [])
-      .filter(fact => structuredConceptEvidence(fact, plan.concepts) > 0)
-      .sort((left, right) => right.utilityScore - left.utilityScore || left.id.localeCompare(right.id))
-      .slice(0, candidateBudget)
+    const semanticHits = factSemantic.search(queryVector, {
+      limit: candidateBudget,
+      minScore: MIN_SEMANTIC_CANDIDATE_SCORE,
+      allow: id => allowedFacts.has(id),
+    }).flatMap(hit => facts.get(hit.id) ? [{ indexed: facts.get(hit.id)!, score: hit.score }] : [])
+    const structuredHits = plan.concepts.length === 0 && plan.intent !== 'enumerative'
+      ? []
+      : [...allowedFacts]
+          .flatMap(id => facts.get(id) ? [facts.get(id)!.fact] : [])
+          .filter(fact => structuredConceptEvidence(fact, plan.concepts, plan.intent) > 0)
+          .sort((left, right) => right.utilityScore - left.utilityScore || left.id.localeCompare(right.id))
+          .slice(0, candidateBudget)
     const lexicalScores = new Map(lexicalHits.map(hit => [hit.id, hit.score]))
     const semanticScores = new Map(semanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
-    const structuredScores = new Map(structuredHits.map(fact => [fact.id, structuredConceptEvidence(fact, plan.concepts)]))
-    const directEvidence = new Map([...allowedFacts].map(id => [
+    const structuredScores = new Map(structuredHits.map(fact => [
+      fact.id,
+      structuredConceptEvidence(fact, plan.concepts, plan.intent),
+    ]))
+    const directCandidateIds = new Set([
+      ...lexicalScores.keys(),
+      ...semanticScores.keys(),
+      ...structuredScores.keys(),
+      ...summaryFactSupport.keys(),
+    ])
+    const directEvidence = new Map([...directCandidateIds].map(id => [
       id,
       combineRouteEvidence([
         lexicalScores.get(id) ?? 0,
@@ -661,20 +683,21 @@ function sourceMemoryId(fact: MemoryFactV4): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined
 }
 
-function cosine(left: readonly number[], right: readonly number[]): number {
-  const length = Math.min(left.length, right.length)
-  let dot = 0
-  for (let index = 0; index < length; index++)
-    dot += (left[index] ?? 0) * (right[index] ?? 0)
-  return Math.max(0, Math.min(1, dot))
-}
-
 /** V4 BM25 treats Chinese bigrams as evidence and drops collision-prone unigrams. */
 function tokenizeV4Evidence(value: string): string[] {
   return tokenizeBm25(value).filter(token => !token.startsWith('c:') && !V4_BM25_STOP_TERMS.has(token))
 }
 
-function structuredConceptEvidence(fact: MemoryFactV4, concepts: readonly string[]): number {
+function structuredConceptEvidence(
+  fact: MemoryFactV4,
+  concepts: readonly string[],
+  intent: string,
+): number {
+  // An explicit broad personal-memory request asks for the active fact set.
+  // Scope/privacy/time filtering has already run, so every remaining fact is
+  // directly responsive even when no single semantic field was named.
+  if (intent === 'enumerative')
+    return 0.72
   if (concepts.includes(fact.memoryKey))
     return 1
   return concepts.some(concept =>

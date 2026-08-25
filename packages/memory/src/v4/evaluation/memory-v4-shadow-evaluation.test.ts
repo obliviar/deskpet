@@ -30,6 +30,10 @@ function comparison(index: number, intent = 'specific'): V3V4ShadowComparison {
     v3RetrievedCount: 2,
     v3InjectedCount: 1,
     v4RetrievedCount: 2,
+    v4Abstained: false,
+    v4BestEvidenceScore: 0.83,
+    v4AbstentionThreshold: 0.42,
+    v4AbstentionVersion: 'memory-v4-absolute-evidence-v1:policy-fallback',
     overlapCount: 1,
     v3AgreementRecallAtK: 0.5,
     v3AgreementPrecisionAtK: 0.5,
@@ -79,6 +83,12 @@ describe('persistent V4 shadow evaluation', () => {
     expect(status.overall.latencyMs.p95).toBeGreaterThanOrEqual(status.overall.latencyMs.p50)
     expect(status.byIntent.specific?.count).toBeGreaterThan(0)
     expect(status.byIntent.temporal?.count).toBeGreaterThan(0)
+    expect(status.lastComparison).toMatchObject({
+      v4Abstained: false,
+      v4BestEvidenceScore: 0.83,
+      v4AbstentionThreshold: 0.42,
+      v4AbstentionVersion: 'memory-v4-absolute-evidence-v1:policy-fallback',
+    })
 
     const restored = createMemoryV4ShadowEvaluationStore({
       persistence,

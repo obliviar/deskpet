@@ -137,7 +137,7 @@ function recallOptions() {
 
 function result(snapshotRevision: number): MemoryV4ShadowRecallResult {
   return {
-    version: 'memory-v4-shadow-retriever-v1',
+    version: 'memory-v4-shadow-retriever-v2',
     snapshotRevision,
     queryIntent: 'personal-specific',
     routes: [],

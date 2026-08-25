@@ -89,6 +89,12 @@ describe('Stage 5 versioned V3/V4 ground-truth evaluation', () => {
 
     expect(report.v4.failureCases).toBe(0)
     expect(report.v4.forbiddenLeakCases).toBe(0)
+    expect(report.v4).toMatchObject({
+      recallAtK: 1,
+      top1Accuracy: 1,
+      precisionAtK: 1,
+      abstentionAccuracy: 1,
+    })
     expect(report.v4.byCategory.privacy?.forbiddenLeakCases).toBe(0)
     expect(report.v4.byCategory.deletion?.forbiddenLeakCases).toBe(0)
     expect(report.v4.byCategory.scope?.forbiddenLeakCases).toBe(0)

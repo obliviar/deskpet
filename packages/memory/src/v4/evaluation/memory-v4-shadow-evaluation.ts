@@ -427,6 +427,16 @@ function normalizeComparison(value: V3V4ShadowComparison): V3V4ShadowComparison 
     v3RetrievedCount: nonNegativeInteger(value.v3RetrievedCount),
     v3InjectedCount: nonNegativeInteger(value.v3InjectedCount),
     v4RetrievedCount: nonNegativeInteger(value.v4RetrievedCount),
+    ...(typeof value.v4Abstained === 'boolean' ? { v4Abstained: value.v4Abstained } : {}),
+    ...(value.v4BestEvidenceScore === undefined
+      ? {}
+      : { v4BestEvidenceScore: clamp01(value.v4BestEvidenceScore) }),
+    ...(value.v4AbstentionThreshold === undefined
+      ? {}
+      : { v4AbstentionThreshold: nonNegativeNumber(value.v4AbstentionThreshold) }),
+    ...(value.v4AbstentionVersion === undefined
+      ? {}
+      : { v4AbstentionVersion: boundedString(value.v4AbstentionVersion, 128, 'unknown') }),
     overlapCount: nonNegativeInteger(value.overlapCount),
     v3AgreementRecallAtK: clamp01(value.v3AgreementRecallAtK),
     v3AgreementPrecisionAtK: clamp01(value.v3AgreementPrecisionAtK),

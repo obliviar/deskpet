@@ -35,7 +35,7 @@ export interface MemoryQueryPlan {
 const PERSONAL_CUE = /(?:我的|关于我|对我|我曾|我以前|我过去|我现在|我目前|你记得我|称呼我|本人|\bmy\b|\bme\b|about\s+me|remember\s+me|know\s+about\s+me)/iu
 const TIMELINE_CUE = /(?:变化|变迁|历程|时间线|先后|这些年|过去几年|从.+到|历史记录|timeline|over\s+time|through\s+the\s+years|history\s+of)/iu
 const MULTI_FACT_CUE = /(?:以及|还有|分别|各自|同时|和我的|与我的|哪些.{0,12}(?:偏好|习惯|信息)|\b(?:and|also|both|respectively)\b)/iu
-const EXTERNAL_KNOWLEDGE_CUE = /(?:什么是|定义是什么|如何定义|原理是什么|科普|解释一下|天气|新闻|汇率|股价|怎么计算|\bwhat\s+is\b|\bdefine\b|\bweather\b|\bnews\b|\bexchange\s+rate\b)/iu
+const EXTERNAL_KNOWLEDGE_CUE = /(?:什么是|定义是什么|如何定义|原理是什么|科普|解释一下|天气|下雨|降雨|气温|气象|空气质量|新闻|汇率|股价|怎么计算|\bwhat\s+is\b|\bdefine\b|\bweather\b|\brain(?:ing)?\b|\btemperature\b|\bnews\b|\bexchange\s+rate\b)/iu
 /** Correction, negation and “it changed” cues activate the correction route. */
 const CORRECTION_CUE = /(?:不是|记错|搞错|写错|更正|纠正|改成|换成|换成了|其实|应该是|以前是|之前是|原来是|不是吧|不对|弄错|更正为|\bnot\b[^.?]*\bmy\b|\bmistake\b|\bactually\b|\bused\s+to\s+be\b|\bchanged\s+to\b|\bcorrect(ed|ion)?\b)/iu
 /** Conversational-episode cues activate the episode route for same-context recall. */

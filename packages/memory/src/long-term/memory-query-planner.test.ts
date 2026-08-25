@@ -37,6 +37,9 @@ describe('memory query planner', () => {
       intent: 'external', requiresMemory: false, routes: [], candidateBudget: 0,
     })
     expect(planMemoryQuery('为什么我不喜欢咖啡').requiresMemory).toBe(true)
+    expect(planMemoryQuery('明天会不会下雨？')).toMatchObject({
+      intent: 'external', requiresMemory: false, routes: [],
+    })
   })
 
   it('honours explicit temporal options', () => {

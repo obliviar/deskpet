@@ -97,6 +97,7 @@ export {
   createMemoryTieringService,
 } from './consolidation/memory-tiering-service'
 export {
+  DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION,
   MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION,
   MEMORY_V4_SHADOW_RETRIEVER_VERSION,
   createMemoryV4ShadowRetriever,
@@ -107,6 +108,7 @@ export type {
   MemoryV4ShadowRecallOptions,
   MemoryV4ShadowRecallResult,
   MemoryV4ShadowRetriever,
+  MemoryV4ShadowRetrieverOptions,
   V3V4ShadowComparator,
   V3V4ShadowComparison,
   V3V4ShadowComparisonSink,

@@ -80,6 +80,8 @@ describe('Memory V4 read-only shadow retrieval', () => {
     })
 
     expect(recalled.hits[0]).toMatchObject({ sourceMemoryId: 'coffee' })
+    expect(recalled.hits.map(hit => hit.sourceMemoryId)).toEqual(['coffee'])
+    expect(recalled.abstention?.abstained).toBe(false)
     expect(recalled.hits[0]?.routes).toContain('summary-down-drill')
     expect(recalled.hits[0]?.summaryIds.length).toBeGreaterThan(0)
     expect(recalled.hits.some(hit => hit.sourceMemoryId === 'secret')).toBe(false)
@@ -94,12 +96,65 @@ describe('Memory V4 read-only shadow retrieval', () => {
     const retriever = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
 
     const current = retriever.recall('我现在做什么项目？', { scope, limit: 5 })
-    expect(current.hits.some(hit => hit.sourceMemoryId === 'old-project')).toBe(false)
+    expect(current.hits).toEqual([])
+    expect(current.abstention?.abstained).toBe(true)
 
     const historical = retriever.recall('我以前做过什么项目？', { scope, limit: 5 })
     expect(historical.hits).toEqual(expect.arrayContaining([
       expect.objectContaining({ sourceMemoryId: 'old-project', status: 'superseded' }),
     ]))
+  })
+
+  it('returns no memories when the requested fact is filtered or no relevant fact exists', async () => {
+    const repository = await seedRepository()
+    const retriever = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
+
+    const privateNote = retriever.recall('我的私人备注是什么？', {
+      scope,
+      sharePolicies: ['allow-remote'],
+      sensitivities: ['normal'],
+      limit: 5,
+    })
+    expect(privateNote.privacyFiltered).toBeGreaterThan(0)
+    expect(privateNote.hits).toEqual([])
+    expect(privateNote.abstention?.abstained).toBe(true)
+
+    const absentDoorCode = retriever.recall('我的门禁码是多少？', { scope, limit: 5 })
+    expect(absentDoorCode.hits).toEqual([])
+    expect(absentDoorCode.abstention?.abstained).toBe(true)
+
+    const weather = retriever.recall('明天会不会下雨？', { scope, limit: 5 })
+    expect(weather.queryIntent).toBe('external')
+    expect(weather.routes).toEqual([])
+    expect(weather.hits).toEqual([])
+  })
+
+  it('keeps exact lexical facts retrievable without relying on a known semantic field', async () => {
+    const payload = JSON.stringify({
+      version: 3,
+      items: [v3Item('door', '用户的门禁码：2468', 'private.door-code')],
+    })
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    repository.replace(migrateV3PayloadToV4(payload, { now: () => NOW }))
+    await createMemoryConsolidationService(repository).consolidate(scope, { granularity: ['session', 'day'] })
+    const retriever = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
+
+    const recalled = retriever.recall('我的门禁码是多少？', { scope, limit: 5 })
+    expect(recalled.hits.map(hit => hit.sourceMemoryId)).toEqual(['door'])
+    expect(recalled.hits[0]?.routes).toContain('fact-lexical')
+    expect(recalled.abstention).toMatchObject({
+      abstained: false,
+      version: 'memory-v4-absolute-evidence-v1:policy-fallback',
+    })
+  })
+
+  it('retrieves each independently supported fact for a multi-fact query', async () => {
+    const repository = await seedRepository()
+    const retriever = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
+
+    const recalled = retriever.recall('我的姓名和饮品偏好分别是什么？', { scope, limit: 5 })
+    expect(new Set(recalled.hits.map(hit => hit.sourceMemoryId))).toEqual(new Set(['coffee', 'name']))
+    expect(recalled.hits.every(hit => hit.score >= (recalled.abstention?.threshold ?? 1))).toBe(true)
   })
 
   it('rebuilds its derived indexes only when facts or summaries actually change', async () => {
@@ -145,7 +200,11 @@ describe('V3/V4 shadow comparator', () => {
     expect(comparison).toMatchObject({
       overlapCount: 1,
       v3AgreementRecallAtK: 1,
-      v3AgreementPrecisionAtK: 1 / 3,
+      v3AgreementPrecisionAtK: 1,
+      v4Abstained: false,
+      v4BestEvidenceScore: recalled.abstention?.bestScore,
+      v4AbstentionThreshold: recalled.abstention?.threshold,
+      v4AbstentionVersion: 'memory-v4-absolute-evidence-v1:policy-fallback',
     })
     expect(comparison.queryHash).toBe('a'.repeat(64))
     expect(comparison).toMatchObject({

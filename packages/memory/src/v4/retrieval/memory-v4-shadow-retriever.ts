@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
-import type { MemorySensitivity, MemorySharePolicy, MemoryTemporalMode } from '@deskpet/contracts'
-import { createMemoryBm25Index } from '../../long-term/bm25-index'
+import type { MemoryRecallAbstention, MemorySensitivity, MemorySharePolicy, MemoryTemporalMode } from '@deskpet/contracts'
+import {
+  calibrateRecallAbstention,
+  type RecallAbstentionCalibrationModel,
+} from '../../long-term/abstention-calibration'
+import { createMemoryBm25Index, tokenizeBm25 } from '../../long-term/bm25-index'
 import { createLocalEmbedding } from '../../long-term/local-embedding'
 import { planMemoryQuery } from '../../long-term/memory-query-planner'
 import { reciprocalRankFusion } from '../../long-term/reciprocal-rank-fusion'
@@ -13,8 +17,29 @@ import type {
 } from '../domain/types'
 import type { MemoryV4Repository } from '../repository/memory-v4-repository'
 
-export const MEMORY_V4_SHADOW_RETRIEVER_VERSION = 'memory-v4-shadow-retriever-v1'
+export const MEMORY_V4_SHADOW_RETRIEVER_VERSION = 'memory-v4-shadow-retriever-v2'
 export const MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION = 'memory-v3-v4-shadow-comparator-v1'
+export const DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION: RecallAbstentionCalibrationModel = {
+  version: 'memory-v4-absolute-evidence-v1:policy-fallback',
+  defaultThreshold: 0.36,
+  thresholds: {
+    specific: 0.42,
+    'multi-fact': 0.34,
+    temporal: 0.30,
+    timeline: 0.24,
+    enumerative: 0.20,
+  },
+}
+
+const MIN_LEXICAL_CANDIDATE_SCORE = 0.12
+const MIN_SEMANTIC_CANDIDATE_SCORE = 0.08
+const MIN_SUMMARY_EVIDENCE_SCORE = 0.28
+const SUMMARY_EVIDENCE_WEIGHT = 0.25
+const V4_BM25_STOP_TERMS = new Set([
+  'w:a', 'w:an', 'w:and', 'w:are', 'w:do', 'w:does', 'w:i', 'w:is', 'w:me',
+  'w:my', 'w:of', 'w:please', 'w:tell', 'w:the', 'w:to', 'w:user', 'w:what',
+  'w:you', 'w:your',
+])
 
 export interface MemoryV4ShadowRecallOptions {
   scope: { ownerId: string; agentId?: string; sessionId?: string }
@@ -52,6 +77,8 @@ export interface MemoryV4ShadowRecallResult {
   privacyFiltered: number
   temporalFiltered: number
   hits: MemoryV4ShadowRecallHit[]
+  /** Absolute-evidence reject decision; RRF rank is deliberately excluded. */
+  abstention?: MemoryRecallAbstention
   latencyMs: number
   index: {
     summaries: number
@@ -64,6 +91,12 @@ export interface MemoryV4ShadowRetriever {
   /** Read-only: it never mutates V4 or influences the answer path. */
   recall: (query: string, options: MemoryV4ShadowRecallOptions) => MemoryV4ShadowRecallResult
   indexStatus: () => { summaries: number; facts: number; rebuildCount: number; revision?: number }
+}
+
+export interface MemoryV4ShadowRetrieverOptions {
+  now?: () => number
+  /** Must be fitted on V4 absolute-evidence scores, never on normalized RRF. */
+  abstentionCalibration?: RecallAbstentionCalibrationModel
 }
 
 interface IndexedSummary {
@@ -84,11 +117,13 @@ interface IndexedFact {
  */
 export function createMemoryV4ShadowRetriever(
   repository: MemoryV4Repository,
-  options: { now?: () => number } = {},
+  options: MemoryV4ShadowRetrieverOptions = {},
 ): MemoryV4ShadowRetriever {
   const now = options.now ?? Date.now
-  const summaryLexical = createMemoryBm25Index()
-  const factLexical = createMemoryBm25Index()
+  const abstentionCalibration = options.abstentionCalibration
+    ?? DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION
+  const summaryLexical = createMemoryBm25Index({ tokenizer: tokenizeV4Evidence })
+  const factLexical = createMemoryBm25Index({ tokenizer: tokenizeV4Evidence })
   const summaries = new Map<string, IndexedSummary>()
   const facts = new Map<string, IndexedFact>()
   let indexedRevision: number | undefined
@@ -175,6 +210,7 @@ export function createMemoryV4ShadowRetriever(
     }
 
     if (!normalizedQuery || !plan.requiresMemory || allowedFacts.size === 0) {
+      const abstention = calibrateRecallAbstention(plan.intent, 0, abstentionCalibration)
       return result({
         snapshot,
         plan,
@@ -189,6 +225,7 @@ export function createMemoryV4ShadowRetriever(
         summaries: summaries.size,
         facts: facts.size,
         rebuildCount,
+        abstention,
       })
     }
 
@@ -197,14 +234,17 @@ export function createMemoryV4ShadowRetriever(
       scope: summaryScope,
       mode: 'current',
       limit: candidateBudget,
+      minScore: MIN_LEXICAL_CANDIDATE_SCORE,
     })
     const queryVector = createLocalEmbedding(normalizedQuery)
     const summarySemanticHits = [...summaries.values()]
       .filter(indexed => matchesScope(indexed.artifact.scope, recallOptions.scope))
       .map(indexed => ({ indexed, score: cosine(queryVector, indexed.vector) }))
-      .filter(item => item.score > 0)
+      .filter(item => item.score >= MIN_SEMANTIC_CANDIDATE_SCORE)
       .sort((left, right) => right.score - left.score || left.indexed.artifact.id.localeCompare(right.indexed.artifact.id))
       .slice(0, candidateBudget)
+    const summaryLexicalScores = new Map(summaryLexicalHits.map(hit => [hit.id, hit.score]))
+    const summarySemanticScores = new Map(summarySemanticHits.map(hit => [hit.indexed.artifact.id, hit.score]))
     const fusedSummaries = reciprocalRankFusion<MemoryDerivedArtifactV4>([
       {
         name: 'summary-lexical',
@@ -217,12 +257,31 @@ export function createMemoryV4ShadowRetriever(
         items: summarySemanticHits.map(item => ({ id: item.indexed.artifact.id, item: item.indexed.artifact })),
       },
     ], { windowSize: candidateBudget })
+      .map(item => ({
+        ...item,
+        evidenceScore: combineRouteEvidence([
+          summaryLexicalScores.get(item.id) ?? 0,
+          summarySemanticScores.get(item.id) ?? 0,
+        ]),
+      }))
+      .filter(item => item.evidenceScore >= MIN_SUMMARY_EVIDENCE_SCORE)
+      .sort((left, right) =>
+        right.evidenceScore - left.evidenceScore
+        || right.normalizedScore - left.normalizedScore
+        || left.id.localeCompare(right.id))
     const selectedSummaries = fusedSummaries.slice(0, summaryLimit)
-    const summaryFactRanks = new Map<string, number>()
+    const summaryFactSupport = new Map<string, { rank: number; evidenceScore: number }>()
     for (const [rank, summary] of selectedSummaries.entries()) {
       for (const factId of summary.item.sourceFactIds) {
-        if (allowedFacts.has(factId) && !summaryFactRanks.has(factId))
-          summaryFactRanks.set(factId, rank + 1)
+        if (!allowedFacts.has(factId))
+          continue
+        const current = summaryFactSupport.get(factId)
+        if (!current || summary.evidenceScore > current.evidenceScore) {
+          summaryFactSupport.set(factId, {
+            rank: rank + 1,
+            evidenceScore: summary.evidenceScore,
+          })
+        }
       }
     }
 
@@ -230,22 +289,37 @@ export function createMemoryV4ShadowRetriever(
       scope: summaryScope,
       mode,
       limit: candidateBudget,
+      minScore: MIN_LEXICAL_CANDIDATE_SCORE,
       allow: id => allowedFacts.has(id),
     })
     const semanticHits = [...allowedFacts]
       .flatMap(id => facts.get(id) ? [facts.get(id)!] : [])
       .map(indexed => ({ indexed, score: cosine(queryVector, indexed.vector) }))
-      .filter(item => item.score > 0)
+      .filter(item => item.score >= MIN_SEMANTIC_CANDIDATE_SCORE)
       .sort((left, right) => right.score - left.score || left.indexed.fact.id.localeCompare(right.indexed.fact.id))
       .slice(0, candidateBudget)
     const structuredHits = [...allowedFacts]
       .flatMap(id => facts.get(id) ? [facts.get(id)!.fact] : [])
-      .filter(fact => plan.concepts.some(concept =>
-        fact.memoryKey === concept || fact.memoryKey.startsWith(`${concept}.`) || concept.startsWith(`${fact.memoryKey}.`)))
+      .filter(fact => structuredConceptEvidence(fact, plan.concepts) > 0)
       .sort((left, right) => right.utilityScore - left.utilityScore || left.id.localeCompare(right.id))
       .slice(0, candidateBudget)
-    const summaryHits = [...summaryFactRanks]
-      .sort((left, right) => left[1] - right[1] || left[0].localeCompare(right[0]))
+    const lexicalScores = new Map(lexicalHits.map(hit => [hit.id, hit.score]))
+    const semanticScores = new Map(semanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
+    const structuredScores = new Map(structuredHits.map(fact => [fact.id, structuredConceptEvidence(fact, plan.concepts)]))
+    const directEvidence = new Map([...allowedFacts].map(id => [
+      id,
+      combineRouteEvidence([
+        lexicalScores.get(id) ?? 0,
+        semanticScores.get(id) ?? 0,
+        structuredScores.get(id) ?? 0,
+      ]),
+    ]))
+    const threshold = calibrateRecallAbstention(plan.intent, 0, abstentionCalibration).threshold
+    const minimumSummaryFactEvidence = threshold * 0.5
+    const summaryHits = [...summaryFactSupport]
+      // A summary is navigation, not evidence that every fact in its bucket is relevant.
+      .filter(([id]) => (directEvidence.get(id) ?? 0) >= minimumSummaryFactEvidence)
+      .sort((left, right) => left[1].rank - right[1].rank || left[0].localeCompare(right[0]))
       .flatMap(([id]) => facts.get(id)?.fact ? [{ id, item: facts.get(id)!.fact }] : [])
 
     const routes = [
@@ -263,21 +337,39 @@ export function createMemoryV4ShadowRetriever(
       { name: 'summary-down-drill', items: summaryHits },
     ].filter(route => route.items.length > 0)
     const fusedFacts = reciprocalRankFusion<MemoryFactV4>(routes, { windowSize: candidateBudget })
-      .map(item => ({
-        ...item,
-        qualityScore: clamp01(
-          0.72 * item.normalizedScore
-          + 0.10 * item.item.verificationScore
-          + 0.10 * item.item.utilityScore
-          + 0.08 * item.item.importance,
-        ),
-      }))
-      .sort((left, right) => right.qualityScore - left.qualityScore || left.id.localeCompare(right.id))
-    const hits = fusedFacts.slice(0, limit).map(({ item, qualityScore, routes }) => ({
+      .map((item) => {
+        const directScore = directEvidence.get(item.id) ?? 0
+        const summaryScore = item.routes.includes('summary-down-drill')
+          ? summaryFactSupport.get(item.id)?.evidenceScore ?? 0
+          : 0
+        const evidenceScore = clamp01(
+          directScore + SUMMARY_EVIDENCE_WEIGHT * summaryScore * (1 - directScore),
+        )
+        // Rank support and static quality may break close ties, but cannot make
+        // an item eligible when its absolute evidence is below the reject gate.
+        const rankingScore = clamp01(
+          0.88 * evidenceScore
+          + 0.06 * item.normalizedScore * evidenceScore
+          + 0.02 * item.item.verificationScore
+          + 0.02 * item.item.utilityScore
+          + 0.02 * item.item.importance,
+        )
+        return { ...item, evidenceScore, rankingScore }
+      })
+      .sort((left, right) =>
+        right.rankingScore - left.rankingScore
+        || right.evidenceScore - left.evidenceScore
+        || left.id.localeCompare(right.id))
+    const bestEvidenceScore = fusedFacts[0]?.evidenceScore ?? 0
+    const abstention = calibrateRecallAbstention(plan.intent, bestEvidenceScore, abstentionCalibration)
+    const eligibleFacts = abstention.abstained
+      ? []
+      : fusedFacts.filter(item => item.evidenceScore >= abstention.threshold)
+    const hits = eligibleFacts.slice(0, limit).map(({ item, evidenceScore, routes }) => ({
       factId: item.id,
       ...(facts.get(item.id)?.sourceMemoryId ? { sourceMemoryId: facts.get(item.id)!.sourceMemoryId } : {}),
       content: item.canonicalText,
-      score: qualityScore,
+      score: evidenceScore,
       routes,
       summaryIds: selectedSummaries
         .filter(summary => summary.item.sourceFactIds.includes(item.id))
@@ -303,6 +395,7 @@ export function createMemoryV4ShadowRetriever(
       summaries: summaries.size,
       facts: facts.size,
       rebuildCount,
+      abstention,
     })
   }
 
@@ -329,6 +422,10 @@ export interface V3V4ShadowComparison {
   v3RetrievedCount: number
   v3InjectedCount: number
   v4RetrievedCount: number
+  v4Abstained?: boolean
+  v4BestEvidenceScore?: number
+  v4AbstentionThreshold?: number
+  v4AbstentionVersion?: string
   overlapCount: number
   /** Agreement against the current V3 baseline, not ground-truth recall. */
   v3AgreementRecallAtK: number
@@ -404,6 +501,14 @@ export function createV3V4ShadowComparator(options: {
         v3RetrievedCount: v3.size,
         v3InjectedCount: new Set(v3InjectedIds).size,
         v4RetrievedCount: v4Ids.size,
+        ...(v4.abstention
+          ? {
+              v4Abstained: v4.abstention.abstained,
+              v4BestEvidenceScore: v4.abstention.bestScore,
+              v4AbstentionThreshold: v4.abstention.threshold,
+              v4AbstentionVersion: v4.abstention.version,
+            }
+          : {}),
         overlapCount,
         v3AgreementRecallAtK: v3.size > 0 ? overlapCount / v3.size : (v4Ids.size === 0 ? 1 : 0),
         v3AgreementPrecisionAtK: v4Ids.size > 0 ? overlapCount / v4Ids.size : (v3.size === 0 ? 1 : 0),
@@ -472,6 +577,7 @@ function result(input: {
   summaries: number
   facts: number
   rebuildCount: number
+  abstention?: MemoryRecallAbstention
 }): MemoryV4ShadowRecallResult {
   return {
     version: MEMORY_V4_SHADOW_RETRIEVER_VERSION,
@@ -484,6 +590,7 @@ function result(input: {
     privacyFiltered: input.privacyFiltered,
     temporalFiltered: input.temporalFiltered,
     hits: input.hits,
+    ...(input.abstention ? { abstention: input.abstention } : {}),
     latencyMs: Math.max(0, performance.now() - input.startedAt),
     index: {
       summaries: input.summaries,
@@ -560,6 +667,32 @@ function cosine(left: readonly number[], right: readonly number[]): number {
   for (let index = 0; index < length; index++)
     dot += (left[index] ?? 0) * (right[index] ?? 0)
   return Math.max(0, Math.min(1, dot))
+}
+
+/** V4 BM25 treats Chinese bigrams as evidence and drops collision-prone unigrams. */
+function tokenizeV4Evidence(value: string): string[] {
+  return tokenizeBm25(value).filter(token => !token.startsWith('c:') && !V4_BM25_STOP_TERMS.has(token))
+}
+
+function structuredConceptEvidence(fact: MemoryFactV4, concepts: readonly string[]): number {
+  if (concepts.includes(fact.memoryKey))
+    return 1
+  return concepts.some(concept =>
+    fact.memoryKey.startsWith(`${concept}.`) || concept.startsWith(`${fact.memoryKey}.`))
+    ? 0.86
+    : 0
+}
+
+/** Preserve absolute route strength while giving bounded credit to corroboration. */
+function combineRouteEvidence(scores: readonly number[]): number {
+  const ordered = scores.map(clamp01).sort((left, right) => right - left)
+  const strongest = ordered[0] ?? 0
+  const remaining = 1 - strongest
+  return clamp01(
+    strongest
+    + remaining * 0.16 * (ordered[1] ?? 0)
+    + remaining * 0.08 * (ordered[2] ?? 0),
+  )
 }
 
 function clamp01(value: number): number {

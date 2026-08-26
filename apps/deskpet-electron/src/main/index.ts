@@ -72,6 +72,11 @@ import {
   type MemoryV4ShadowWorkerClient,
 } from './memory-v4-shadow-worker-client'
 import { createMemoryV4InternalReviewController } from './memory-v4-internal-review'
+import {
+  createMemoryV4InternalFeedbackStore,
+  isMemoryV4InternalFeedbackLabel,
+  type MemoryV4InternalFeedbackStore,
+} from './memory-v4-internal-feedback'
 import { buildMemoryV4SemanticIndexSnapshot } from './memory-v4-semantic-bridge'
 import {
   createMemoryV4SemanticBackgroundIndex,
@@ -325,9 +330,12 @@ interface MemoryV4ShadowComparisonTask {
 }
 let memoryV4ShadowEvaluationPersistence: EncryptedMemoryPersistence | undefined
 let memoryV4ShadowEvaluationStore: MemoryV4ShadowEvaluationStore | undefined
+let memoryV4InternalFeedbackPersistence: EncryptedMemoryPersistence | undefined
+let memoryV4InternalFeedbackStore: MemoryV4InternalFeedbackStore | undefined
 let memoryV4ShadowTaskQueue: MemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTask> | undefined
 let memoryV4ShadowGeneration = 0
 let memoryV4ShadowEvaluationError = ''
+let memoryV4InternalFeedbackError = ''
 const memoryV4InternalReview = createMemoryV4InternalReviewController({
   enabled: false,
   timeoutMs: 1_500,
@@ -352,6 +360,8 @@ const memoryV4JournalPath = join(userDataDir, 'memory-v4.enc.journal')
 const memoryV4KeyPath = join(userDataDir, 'memory-v4-key.json')
 const memoryV4ShadowEvaluationPath = join(userDataDir, 'memory-v4-shadow-eval.enc')
 const memoryV4ShadowEvaluationKeyPath = join(userDataDir, 'memory-v4-shadow-eval-key.json')
+const memoryV4InternalFeedbackPath = join(userDataDir, 'memory-v4-internal-feedback.enc')
+const memoryV4InternalFeedbackKeyPath = join(userDataDir, 'memory-v4-internal-feedback-key.json')
 const memoryV4EmbeddingStoragePath = join(userDataDir, 'memory-v4-embeddings.enc')
 const memoryV4EmbeddingKeyPath = join(userDataDir, 'memory-v4-embedding-key.json')
 let semanticModelProgress: SemanticModelProgress = { status: 'idle' }
@@ -506,6 +516,12 @@ function initializeMemory(): void {
   catch (error) {
     writeBootLog(`Memory V4 shadow evaluation flush before reinitialize failed: ${errorMessage(error)}`)
   }
+  try {
+    memoryV4InternalFeedbackStore?.flush()
+  }
+  catch (error) {
+    writeBootLog(`Memory V4 Internal feedback flush before reinitialize failed: ${errorMessage(error)}`)
+  }
   memory = undefined
   memoryPersistence = undefined
   memoryEmbeddingIndex = undefined
@@ -523,7 +539,10 @@ function initializeMemory(): void {
   memoryV4ShadowComparator = createV3V4ShadowComparator()
   memoryV4ShadowEvaluationPersistence = undefined
   memoryV4ShadowEvaluationStore = undefined
+  memoryV4InternalFeedbackPersistence = undefined
+  memoryV4InternalFeedbackStore = undefined
   memoryV4ShadowEvaluationError = ''
+  memoryV4InternalFeedbackError = ''
   memoryCandidateReview = undefined
   memoryV4Persistence = undefined
   memoryStore = undefined
@@ -779,6 +798,33 @@ function initializeMemory(): void {
         memoryV4ShadowComparator = createV3V4ShadowComparator()
         writeBootLog(`Memory V4 persistent shadow evaluation disabled: ${memoryV4ShadowEvaluationError}`)
       }
+      try {
+        const feedbackPersistence = createEncryptedFilePersistence({
+          encryptedPath: memoryV4InternalFeedbackPath,
+          keyPath: memoryV4InternalFeedbackKeyPath,
+          protectKey: key => safeStorage.encryptString(key.toString('base64')),
+          unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
+        })
+        const feedbackStore = createMemoryV4InternalFeedbackStore({
+          persistence: feedbackPersistence,
+          encrypted: true,
+          maxReviews: 4_096,
+          flushDelayMs: 1_000,
+          onPersistenceError: (error) => {
+            memoryV4InternalFeedbackError = errorMessage(error)
+            writeBootLog(`Memory V4 Internal feedback persistence failed: ${memoryV4InternalFeedbackError}`)
+          },
+        })
+        memoryV4InternalFeedbackPersistence = feedbackPersistence
+        memoryV4InternalFeedbackStore = feedbackStore
+        writeBootLog(`Memory V4 encrypted Internal feedback ready: ${feedbackStore.status().retainedReviews} reviews retained`)
+      }
+      catch (error) {
+        memoryV4InternalFeedbackPersistence = undefined
+        memoryV4InternalFeedbackStore = undefined
+        memoryV4InternalFeedbackError = errorMessage(error)
+        writeBootLog(`Memory V4 Internal feedback disabled; retrieval remains active: ${memoryV4InternalFeedbackError}`)
+      }
       memoryV4ShadowTaskQueue = createMemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTask>({
         maxPending: 4,
         maxQueueAgeMs: 10_000,
@@ -827,7 +873,9 @@ function initializeMemory(): void {
               v4,
             )
             if (task.internalReviewRequestId) {
-              memoryV4InternalReview.complete(task.internalReviewRequestId, comparison, v4)
+              const review = memoryV4InternalReview.complete(task.internalReviewRequestId, comparison, v4)
+              if (review)
+                memoryV4InternalFeedbackStore?.registerReview(review)
               writeBootLog('Memory V4 internal candidate review completed; V3 remained authoritative')
             }
           }
@@ -1135,6 +1183,9 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
       .filter(artifact => artifact.sourceFactIds.includes(fact.id))
       .map(artifact => artifact.id)])
     memoryV4EmbeddingIndex?.scrubBackups()
+    memoryV4InternalFeedbackStore?.removeFactIds([fact.id, id])
+    memoryV4InternalFeedbackStore?.flush()
+    memoryV4InternalFeedbackPersistence?.scrubBackups()
     removedV3 = await memory.purge(id, localMemoryScope)
     memoryV4Shadow!.flush()
     const recoveredV3 = memoryPersistence?.loadReadOnly()
@@ -1144,6 +1195,7 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
     }
     memoryV4Persistence.scrubBackups()
     memoryV4EmbeddingIndex?.scrubBackups()
+    memoryV4InternalFeedbackPersistence?.scrubBackups()
   }
   catch (error) {
     writeBootLog(`Memory purge partially failed for ${id}: ${errorMessage(error)}`)
@@ -1160,6 +1212,8 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
     residual.push('派生向量索引仍含该记忆')
   if (memoryV4EmbeddingIndex?.hasMemory(fact.id))
     residual.push('V4 派生语义索引仍含该记忆')
+  if (memoryV4InternalFeedbackStore?.hasFact(fact.id) || memoryV4InternalFeedbackStore?.hasFact(id))
+    residual.push('V4 Internal 反馈仍含该事实引用')
   if (residual.length > 0)
     return { ok: false as const, error: `清除后残留审计失败：${residual.join('；')}`, residual }
   writeBootLog(`Memory purge completed: ${id}, V3 removed=${removedV3}, V4 version=${lifecycle.version}, residual=0`)
@@ -1177,6 +1231,7 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
       checkpointCompacted: true,
       backupsScrubbed: true,
       embeddingIndexPurged: true,
+      internalFeedbackPurged: true,
     },
   }
 }
@@ -1327,6 +1382,9 @@ function setupIPC() {
         requestedRolloutStage: memorySettings.v4RolloutStage,
         rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
         internalReview: memoryV4InternalReview.status(),
+        internalFeedback: memoryV4InternalFeedbackStore?.status(),
+        internalFeedbackPath: memoryV4InternalFeedbackPath,
+        internalFeedbackError: memoryV4InternalFeedbackError,
         learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
           ? memoryV4SemanticBackgroundIndex.status(memoryV4Repository.snapshot())
           : undefined,
@@ -1378,6 +1436,9 @@ function setupIPC() {
         requestedRolloutStage: memorySettings.v4RolloutStage,
         rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
         internalReview: memoryV4InternalReview.status(),
+        internalFeedback: memoryV4InternalFeedbackStore?.status(),
+        internalFeedbackPath: memoryV4InternalFeedbackPath,
+        internalFeedbackError: memoryV4InternalFeedbackError,
         learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
           ? memoryV4SemanticBackgroundIndex.status(memoryV4Repository.snapshot())
           : undefined,
@@ -1417,6 +1478,39 @@ function setupIPC() {
       : memoryCandidateReview.reject(id, localMemoryScope, note)
     memoryV4Shadow?.flush()
     return changed ? { ok: true } : { ok: false, error: '候选不存在、已审核或不属于当前作用域。' }
+  })
+
+  ipcMain.handle('memory:v4-internal-feedback', async (
+    _event,
+    input: { reviewId?: unknown; factId?: unknown; label?: unknown },
+  ) => {
+    if (!memoryV4InternalFeedbackStore)
+      return { ok: false, error: 'V4 Internal 反馈存储当前不可用。' }
+    const reviewId = typeof input?.reviewId === 'string' ? input.reviewId.trim() : ''
+    const factId = typeof input?.factId === 'string' ? input.factId.trim() : ''
+    if (!reviewId || !isMemoryV4InternalFeedbackLabel(input?.label))
+      return { ok: false, error: '无效的 V4 Internal 反馈。' }
+    const result = memoryV4InternalFeedbackStore.recordFeedback({
+      reviewId,
+      ...(factId ? { factId } : {}),
+      label: input.label,
+    })
+    if (!result.ok) {
+      const errors = {
+        'unknown-review': '评审记录已过期或不存在。',
+        'unknown-candidate': '候选不属于该评审。',
+        'invalid-target': '“遗漏”只能标记整轮评审，其他反馈必须选择具体候选。',
+      }
+      return { ok: false, error: errors[result.reason] }
+    }
+    try {
+      memoryV4InternalFeedbackStore.flush()
+      return { ok: true, label: result.label, status: memoryV4InternalFeedbackStore.status() }
+    }
+    catch (error) {
+      memoryV4InternalFeedbackError = errorMessage(error)
+      return { ok: false, error: `反馈未能加密保存：${memoryV4InternalFeedbackError}` }
+    }
   })
 
   ipcMain.handle('memory:candidate-reprocess', async (
@@ -1597,6 +1691,7 @@ function setupIPC() {
     invalidateMemoryV4ShadowComparisons()
     await memory.clear(localMemoryScope)
     memoryV4ShadowEvaluationStore?.clear()
+    memoryV4InternalFeedbackStore?.clear()
     return { ok: true, count: 0 }
   })
 
@@ -1738,6 +1833,12 @@ app.on('before-quit', (event) => {
   }
   catch (error) {
     writeBootLog(`Memory V4 shadow evaluation final flush failed: ${errorMessage(error)}`)
+  }
+  try {
+    memoryV4InternalFeedbackStore?.flush()
+  }
+  catch (error) {
+    writeBootLog(`Memory V4 Internal feedback final flush failed: ${errorMessage(error)}`)
   }
   if (!memoryShutdownComplete && (memory?.pendingCaptureCount() ?? 0) > 0) {
     event.preventDefault()

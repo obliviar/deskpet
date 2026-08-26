@@ -12,6 +12,7 @@ interface Message {
 }
 
 interface MemoryV4InternalCandidateReview {
+  reviewId: string
   mode: 'internal-candidate'
   authoritativeAnswerSource: 'v3'
   v4InfluencedAnswer: false
@@ -32,6 +33,25 @@ interface MemoryV4InternalCandidateReview {
   }
   agreement: { overlapCount: number; recallAtK: number; precisionAtK: number; jaccard: number }
 }
+
+type MemoryV4InternalFeedbackLabel =
+  | 'correct'
+  | 'should-not-use'
+  | 'incorrect'
+  | 'expired'
+  | 'missing'
+  | 'privacy'
+
+const V4_INTERNAL_CANDIDATE_FEEDBACK_OPTIONS: Array<{
+  label: Exclude<MemoryV4InternalFeedbackLabel, 'missing'>
+  text: string
+}> = [
+  { label: 'correct', text: '正确' },
+  { label: 'should-not-use', text: '不应使用' },
+  { label: 'incorrect', text: '事实错误' },
+  { label: 'expired', text: '已过期' },
+  { label: 'privacy', text: '隐私不当' },
+]
 
 interface Theme {
   id: string
@@ -242,6 +262,9 @@ const semanticModelProgress = ref<{
   checkedBytes?: number
 }>({ status: 'idle' })
 const semanticInstalling = ref(false)
+const v4InternalFeedback = ref<Record<string, MemoryV4InternalFeedbackLabel>>({})
+const v4InternalFeedbackPending = ref('')
+const v4InternalFeedbackError = ref<Record<string, string>>({})
 
 // Screen capture state
 const pendingImage = ref<{ data: string; mimeType: string } | null>(null)
@@ -1124,6 +1147,40 @@ function closeThemeMenu(restorePreview: boolean) {
   showThemeMenu.value = false
 }
 
+function v4FeedbackKey(reviewId: string, factId?: string): string {
+  return `${reviewId}:${factId || '__missing__'}`
+}
+
+async function submitV4InternalFeedback(
+  reviewId: string,
+  factId: string | undefined,
+  label: MemoryV4InternalFeedbackLabel,
+) {
+  const key = v4FeedbackKey(reviewId, factId)
+  if (v4InternalFeedbackPending.value)
+    return
+  v4InternalFeedbackPending.value = key
+  v4InternalFeedbackError.value[key] = ''
+  try {
+    const result = await ipcRenderer.invoke('memory:v4-internal-feedback', {
+      reviewId,
+      ...(factId ? { factId } : {}),
+      label,
+    })
+    if (!result?.ok) {
+      v4InternalFeedbackError.value[key] = result?.error || '反馈保存失败。'
+      return
+    }
+    v4InternalFeedback.value[key] = label
+  }
+  catch (error) {
+    v4InternalFeedbackError.value[key] = error instanceof Error ? error.message : '反馈保存失败。'
+  }
+  finally {
+    v4InternalFeedbackPending.value = ''
+  }
+}
+
 function toggleThemeMenu() {
   if (showThemeMenu.value) {
     closeThemeMenu(true)
@@ -1522,11 +1579,34 @@ async function doReset() {
               <span>拒答门槛 {{ Math.round(msg.memoryReview.v4.threshold * 100) }}%</span>
               <span>重合 {{ msg.memoryReview.agreement.overlapCount }}</span>
             </div>
+            <div class="v4-review-query-feedback">
+              <span>正确记忆没有出现在候选中？</span>
+              <button
+                :class="{ selected: v4InternalFeedback[v4FeedbackKey(msg.memoryReview.reviewId)] === 'missing' }"
+                :disabled="!!v4InternalFeedbackPending"
+                @click="submitV4InternalFeedback(msg.memoryReview.reviewId, undefined, 'missing')"
+              >标记遗漏</button>
+              <small v-if="v4InternalFeedbackError[v4FeedbackKey(msg.memoryReview.reviewId)]">
+                {{ v4InternalFeedbackError[v4FeedbackKey(msg.memoryReview.reviewId)] }}
+              </small>
+            </div>
             <div v-for="candidate in msg.memoryReview.v4.candidates" :key="candidate.factId" class="v4-review-candidate">
               <div>{{ candidate.content }}</div>
               <small>
                 证据 {{ Math.round(candidate.score * 100) }}% · {{ candidate.status }} ·
                 {{ candidate.routes.join(' + ') }}
+              </small>
+              <div class="v4-review-feedback-actions">
+                <button
+                  v-for="option in V4_INTERNAL_CANDIDATE_FEEDBACK_OPTIONS"
+                  :key="option.label"
+                  :class="{ selected: v4InternalFeedback[v4FeedbackKey(msg.memoryReview.reviewId, candidate.factId)] === option.label }"
+                  :disabled="!!v4InternalFeedbackPending"
+                  @click="submitV4InternalFeedback(msg.memoryReview.reviewId, candidate.factId, option.label)"
+                >{{ option.text }}</button>
+              </div>
+              <small v-if="v4InternalFeedbackError[v4FeedbackKey(msg.memoryReview.reviewId, candidate.factId)]" class="v4-review-feedback-error">
+                {{ v4InternalFeedbackError[v4FeedbackKey(msg.memoryReview.reviewId, candidate.factId)] }}
               </small>
             </div>
             <div v-if="msg.memoryReview.v4.candidates.length === 0" class="v4-review-empty">
@@ -1736,6 +1816,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .v4-review-candidate { margin-top: 7px; padding: 7px; border-radius: 6px; background: var(--surface); color: var(--text); line-height: 1.4; }
 .v4-review-candidate small { display: block; margin-top: 4px; color: var(--text-muted); }
 .v4-review-empty { margin-top: 7px; color: var(--text-muted); }
+.v4-review-query-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.v4-review-query-feedback small { width: 100%; color: #e74c3c; }
+.v4-review-query-feedback button, .v4-review-feedback-actions button { padding: 3px 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text-muted); cursor: pointer; font-size: 10px; }
+.v4-review-query-feedback button:hover:not(:disabled), .v4-review-feedback-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.v4-review-query-feedback button.selected, .v4-review-feedback-actions button.selected { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.v4-review-query-feedback button:disabled, .v4-review-feedback-actions button:disabled { cursor: default; opacity: 0.55; }
+.v4-review-feedback-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.v4-review-feedback-error { color: #e74c3c !important; }
 
 /* Image preview */
 .image-preview { display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: var(--surface); border-top: 1px solid var(--border); }

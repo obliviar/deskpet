@@ -8,6 +8,7 @@ export const MEMORY_V4_INTERNAL_REVIEW_VERSION = 'memory-v4-internal-candidate-r
 
 export interface MemoryV4InternalCandidateReview {
   version: typeof MEMORY_V4_INTERNAL_REVIEW_VERSION
+  reviewId: string
   mode: 'internal-candidate'
   authoritativeAnswerSource: 'v3'
   v4InfluencedAnswer: false
@@ -199,7 +200,7 @@ export function createMemoryV4InternalReviewController(options: {
     const request = pendingById.get(requestId)
     if (!request || request.settled)
       return undefined
-    const review = buildReview(comparison, recall, now())
+    const review = buildReview(request.id, comparison, recall, now())
     if (!settle(request, review))
       return undefined
     completed += 1
@@ -258,6 +259,7 @@ export function createMemoryV4InternalReviewController(options: {
 }
 
 function buildReview(
+  reviewId: string,
   comparison: V3V4ShadowComparison,
   recall: MemoryV4ShadowRecallResult,
   createdAt: number,
@@ -265,6 +267,7 @@ function buildReview(
   const abstention = recall.abstention
   return {
     version: MEMORY_V4_INTERNAL_REVIEW_VERSION,
+    reviewId,
     mode: 'internal-candidate',
     authoritativeAnswerSource: 'v3',
     v4InfluencedAnswer: false,

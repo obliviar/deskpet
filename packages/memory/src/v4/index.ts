@@ -146,6 +146,22 @@ export type {
   MemoryV4LocalCalibrationArtifact,
   MemoryV4LocalCalibrationOptions,
 } from './evaluation/memory-v4-local-calibration'
+export {
+  MEMORY_V4_INTERNAL_FEEDBACK_LABELS,
+  MEMORY_V4_INTERNAL_FEEDBACK_SCHEMA_VERSION,
+  MEMORY_V4_INTERNAL_FEEDBACK_VERSION,
+  createMemoryV4InternalFeedbackStore,
+  isMemoryV4InternalFeedbackLabel,
+} from './evaluation/memory-v4-internal-feedback'
+export type {
+  MemoryV4InternalFeedbackCandidate,
+  MemoryV4InternalFeedbackLabel,
+  MemoryV4InternalFeedbackPersistence,
+  MemoryV4InternalFeedbackResult,
+  MemoryV4InternalFeedbackReviewInput,
+  MemoryV4InternalFeedbackStatus,
+  MemoryV4InternalFeedbackStore,
+} from './evaluation/memory-v4-internal-feedback'
 export type {
   ArchiveColdFactsOptions,
   ArchiveColdFactsReport,

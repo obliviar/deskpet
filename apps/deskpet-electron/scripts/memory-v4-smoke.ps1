@@ -114,7 +114,7 @@ try {
   if (Test-Path -LiteralPath (Join-Path $dataPath 'memories.json')) {
     throw 'The verified V3 encryption migration left the legacy plaintext file behind.'
   }
-  foreach ($file in @('memories.enc', 'memory-key.json', 'memory-embeddings.enc', 'memory-embedding-key.json', 'memory-v4.enc', 'memory-v4-key.json', 'memory-v4.enc.journal', 'memory-v4-shadow-eval.enc', 'memory-v4-shadow-eval-key.json', 'memory-v4-shadow-eval-hmac-key.json')) {
+  foreach ($file in @('memories.enc', 'memory-key.json', 'memory-embeddings.enc', 'memory-embedding-key.json', 'memory-v4.enc', 'memory-v4-key.json', 'memory-v4.enc.journal', 'memory-v4-shadow-eval.enc', 'memory-v4-shadow-eval-key.json', 'memory-v4-shadow-eval-hmac-key.json', 'memory-v4-internal-feedback.enc', 'memory-v4-internal-feedback-key.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $dataPath $file))) {
       throw "Expected encrypted memory artifact is missing: $file"
     }

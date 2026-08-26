@@ -2,7 +2,7 @@
 
 DeskPet 是一个基于 Electron、Vue 3 和 TypeScript 的 Windows 桌面 AI 伙伴。项目采用 Monorepo 与 Port/Adapter 架构，将聊天模型、会话、长期记忆、工具和语音能力拆分为独立模块。
 
-> 当前版本：`0.3.7`。本版将 V4 Internal 内部评审产品化：可在记忆管理界面安全切换并持久化阶段，退出时清理挂起任务；V3 仍是唯一正式回答来源。
+> 当前版本：`0.3.8`。本版完成 V4 Internal 人工反馈闭环：六类标签与实际签发的评审/候选绑定、加密保存并联动隐私清除；这些标签只形成校准数据，尚不会自动改变正式排序。V3 仍是唯一正式回答来源。
 
 ## 主要功能
 
@@ -21,7 +21,7 @@ DeskPet 是一个基于 Electron、Vue 3 和 TypeScript 的 Windows 桌面 AI �
 
 ### Windows 打包版
 
-1. 下载并完整解压 `DeskPet-0.3.7-win.zip`。
+1. 下载并完整解压 `DeskPet-0.3.8-win.zip`。
 2. 启动 `DeskPet.exe`，不要直接在 ZIP 内运行。
 3. 首次进入时设置助手名称。
 4. 点击右上角“API”，填写 API Key、Base URL 和模型名称。
@@ -61,6 +61,7 @@ DeskPet 同时保留短期会话和长期记忆：
 | 长期记忆 v3 | 原子事实、时间版本、来源、向量和隐私字段 | 跨会话及历史时间召回，默认最多 20,000 条 | `memories.enc` + `memories.enc.journal` |
 | V4 影子记忆 | 事实图、证据、版本、摘要、检索事件和冷热层级 | 双写审计、离线巩固和候选质量评估，不直接进入回答 | `memory-v4.enc` + `memory-v4.enc.journal` |
 | V4 学习语义索引 | 与精确正文哈希绑定的 BGE 事实/摘要向量 | 在隔离 Worker 中增强改写和同义表达召回 | `memory-v4-embeddings.enc` |
+| V4 Internal 反馈 | 查询哈希、候选/来源 ID、分数和六类人工标签 | 建立可审计的本地校准集；不保存查询、回答或记忆正文，不直接改变排序 | `memory-v4-internal-feedback.enc` |
 
 ### 完整工作流程
 
@@ -116,6 +117,8 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 - 启动对账使用线性映射索引；5000 条模拟 V3 记录首次对账约 393 ms，未变化重启约 46 ms（测试机器结果，不是性能保证）。
 - V4 影子检索在独立 Worker 中运行；超时、模型不匹配、索引损坏或语义查询失败时安全退回哈希/BM25 路径，聊天提示词继续只使用经过验证的 V3 召回结果。
 - 记忆管理界面可以在 `Shadow` 与 `Internal` 之间切换。`Internal` 只把 V4 候选附在本地回复下方供检查，不会修改提示词；退出或运行时失败会立即清理挂起评审并回到 `Shadow`。
+- 每轮实际签发的评审可标注“正确、不应使用、事实错误、已过期、遗漏、隐私不当”。除“遗漏”为整轮标签外，其余反馈必须绑定该轮真实候选，无法通过 IPC 伪造候选；数据经独立 AES-256-GCM 文件保存，彻底清除事实时同步移除 V4/V3 ID 引用。
+- 当前反馈仅用于形成后续冻结校准集，不会在线自学习或直接提高/降低记忆分数，避免少量误标立即污染正式回答。
 
 ### 长期优化计划表
 
@@ -131,11 +134,12 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 | √ | V4 隔离影子召回 | 独立 Worker、多路 RRF、BM25、结构化查询、摘要导航、绝对证据门槛、拒答和持久化对比已完成；不影响正式回答 |
 | √ | V4 学习语义旁路 | 固定指纹 BGE、SHA-256 模型清单、启动探针、V3 向量复用、独立加密索引、后台增量补齐、内容哈希校验和哈希降级已完成 |
 | √ | V4 Internal 内部评审 | 阶段持久化、运行时启停、界面控制、环境锁、Worker 前置校验和挂起任务清理已完成；V3 始终权威 |
+| √ | V4 Internal 人工反馈采集 | 六类绑定式标签、候选防伪、查询级遗漏、独立加密存储、明文最小化、删除联动和状态统计已完成；反馈不直接修改在线排序 |
 | × | 高质量写入门控（3/8） | 已上线双通道候选、本地证据 verifier 和七类写入决策；低证据/冲突候选不进入 V3 正式召回并在 V4 隔离，完整上下文、归一化、审核和重处理仍待完成 |
 | × | 时间与冲突演化 | 完整处理补充、纠正、替代、冲突和历史时间查询 |
 | × | 分层巩固与遗忘 | 日/周/月摘要、稳定事实、事件层和可恢复冷归档 |
 | × | 大规模多层检索（4/5） | 已有冷热分层、精确密集向量、BM25、哈希、时间/字段检索和摘要下钻；待真实 BGE 冻结集校准后才能成为正式召回 |
-| × | 反馈学习和可解释管理 | 使用 RetrievalEvent 改进排序，并在界面显示来源、版本、可信度与召回原因 |
+| × | 反馈学习和可解释管理（1/4） | 已完成高质量标签采集；仍需一致性复核、冻结训练/验证集、离线校准门禁和可解释来源管理，门禁通过前不接入排序 |
 | × | 长周期可靠性与隐私 | 备份恢复、文件锁、故障注入、隐私泄漏评测和一年尺度模拟 |
 | × | V4 灰度切换与一年验收 | 质量门槛达标后小比例召回，可立即回退 V3，最终完成一年记忆验收 |
 
@@ -239,6 +243,10 @@ Windows 打包版主要数据位于：
 ├─ memory-v4-key.json    # V4 独立的 DPAPI 保护密钥
 ├─ memory-v4-embeddings.enc # V4 事实/摘要的加密 BGE 派生索引
 ├─ memory-v4-embedding-key.json # V4 语义索引的 DPAPI 保护密钥
+├─ memory-v4-shadow-eval.enc # 加密的 V3/V4 影子比较指标
+├─ memory-v4-shadow-eval-key.json # 影子比较数据的 DPAPI 保护密钥
+├─ memory-v4-internal-feedback.enc # 加密的 Internal 人工反馈（不含正文）
+├─ memory-v4-internal-feedback-key.json # Internal 反馈的 DPAPI 保护密钥
 ├─ memory-settings.json  # 提取、语义、OCR 和分享设置
 ├─ sessions.enc          # AES-256-GCM 加密短期聊天历史
 ├─ session-key.json      # DPAPI 保护后的会话主密钥
@@ -309,10 +317,13 @@ deskpet/
 - `packages/memory/src/long-term/encrypted-persistence.ts`：AES-256-GCM 文件适配器
 - `packages/memory/src/v4/dual-write/v4-shadow-writer.ts`：V3 提交后双写、证据连接、版本和召回审计
 - `packages/memory/src/v4/retrieval/memory-v4-shadow-retriever.ts`：V4 多路召回、学习语义、融合和拒答
+- `packages/memory/src/v4/evaluation/memory-v4-internal-feedback.ts`：绑定式六类反馈、最小化持久化、统计和删除联动
 - `packages/core/src/runtime/agent-runtime.ts`：召回、附件和来源 ID
 - `apps/deskpet-electron/src/main/semantic-memory.ts`：本地中文语义模型
 - `apps/deskpet-electron/src/main/memory-v4-semantic-index.ts`：V4 加密语义索引、迁移和后台增量重建
 - `apps/deskpet-electron/src/main/memory-v4-shadow-worker.ts`：隔离 V4 影子召回 Worker
+- `apps/deskpet-electron/src/main/memory-v4-internal-review.ts`：签发本地评审、短时关联查询与影子候选
+- `apps/deskpet-electron/src/main/memory-v4-internal-feedback.ts`：将临时候选裁剪为无正文的核心反馈记录
 - `apps/deskpet-electron/src/main/image-memory.ts`：显式图片 OCR
 - `apps/deskpet-electron/src/main/index.ts`：加密初始化、隐私过滤和 IPC
 - `apps/deskpet-electron/src/renderer/src/App.vue`：记忆管理界面
@@ -349,7 +360,7 @@ pnpm --filter @deskpet/electron package
 - 本地语义模型和 OCR 语言数据需要首次联网下载，未内置到安装 ZIP。
 - 短期会话与长期记忆均已加密；DPAPI 密钥与数据文件必须一起备份。
 - 当前桌面端固定为一个本地用户和一个 Agent 作用域。
-- V4 已执行隔离影子召回和内部评估，但没有进入聊天提示词；学习语义分数仍需用真实 BGE 冻结集正式校准后才能灰度接管回答。
+- V4 已执行隔离影子召回、内部评审和加密反馈采集，但没有进入聊天提示词；学习语义分数和人工标签仍需冻结集复核、正式校准与门禁评测后才能灰度接管回答。
 - 桌面设置只允许 `Shadow` 和 `Internal`；尚未实现 `percent-1` 流量分桶、V4 提示词注入与在线自动回滚。
 - 本次代码回归未执行外部盲测；本机也没有 BGE 模型缓存，因此真实 BGE 开发集对比未执行，不能把合成集成绩视作上线质量证明。
 - 尚无多进程文件锁、正文原地编辑和分层的日/周/月会话摘要。

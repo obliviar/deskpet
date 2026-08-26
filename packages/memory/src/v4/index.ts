@@ -98,7 +98,9 @@ export {
 } from './consolidation/memory-tiering-service'
 export {
   DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION,
+  MEMORY_V4_LEARNED_SEMANTIC_EVIDENCE_VERSION,
   MEMORY_V4_LOCAL_CALIBRATION_DATASET_FINGERPRINT,
+  MEMORY_V4_SEMANTIC_INDEX_VERSION,
   MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION,
   MEMORY_V4_SHADOW_RETRIEVER_VERSION,
   createMemoryV4ShadowRetriever,
@@ -110,6 +112,9 @@ export type {
   MemoryV4ShadowRecallResult,
   MemoryV4ShadowRetriever,
   MemoryV4ShadowRetrieverOptions,
+  MemoryV4SemanticIndexSnapshot,
+  MemoryV4SemanticQueryEmbedding,
+  MemoryV4SemanticVectorEntry,
   V3V4ShadowComparator,
   V3V4ShadowComparison,
   V3V4ShadowComparisonSink,

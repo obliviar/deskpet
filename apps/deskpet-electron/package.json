@@ -1,6 +1,6 @@
 {
   "name": "@deskpet/electron",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "private": true,
   "type": "module",
   "description": "DeskPet Electron desktop app",
@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "test": "vitest run src/main/memory-v4-shadow-worker-client.test.ts --no-file-parallelism",
+    "test": "vitest run src/main --no-file-parallelism",
     "test:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/memory-v4-smoke.ps1",
     "preview": "electron-vite preview",
     "package": "electron-vite build && electron-builder --win dir && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-versioned.ps1",

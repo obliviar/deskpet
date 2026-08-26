@@ -2,6 +2,7 @@ import { Worker } from 'node:worker_threads'
 import type {
   MemoryV4ShadowRecallOptions,
   MemoryV4ShadowRecallResult,
+  MemoryV4SemanticIndexSnapshot,
   MemoryV4Snapshot,
 } from '@deskpet/memory'
 import type {
@@ -31,6 +32,7 @@ export interface MemoryV4ShadowWorkerClientStatus {
   timeouts: number
   cancellations: number
   snapshotSyncs: number
+  semanticSyncs: number
   lastTaskMs?: number
   lastIndex?: MemoryV4ShadowRecallResult['index'] & { revision: number }
 }
@@ -45,6 +47,8 @@ export interface MemoryV4ShadowWorkerClient {
 export interface MemoryV4ShadowWorkerClientOptions {
   workerPath: string
   getSnapshot: () => MemoryV4Snapshot
+  /** Learned vectors are synchronized only for their matching snapshot. */
+  getSemanticIndex?: (snapshot: MemoryV4Snapshot) => MemoryV4SemanticIndexSnapshot | undefined
   timeoutMs?: number
   workerFactory?: (workerPath: string) => WorkerLike
   now?: () => number
@@ -53,6 +57,7 @@ export interface MemoryV4ShadowWorkerClientOptions {
 interface ActiveRequest {
   requestId: number
   snapshotRevision?: number
+  semanticIdentity?: string
   startedAt: number
   timer: ReturnType<typeof setTimeout>
   resolve: (result: MemoryV4ShadowRecallResult) => void
@@ -71,6 +76,7 @@ export function createMemoryV4ShadowWorkerClient(
   let startedBefore = false
   let nextRequestId = 1
   let syncedRevision: number | undefined
+  let syncedSemanticIdentity: string | undefined
   let starts = 0
   let restarts = 0
   let requests = 0
@@ -79,6 +85,7 @@ export function createMemoryV4ShadowWorkerClient(
   let timeouts = 0
   let cancellations = 0
   let snapshotSyncs = 0
+  let semanticSyncs = 0
   let lastTaskMs: number | undefined
   let lastIndex: MemoryV4ShadowWorkerClientStatus['lastIndex']
 
@@ -109,6 +116,7 @@ export function createMemoryV4ShadowWorkerClient(
     if (worker === current)
       worker = undefined
     syncedRevision = undefined
+    syncedSemanticIdentity = undefined
     void current.terminate().catch(() => undefined)
   }
 
@@ -152,6 +160,10 @@ export function createMemoryV4ShadowWorkerClient(
       syncedRevision = request.snapshotRevision
       snapshotSyncs += 1
     }
+    if (request.semanticIdentity !== undefined) {
+      syncedSemanticIdentity = request.semanticIdentity
+      semanticSyncs += 1
+    }
     lastIndex = { ...message.result.index, revision: message.result.snapshotRevision }
     request.resolve(message.result)
   }
@@ -169,6 +181,11 @@ export function createMemoryV4ShadowWorkerClient(
       }
       const snapshot = options.getSnapshot()
       const requiresSync = syncedRevision !== snapshot.revision
+      const semanticIndex = options.getSemanticIndex?.(snapshot)
+      const semanticIdentity = semanticIndex
+        ? `${semanticIndex.snapshotRevision}:${semanticIndex.semanticRevision}:${semanticIndex.model}`
+        : undefined
+      const requiresSemanticSync = semanticIdentity !== undefined && semanticIdentity !== syncedSemanticIdentity
       const requestId = nextRequestId++
       requests += 1
       return new Promise<MemoryV4ShadowRecallResult>((resolve, reject) => {
@@ -183,6 +200,7 @@ export function createMemoryV4ShadowWorkerClient(
         active = {
           requestId,
           ...(requiresSync ? { snapshotRevision: snapshot.revision } : {}),
+          ...(requiresSemanticSync ? { semanticIdentity } : {}),
           startedAt,
           timer,
           resolve,
@@ -195,6 +213,7 @@ export function createMemoryV4ShadowWorkerClient(
             query,
             options: recallOptions,
             ...(requiresSync ? { snapshot } : {}),
+            ...(requiresSemanticSync && semanticIndex ? { semanticIndex } : {}),
           })
         }
         catch (error) {
@@ -230,6 +249,7 @@ export function createMemoryV4ShadowWorkerClient(
       timeouts,
       cancellations,
       snapshotSyncs,
+      semanticSyncs,
       ...(lastTaskMs === undefined ? {} : { lastTaskMs }),
       ...(lastIndex ? { lastIndex: { ...lastIndex } } : {}),
     }),

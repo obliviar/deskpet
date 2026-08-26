@@ -60,6 +60,15 @@ describe('Memory V4 shadow worker client', () => {
     const client = createMemoryV4ShadowWorkerClient({
       workerPath: 'worker.js',
       getSnapshot: () => structuredClone(snapshot),
+      getSemanticIndex: current => ({
+        version: 1,
+        snapshotRevision: current.revision,
+        semanticRevision: current.revision,
+        model: 'verified-bge-test',
+        dimension: 2,
+        factVectors: [],
+        summaryVectors: [],
+      }),
       workerFactory: () => worker,
     })
 
@@ -69,12 +78,14 @@ describe('Memory V4 shadow worker client', () => {
     await client.recall('third', recallOptions())
 
     expect(worker.messages.map(message => message.snapshot?.revision)).toEqual([3, undefined, 4])
+    expect(worker.messages.map(message => message.semanticIndex?.snapshotRevision)).toEqual([3, undefined, 4])
     expect(client.status()).toMatchObject({
       starts: 1,
       restarts: 0,
       requests: 3,
       completed: 3,
       snapshotSyncs: 2,
+      semanticSyncs: 2,
       lastIndex: { revision: 4 },
     })
   })

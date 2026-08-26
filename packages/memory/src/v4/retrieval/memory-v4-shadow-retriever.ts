@@ -5,6 +5,7 @@ import {
   type RecallAbstentionCalibrationModel,
 } from '../../long-term/abstention-calibration'
 import { createMemoryBm25Index, tokenizeBm25 } from '../../long-term/bm25-index'
+import { createDenseVectorCandidateIndex } from '../../long-term/dense-vector-candidate-index'
 import { createLocalEmbedding } from '../../long-term/local-embedding'
 import { planMemoryQuery } from '../../long-term/memory-query-planner'
 import { reciprocalRankFusion } from '../../long-term/reciprocal-rank-fusion'
@@ -20,6 +21,8 @@ import type { MemoryV4Repository } from '../repository/memory-v4-repository'
 
 export const MEMORY_V4_SHADOW_RETRIEVER_VERSION = 'memory-v4-shadow-retriever-v2'
 export const MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION = 'memory-v3-v4-shadow-comparator-v1'
+export const MEMORY_V4_SEMANTIC_INDEX_VERSION = 1 as const
+export const MEMORY_V4_LEARNED_SEMANTIC_EVIDENCE_VERSION = 'memory-v4-learned-semantic-evidence-v1'
 export const MEMORY_V4_LOCAL_CALIBRATION_DATASET_FINGERPRINT = 'e039d598c093be3b22d4727762fdcaf0db0da3f41715d3e1a50f3d505e160899'
 export const DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION: RecallAbstentionCalibrationModel = {
   version: 'memory-v4-local-calibration-v1:deskpet-v4-local-synthetic-calibration-v1',
@@ -37,6 +40,7 @@ export const DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION: RecallAbstentionCa
 
 const MIN_LEXICAL_CANDIDATE_SCORE = 0.12
 const MIN_SEMANTIC_CANDIDATE_SCORE = 0.08
+const MIN_LEARNED_SEMANTIC_COSINE = 0.45
 const MIN_SUMMARY_EVIDENCE_SCORE = 0.28
 const SUMMARY_EVIDENCE_WEIGHT = 0.25
 const V4_BM25_STOP_TERMS = new Set([
@@ -53,6 +57,32 @@ export interface MemoryV4ShadowRecallOptions {
   sensitivities?: MemorySensitivity[]
   temporalMode?: MemoryTemporalMode
   asOf?: number
+  /** Optional verified local-model query vector. Never persisted by recall. */
+  semanticQuery?: MemoryV4SemanticQueryEmbedding
+}
+
+export interface MemoryV4SemanticQueryEmbedding {
+  model: string
+  vector: number[]
+}
+
+export interface MemoryV4SemanticVectorEntry {
+  id: string
+  /** SHA-256 of the exact fact/summary text embedded by the host. */
+  contentHash: string
+  vector: number[]
+}
+
+/** Versioned learned-vector side index synchronized to the Worker. */
+export interface MemoryV4SemanticIndexSnapshot {
+  version: typeof MEMORY_V4_SEMANTIC_INDEX_VERSION
+  snapshotRevision: number
+  /** Monotonic host-side vector generation, independent from fact changes. */
+  semanticRevision: number
+  model: string
+  dimension: number
+  factVectors: MemoryV4SemanticVectorEntry[]
+  summaryVectors: MemoryV4SemanticVectorEntry[]
 }
 
 export interface MemoryV4ShadowRecallHit {
@@ -88,13 +118,30 @@ export interface MemoryV4ShadowRecallResult {
     summaries: number
     facts: number
     rebuildCount: number
+    semanticModel?: string
+    semanticDimension?: number
+    semanticFacts?: number
+    semanticSummaries?: number
+    semanticQueryUsed?: boolean
+    semanticEvidenceVersion?: string
   }
 }
 
 export interface MemoryV4ShadowRetriever {
   /** Read-only: it never mutates V4 or influences the answer path. */
   recall: (query: string, options: MemoryV4ShadowRecallOptions) => MemoryV4ShadowRecallResult
-  indexStatus: () => { summaries: number; facts: number; rebuildCount: number; revision?: number }
+  replaceSemanticIndex: (index?: MemoryV4SemanticIndexSnapshot) => void
+  indexStatus: () => {
+    summaries: number
+    facts: number
+    rebuildCount: number
+    revision?: number
+    semanticModel?: string
+    semanticDimension?: number
+    semanticFacts?: number
+    semanticSummaries?: number
+    semanticRevision?: number
+  }
 }
 
 export interface MemoryV4ShadowRetrieverOptions {
@@ -128,13 +175,65 @@ export function createMemoryV4ShadowRetriever(
   const factLexical = createMemoryBm25Index({ tokenizer: tokenizeV4Evidence })
   const summarySemantic = createSparseVectorCandidateIndex()
   const factSemantic = createSparseVectorCandidateIndex()
+  const learnedSummarySemantic = createDenseVectorCandidateIndex()
+  const learnedFactSemantic = createDenseVectorCandidateIndex()
   const summaries = new Map<string, IndexedSummary>()
   const facts = new Map<string, IndexedFact>()
   let indexedRevision: number | undefined
   let indexedSignature = ''
   let rebuildCount = 0
+  let semanticModel: string | undefined
+  let semanticDimension: number | undefined
+  let semanticSnapshotRevision: number | undefined
+  let semanticIndexRevision: number | undefined
+
+  function clearSemanticIndex(): void {
+    learnedSummarySemantic.clear()
+    learnedFactSemantic.clear()
+    semanticModel = undefined
+    semanticDimension = undefined
+    semanticSnapshotRevision = undefined
+    semanticIndexRevision = undefined
+  }
+
+  function replaceSemanticIndex(index?: MemoryV4SemanticIndexSnapshot): void {
+    clearSemanticIndex()
+    if (!index)
+      return
+    const snapshot = repository.snapshot()
+    if (index.version !== MEMORY_V4_SEMANTIC_INDEX_VERSION)
+      throw new Error(`Unsupported V4 semantic index version: ${String(index.version)}`)
+    if (index.snapshotRevision !== snapshot.revision)
+      throw new Error(`V4 semantic index revision ${index.snapshotRevision} does not match snapshot ${snapshot.revision}`)
+    if (!index.model.trim() || !Number.isSafeInteger(index.dimension) || index.dimension <= 0)
+      throw new Error('V4 semantic index identity is invalid')
+    const factsById = new Map(snapshot.facts.map(fact => [fact.id, fact]))
+    const summariesById = new Map(snapshot.derivedArtifacts
+      .filter(artifact => artifact.kind === 'summary' && artifact.status === 'current' && artifact.content)
+      .map(artifact => [artifact.id, artifact]))
+    for (const entry of index.factVectors) {
+      const fact = factsById.get(entry.id)
+      if (!fact || !indexableFact(fact) || entry.contentHash !== semanticContentHash(fact.canonicalText))
+        continue
+      assertSemanticEntry(entry, index.dimension)
+      learnedFactSemantic.upsert(entry.id, entry.vector)
+    }
+    for (const entry of index.summaryVectors) {
+      const artifact = summariesById.get(entry.id)
+      if (!artifact?.content || entry.contentHash !== semanticContentHash(artifact.content))
+        continue
+      assertSemanticEntry(entry, index.dimension)
+      learnedSummarySemantic.upsert(entry.id, entry.vector)
+    }
+    semanticModel = index.model
+    semanticDimension = index.dimension
+    semanticSnapshotRevision = index.snapshotRevision
+    semanticIndexRevision = index.semanticRevision
+  }
 
   function rebuild(snapshot: MemoryV4Snapshot): void {
+    if (semanticSnapshotRevision !== undefined && semanticSnapshotRevision !== snapshot.revision)
+      clearSemanticIndex()
     const signature = indexSignature(snapshot)
     indexedRevision = snapshot.revision
     if (signature === indexedSignature)
@@ -235,6 +334,11 @@ export function createMemoryV4ShadowRetriever(
         facts: facts.size,
         rebuildCount,
         abstention,
+        semanticQueryUsed: false,
+        semanticModel,
+        semanticDimension,
+        semanticFacts: learnedFactSemantic.size(),
+        semanticSummaries: learnedSummarySemantic.size(),
       })
     }
 
@@ -255,8 +359,21 @@ export function createMemoryV4ShadowRetriever(
     }).flatMap(hit => summaries.get(hit.id)
       ? [{ indexed: summaries.get(hit.id)!, score: hit.score }]
       : [])
+    const learnedQuery = validLearnedQuery(recallOptions.semanticQuery, semanticModel, semanticDimension)
+    const learnedSummarySemanticHits = learnedQuery
+      ? learnedSummarySemantic.search(learnedQuery.vector, {
+          limit: candidateBudget,
+          minScore: MIN_LEARNED_SEMANTIC_COSINE,
+          allow: id => summaries.get(id)?.artifact
+            ? matchesScope(summaries.get(id)!.artifact.scope, recallOptions.scope)
+            : false,
+        }).flatMap(hit => summaries.get(hit.id)
+          ? [{ indexed: summaries.get(hit.id)!, score: learnedSemanticEvidence(hit.score) }]
+          : [])
+      : []
     const summaryLexicalScores = new Map(summaryLexicalHits.map(hit => [hit.id, hit.score]))
     const summarySemanticScores = new Map(summarySemanticHits.map(hit => [hit.indexed.artifact.id, hit.score]))
+    const learnedSummarySemanticScores = new Map(learnedSummarySemanticHits.map(hit => [hit.indexed.artifact.id, hit.score]))
     const fusedSummaries = reciprocalRankFusion<MemoryDerivedArtifactV4>([
       {
         name: 'summary-lexical',
@@ -265,15 +382,22 @@ export function createMemoryV4ShadowRetriever(
           : []),
       },
       {
-        name: 'summary-semantic',
+        name: learnedQuery ? 'summary-semantic-hash' : 'summary-semantic',
         items: summarySemanticHits.map(item => ({ id: item.indexed.artifact.id, item: item.indexed.artifact })),
+      },
+      {
+        name: 'summary-semantic-learned',
+        items: learnedSummarySemanticHits.map(item => ({ id: item.indexed.artifact.id, item: item.indexed.artifact })),
       },
     ], { windowSize: candidateBudget })
       .map(item => ({
         ...item,
         evidenceScore: combineRouteEvidence([
           summaryLexicalScores.get(item.id) ?? 0,
-          summarySemanticScores.get(item.id) ?? 0,
+          Math.max(
+            summarySemanticScores.get(item.id) ?? 0,
+            learnedSummarySemanticScores.get(item.id) ?? 0,
+          ),
         ]),
       }))
       .filter(item => item.evidenceScore >= MIN_SUMMARY_EVIDENCE_SCORE)
@@ -309,6 +433,15 @@ export function createMemoryV4ShadowRetriever(
       minScore: MIN_SEMANTIC_CANDIDATE_SCORE,
       allow: id => allowedFacts.has(id),
     }).flatMap(hit => facts.get(hit.id) ? [{ indexed: facts.get(hit.id)!, score: hit.score }] : [])
+    const learnedSemanticHits = learnedQuery
+      ? learnedFactSemantic.search(learnedQuery.vector, {
+          limit: candidateBudget,
+          minScore: MIN_LEARNED_SEMANTIC_COSINE,
+          allow: id => allowedFacts.has(id),
+        }).flatMap(hit => facts.get(hit.id)
+          ? [{ indexed: facts.get(hit.id)!, score: learnedSemanticEvidence(hit.score) }]
+          : [])
+      : []
     const structuredHits = plan.concepts.length === 0 && plan.intent !== 'enumerative'
       ? []
       : [...allowedFacts]
@@ -318,6 +451,7 @@ export function createMemoryV4ShadowRetriever(
           .slice(0, candidateBudget)
     const lexicalScores = new Map(lexicalHits.map(hit => [hit.id, hit.score]))
     const semanticScores = new Map(semanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
+    const learnedSemanticScores = new Map(learnedSemanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
     const structuredScores = new Map(structuredHits.map(fact => [
       fact.id,
       structuredConceptEvidence(fact, plan.concepts, plan.intent),
@@ -325,6 +459,7 @@ export function createMemoryV4ShadowRetriever(
     const directCandidateIds = new Set([
       ...lexicalScores.keys(),
       ...semanticScores.keys(),
+      ...learnedSemanticScores.keys(),
       ...structuredScores.keys(),
       ...summaryFactSupport.keys(),
     ])
@@ -332,7 +467,7 @@ export function createMemoryV4ShadowRetriever(
       id,
       combineRouteEvidence([
         lexicalScores.get(id) ?? 0,
-        semanticScores.get(id) ?? 0,
+        Math.max(semanticScores.get(id) ?? 0, learnedSemanticScores.get(id) ?? 0),
         structuredScores.get(id) ?? 0,
       ]),
     ]))
@@ -352,8 +487,12 @@ export function createMemoryV4ShadowRetriever(
           : []),
       },
       {
-        name: 'fact-semantic',
+        name: learnedQuery ? 'fact-semantic-hash' : 'fact-semantic',
         items: semanticHits.map(item => ({ id: item.indexed.fact.id, item: item.indexed.fact })),
+      },
+      {
+        name: 'fact-semantic-learned',
+        items: learnedSemanticHits.map(item => ({ id: item.indexed.fact.id, item: item.indexed.fact })),
       },
       { name: 'fact-structured', items: structuredHits.map(fact => ({ id: fact.id, item: fact })) },
       { name: 'summary-down-drill', items: summaryHits },
@@ -418,16 +557,27 @@ export function createMemoryV4ShadowRetriever(
       facts: facts.size,
       rebuildCount,
       abstention,
+      semanticQueryUsed: learnedQuery !== undefined,
+      semanticModel,
+      semanticDimension,
+      semanticFacts: learnedFactSemantic.size(),
+      semanticSummaries: learnedSummarySemantic.size(),
     })
   }
 
   return {
     recall,
+    replaceSemanticIndex,
     indexStatus: () => ({
       summaries: summaries.size,
       facts: facts.size,
       rebuildCount,
       ...(indexedRevision === undefined ? {} : { revision: indexedRevision }),
+      ...(semanticModel ? { semanticModel } : {}),
+      ...(semanticDimension === undefined ? {} : { semanticDimension }),
+      ...(semanticIndexRevision === undefined ? {} : { semanticRevision: semanticIndexRevision }),
+      ...(semanticModel ? { semanticFacts: learnedFactSemantic.size() } : {}),
+      ...(semanticModel ? { semanticSummaries: learnedSummarySemantic.size() } : {}),
     }),
   }
 }
@@ -600,6 +750,11 @@ function result(input: {
   facts: number
   rebuildCount: number
   abstention?: MemoryRecallAbstention
+  semanticQueryUsed?: boolean
+  semanticModel?: string
+  semanticDimension?: number
+  semanticFacts?: number
+  semanticSummaries?: number
 }): MemoryV4ShadowRecallResult {
   return {
     version: MEMORY_V4_SHADOW_RETRIEVER_VERSION,
@@ -618,6 +773,12 @@ function result(input: {
       summaries: input.summaries,
       facts: input.facts,
       rebuildCount: input.rebuildCount,
+      ...(input.semanticModel ? { semanticModel: input.semanticModel } : {}),
+      ...(input.semanticDimension === undefined ? {} : { semanticDimension: input.semanticDimension }),
+      ...(input.semanticFacts === undefined ? {} : { semanticFacts: input.semanticFacts }),
+      ...(input.semanticSummaries === undefined ? {} : { semanticSummaries: input.semanticSummaries }),
+      ...(input.semanticQueryUsed === undefined ? {} : { semanticQueryUsed: input.semanticQueryUsed }),
+      ...(input.semanticQueryUsed ? { semanticEvidenceVersion: MEMORY_V4_LEARNED_SEMANTIC_EVIDENCE_VERSION } : {}),
     },
   }
 }
@@ -718,6 +879,47 @@ function combineRouteEvidence(scores: readonly number[]): number {
   )
 }
 
+/**
+ * Conservative fixed transform used only during shadow evaluation. It maps
+ * BGE-like cosine values onto the existing absolute-evidence scale; production
+ * activation still requires a model-specific, real-data calibration artifact.
+ */
+function learnedSemanticEvidence(cosine: number): number {
+  return clamp01((cosine - 0.35) / 0.55)
+}
+
+function validLearnedQuery(
+  query: MemoryV4SemanticQueryEmbedding | undefined,
+  model: string | undefined,
+  dimension: number | undefined,
+): MemoryV4SemanticQueryEmbedding | undefined {
+  if (!query || !model || dimension === undefined || query.model !== model)
+    return undefined
+  try {
+    assertNormalizedVector(query.vector, dimension, 'query')
+    return query
+  }
+  catch {
+    // A corrupt/incompatible optional vector must fall back to the local hash
+    // route rather than taking down the V3-authoritative shadow comparison.
+    return undefined
+  }
+}
+
+function assertSemanticEntry(entry: MemoryV4SemanticVectorEntry, dimension: number): void {
+  if (!entry.id.trim() || !/^[a-f0-9]{64}$/u.test(entry.contentHash))
+    throw new Error('V4 semantic vector entry identity is invalid')
+  assertNormalizedVector(entry.vector, dimension, `entry ${entry.id}`)
+}
+
+function assertNormalizedVector(vector: readonly number[], dimension: number, label: string): void {
+  if (!Array.isArray(vector) || vector.length !== dimension || !vector.every(Number.isFinite))
+    throw new Error(`V4 semantic ${label} vector is invalid or has the wrong dimension`)
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0))
+  if (Math.abs(norm - 1) > 0.03)
+    throw new Error(`V4 semantic ${label} vector is not normalized`)
+}
+
 function clamp01(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
 }
@@ -730,4 +932,8 @@ function clampInteger(value: number, minimum: number, maximum: number): number {
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function semanticContentHash(value: string): string {
+  return sha256(value.normalize('NFKC'))
 }

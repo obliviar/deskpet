@@ -2,7 +2,7 @@
 
 DeskPet 是一个基于 Electron、Vue 3 和 TypeScript 的 Windows 桌面 AI 伙伴。项目采用 Monorepo 与 Port/Adapter 架构，将聊天模型、会话、长期记忆、工具和语音能力拆分为独立模块。
 
-> 当前版本：`0.1.0`。本版重点更新了长期记忆方案 A。
+> 当前版本：`0.3.6`。本版为 V4 影子召回接入了经校验的本地 BGE 向量、独立加密语义索引和后台增量重建；V3 仍是正式回答来源。
 
 ## 主要功能
 
@@ -21,7 +21,7 @@ DeskPet 是一个基于 Electron、Vue 3 和 TypeScript 的 Windows 桌面 AI �
 
 ### Windows 打包版
 
-1. 下载并完整解压 `DeskPet-0.1.0-win.zip`。
+1. 下载并完整解压 `DeskPet-0.3.6-win.zip`。
 2. 启动 `DeskPet.exe`，不要直接在 ZIP 内运行。
 3. 首次进入时设置助手名称。
 4. 点击右上角“API”，填写 API Key、Base URL 和模型名称。
@@ -53,12 +53,14 @@ pnpm dev:electron
 
 DeskPet 同时保留短期会话和长期记忆：
 
-> V4 第二阶段安全双写已经启用，但尚未接管召回。V3 仍是唯一正式读写与回滚来源；每次 V3 成功提交后，V4 旁路同步 Episode、Candidate、Fact、EvidenceLink、FactVersion 和 RetrievalEvent。启动时用恢复了增量日志的完整 V3 视图对账，未变化的快照按 SHA-256 水位跳过。V4 失败只保留待重试队列并记录诊断，不回滚或关闭 V3。自动 V3 事实在缺少原始用户消息时仍为 `quarantined`；只有捕获到安全的用户原话或用户手动添加后才具有直接证据。完成质量门槛与灰度验证前，程序不会让 V4 参与回答。
+> V4 安全双写和隔离影子召回已经启用，但尚未接管正式回答。V3 仍是唯一正式读写与回滚来源；每次 V3 成功提交后，V4 旁路同步 Episode、Candidate、Fact、EvidenceLink、FactVersion 和 RetrievalEvent。V4 在独立 Worker 中用 BM25、结构化字段、摘要下钻、本地哈希和可选的已校验 BGE 向量产生候选，只用于与 V3 结果比较和内部评估。任何 V4、向量索引或 Worker 故障都会回退，不会中断 V3。
 
 | 类型 | 保存内容 | 用途 | 文件 |
 | --- | --- | --- | --- |
 | 短期会话 | 用户和助手的原始消息 | 保持当前对话连续性，默认最多 200 条 | `sessions.enc` |
 | 长期记忆 v3 | 原子事实、时间版本、来源、向量和隐私字段 | 跨会话及历史时间召回，默认最多 20,000 条 | `memories.enc` + `memories.enc.journal` |
+| V4 影子记忆 | 事实图、证据、版本、摘要、检索事件和冷热层级 | 双写审计、离线巩固和候选质量评估，不直接进入回答 | `memory-v4.enc` + `memory-v4.enc.journal` |
+| V4 学习语义索引 | 与精确正文哈希绑定的 BGE 事实/摘要向量 | 在隔离 Worker 中增强改写和同义表达召回 | `memory-v4-embeddings.enc` |
 
 ### 完整工作流程
 
@@ -112,7 +114,7 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 - 捕获到原始用户消息时，候选事实会连接到原生 Episode 和直接 Evidence；整段消息必须通过密钥/指令安全检查，并独立执行隐私推断。
 - 自适应召回分别记录已评估事实与实际注入事实，查询正文只保存 SHA-256 哈希。
 - 启动对账使用线性映射索引；5000 条模拟 V3 记录首次对账约 393 ms，未变化重启约 46 ms（测试机器结果，不是性能保证）。
-- 当前 V4 仍是影子写入与审计层，聊天提示词继续只使用经过验证的 V3 召回结果。
+- V4 影子检索在独立 Worker 中运行；超时、模型不匹配、索引损坏或语义查询失败时安全退回哈希/BM25 路径，聊天提示词继续只使用经过验证的 V3 召回结果。
 
 ### 长期优化计划表
 
@@ -125,10 +127,12 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 | √ | 自适应分批召回 | 动态批次、覆盖/增益/分数停止、数量和字符预算已上线 |
 | √ | V4 第二阶段安全双写 | 提交后双写、原始证据、版本历史、删除墓碑、召回事件、启动对账和故障隔离已完成；V4 尚不参与召回 |
 | √ | 双写差异审计 | 已逐项核对计数、正文、状态、作用域、有效时间、来源、隐私和版本头；隔离应用测试达到 100.0000% exact、0 issues |
+| √ | V4 隔离影子召回 | 独立 Worker、多路 RRF、BM25、结构化查询、摘要导航、绝对证据门槛、拒答和持久化对比已完成；不影响正式回答 |
+| √ | V4 学习语义旁路 | 固定指纹 BGE、SHA-256 模型清单、启动探针、V3 向量复用、独立加密索引、后台增量补齐、内容哈希校验和哈希降级已完成 |
 | × | 高质量写入门控（3/8） | 已上线双通道候选、本地证据 verifier 和七类写入决策；低证据/冲突候选不进入 V3 正式召回并在 V4 隔离，完整上下文、归一化、审核和重处理仍待完成 |
 | × | 时间与冲突演化 | 完整处理补充、纠正、替代、冲突和历史时间查询 |
 | × | 分层巩固与遗忘 | 日/周/月摘要、稳定事实、事件层和可恢复冷归档 |
-| × | 大规模多层检索 | 热/冷索引、向量+BM25+时间+字段检索及精排 |
+| × | 大规模多层检索（4/5） | 已有冷热分层、精确密集向量、BM25、哈希、时间/字段检索和摘要下钻；待真实 BGE 冻结集校准后才能成为正式召回 |
 | × | 反馈学习和可解释管理 | 使用 RetrievalEvent 改进排序，并在界面显示来源、版本、可信度与召回原因 |
 | × | 长周期可靠性与隐私 | 备份恢复、文件锁、故障注入、隐私泄漏评测和一年尺度模拟 |
 | × | V4 灰度切换与一年验收 | 质量门槛达标后小比例召回，可立即回退 V3，最终完成一年记忆验收 |
@@ -157,7 +161,9 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 
 结果还会做近重复抑制，避免相似内容占满前 5 条。
 
-在“🧠 记忆”中点击“下载并启用”，可以安装 `Xenova/bge-small-zh-v1.5` 的 q8 ONNX 模型。模型下载到 `DeskPetData\models\memory`，不随 Git 仓库或安装 ZIP 分发。安装完成前继续使用本地哈希；启用后，旧记忆会在后续召回时按需重新生成语义向量。
+在“🧠 记忆”中点击“下载并启用”，可以安装固定 revision 的 `Xenova/bge-small-zh-v1.5` q8 ONNX 模型。模型下载到 `DeskPetData\models\memory`，不随 Git 仓库或安装 ZIP 分发。安装后必须通过逐文件 SHA-256 清单、运行时身份、512 维归一化和重复探针校验；不通过则关闭学习语义路径并继续使用本地哈希。
+
+V3 会先在后台补齐旧记忆的 BGE 向量，再切换正式 V3 语义检索。V4 使用自己的 `memory-v4-embeddings.enc`：启动时复用内容一致的 V3 向量，随后以小批次补齐 V4 事实和摘要；事实 revision 与语义 revision 分开同步给隔离 Worker。Worker 只接受模型指纹、维度、正文哈希和快照 revision 全部匹配的向量。当前 20,000 条、512 维精确索引压力门禁在测试机上的 P95 为约 11.18 ms（不是所有设备的性能保证）。
 
 ### 生命周期、冲突与聊天来源
 
@@ -228,6 +234,8 @@ Windows 打包版主要数据位于：
 ├─ memory-key.json       # DPAPI 保护后的随机主密钥
 ├─ memory-v4.enc         # 第二阶段双写、证据与召回审计的 V4 加密影子快照
 ├─ memory-v4-key.json    # V4 独立的 DPAPI 保护密钥
+├─ memory-v4-embeddings.enc # V4 事实/摘要的加密 BGE 派生索引
+├─ memory-v4-embedding-key.json # V4 语义索引的 DPAPI 保护密钥
 ├─ memory-settings.json  # 提取、语义、OCR 和分享设置
 ├─ sessions.enc          # AES-256-GCM 加密短期聊天历史
 ├─ session-key.json      # DPAPI 保护后的会话主密钥
@@ -291,11 +299,15 @@ deskpet/
 - `packages/memory/src/long-term/memory-extractor.ts`：本地规则与安全过滤
 - `packages/memory/src/long-term/smart-memory-extractor.ts`：结构化智能提取与回退
 - `packages/memory/src/long-term/local-embedding.ts`：本地哈希向量
+- `packages/memory/src/long-term/dense-vector-candidate-index.ts`：BGE 密集向量精确候选索引
 - `packages/memory/src/long-term/vector-store.ts`：混合排序、冲突、生命周期与迁移
 - `packages/memory/src/long-term/encrypted-persistence.ts`：AES-256-GCM 文件适配器
 - `packages/memory/src/v4/dual-write/v4-shadow-writer.ts`：V3 提交后双写、证据连接、版本和召回审计
+- `packages/memory/src/v4/retrieval/memory-v4-shadow-retriever.ts`：V4 多路召回、学习语义、融合和拒答
 - `packages/core/src/runtime/agent-runtime.ts`：召回、附件和来源 ID
 - `apps/deskpet-electron/src/main/semantic-memory.ts`：本地中文语义模型
+- `apps/deskpet-electron/src/main/memory-v4-semantic-index.ts`：V4 加密语义索引、迁移和后台增量重建
+- `apps/deskpet-electron/src/main/memory-v4-shadow-worker.ts`：隔离 V4 影子召回 Worker
 - `apps/deskpet-electron/src/main/image-memory.ts`：显式图片 OCR
 - `apps/deskpet-electron/src/main/index.ts`：加密初始化、隐私过滤和 IPC
 - `apps/deskpet-electron/src/renderer/src/App.vue`：记忆管理界面
@@ -332,6 +344,7 @@ pnpm --filter @deskpet/electron package
 - 本地语义模型和 OCR 语言数据需要首次联网下载，未内置到安装 ZIP。
 - 短期会话与长期记忆均已加密；DPAPI 密钥与数据文件必须一起备份。
 - 当前桌面端固定为一个本地用户和一个 Agent 作用域。
-- V4 目前只做影子双写、候选隔离和审计，尚未承担聊天召回；高质量写入门控已完成首个 3/8 切片，但完整上下文抽取、全面归一化、审核界面、后台重处理和冻结盲测仍待完成。
+- V4 已执行隔离影子召回和内部评估，但没有进入聊天提示词；学习语义分数仍需用真实 BGE 冻结集正式校准后才能灰度接管回答。
+- 本次代码回归未执行外部盲测；本机也没有 BGE 模型缓存，因此真实 BGE 开发集对比未执行，不能把合成集成绩视作上线质量证明。
 - 尚无多进程文件锁、正文原地编辑和分层的日/周/月会话摘要。
 - OCR 只保留可识别文字，无法完整理解没有文字的图片语义。

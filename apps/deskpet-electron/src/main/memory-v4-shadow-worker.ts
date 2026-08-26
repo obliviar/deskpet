@@ -35,9 +35,13 @@ function execute(request: MemoryV4ShadowWorkerRequest): MemoryV4ShadowWorkerResp
         retriever = createMemoryV4ShadowRetriever(repository)
       }
       repository.replace(request.snapshot)
+      if (!request.semanticIndex)
+        retriever!.replaceSemanticIndex(undefined)
     }
     if (!retriever)
       throw new Error('Memory V4 worker has no synchronized snapshot')
+    if (request.semanticIndex)
+      retriever.replaceSemanticIndex(request.semanticIndex)
     return {
       type: 'result',
       requestId: request.requestId,

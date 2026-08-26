@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import { createMemoryConsolidationService } from '../consolidation/memory-consolidation-service'
 import { migrateV3PayloadToV4 } from '../migration/v3-to-v4'
 import { createMemoryV4Repository } from '../repository/memory-v4-repository'
@@ -182,7 +183,85 @@ describe('Memory V4 read-only shadow retrieval', () => {
     retriever.recall('我叫什么？', { scope })
     expect(retriever.indexStatus().rebuildCount).toBe(1)
   })
+
+  it('uses a verified learned embedding for paraphrases while retaining hash fallback', () => {
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    repository.replace(migrateV3PayloadToV4(JSON.stringify({
+      version: 3,
+      items: [
+        v3Item('coffee', '用户偏爱手工冲泡的咖啡', 'custom.fact.coffee'),
+        v3Item('shoe', '用户穿四十二码的鞋', 'custom.fact.shoe'),
+      ],
+    }), { now: () => NOW }))
+    const snapshot = repository.snapshot()
+    const coffee = snapshot.legacyImports.find(item => item.sourceItemId === 'coffee')!
+    const shoe = snapshot.legacyImports.find(item => item.sourceItemId === 'shoe')!
+    const factById = new Map(snapshot.facts.map(fact => [fact.id, fact]))
+    const retriever = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
+    retriever.replaceSemanticIndex({
+      version: 1,
+      snapshotRevision: snapshot.revision,
+      semanticRevision: 1,
+      model: 'verified-bge-test',
+      dimension: 2,
+      factVectors: [
+        semanticEntry(coffee.factId, factById.get(coffee.factId)!.canonicalText, [1, 0]),
+        semanticEntry(shoe.factId, factById.get(shoe.factId)!.canonicalText, [0, 1]),
+      ],
+      summaryVectors: [],
+    })
+
+    const recalled = retriever.recall('我钟意哪一种现磨饮品？', {
+      scope,
+      semanticQuery: { model: 'verified-bge-test', vector: [1, 0] },
+      limit: 3,
+    })
+    expect(recalled.hits[0]).toMatchObject({ sourceMemoryId: 'coffee' })
+    expect(recalled.hits[0]?.routes).toContain('fact-semantic-learned')
+    expect(recalled.index).toMatchObject({
+      semanticModel: 'verified-bge-test',
+      semanticDimension: 2,
+      semanticFacts: 2,
+      semanticQueryUsed: true,
+    })
+  })
+
+  it('ignores stale learned vectors and safely falls back on a model mismatch', () => {
+    const repository = createMemoryV4Repository({ now: () => NOW })
+    repository.replace(migrateV3PayloadToV4(JSON.stringify({
+      version: 3,
+      items: [v3Item('coffee', '用户偏爱手工冲泡的咖啡', 'custom.fact.coffee')],
+    }), { now: () => NOW }))
+    const snapshot = repository.snapshot()
+    const factId = snapshot.legacyImports[0]!.factId
+    const retriever = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
+    retriever.replaceSemanticIndex({
+      version: 1,
+      snapshotRevision: snapshot.revision,
+      semanticRevision: 1,
+      model: 'verified-bge-test',
+      dimension: 2,
+      factVectors: [{ id: factId, contentHash: '0'.repeat(64), vector: [1, 0] }],
+      summaryVectors: [],
+    })
+    expect(retriever.indexStatus().semanticFacts).toBe(0)
+
+    const recalled = retriever.recall('我钟意哪一种现磨饮品？', {
+      scope,
+      semanticQuery: { model: 'different-model', vector: [1, 0] },
+    })
+    expect(recalled.index.semanticQueryUsed).toBe(false)
+    expect(recalled.routes).not.toContain('fact-semantic-learned')
+  })
 })
+
+function semanticEntry(id: string, content: string, vector: number[]) {
+  return {
+    id,
+    contentHash: createHash('sha256').update(content.normalize('NFKC')).digest('hex'),
+    vector,
+  }
+}
 
 describe('V3/V4 shadow comparator', () => {
   it('reports agreement without retaining plaintext queries', async () => {

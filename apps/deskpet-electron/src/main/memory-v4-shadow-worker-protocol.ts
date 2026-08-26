@@ -1,6 +1,7 @@
 import type {
   MemoryV4ShadowRecallOptions,
   MemoryV4ShadowRecallResult,
+  MemoryV4SemanticIndexSnapshot,
   MemoryV4Snapshot,
 } from '@deskpet/memory'
 
@@ -10,6 +11,7 @@ export interface MemoryV4ShadowWorkerRecallRequest {
   query: string
   options: MemoryV4ShadowRecallOptions
   snapshot?: MemoryV4Snapshot
+  semanticIndex?: MemoryV4SemanticIndexSnapshot
 }
 
 export interface MemoryV4ShadowWorkerResultResponse {

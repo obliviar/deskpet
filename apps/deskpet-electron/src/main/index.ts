@@ -46,6 +46,8 @@ import type {
   MemoryCandidateReviewService,
   MemoryEmbeddingIndex,
   MemoryV4Repository,
+  MemoryV4SemanticIndexSnapshot,
+  MemoryV4Snapshot,
   MemoryV4ShadowEvaluationStore,
   MemoryV4ShadowTaskQueue,
   V3V4ShadowComparator,
@@ -61,6 +63,7 @@ import { createImageMemoryService, isExplicitImageMemoryRequest } from './image-
 import {
   createSemanticMemoryService,
   SEMANTIC_MEMORY_FINGERPRINT,
+  SEMANTIC_MEMORY_EXPECTED_DIMENSION,
   SEMANTIC_MEMORY_MODEL,
 } from './semantic-memory'
 import type { SemanticModelProgress } from './semantic-memory'
@@ -69,6 +72,11 @@ import {
   type MemoryV4ShadowWorkerClient,
 } from './memory-v4-shadow-worker-client'
 import { createMemoryV4InternalReviewController } from './memory-v4-internal-review'
+import { buildMemoryV4SemanticIndexSnapshot } from './memory-v4-semantic-bridge'
+import {
+  createMemoryV4SemanticBackgroundIndex,
+  type MemoryV4SemanticBackgroundIndex,
+} from './memory-v4-semantic-index'
 
 // Some Windows systems cannot initialize Electron's GPU subprocess. Disable
 // hardware acceleration before app readiness so the packaged app still starts.
@@ -277,6 +285,8 @@ let memorySettings = normalizeMemorySettings(persist.loadJson<Partial<MemorySett
 let memory: ReturnType<typeof createMemoryWriter> | undefined
 let memoryPersistence: EncryptedMemoryPersistence | undefined
 let memoryEmbeddingIndex: MemoryEmbeddingIndex | undefined
+let memoryV4EmbeddingIndex: MemoryEmbeddingIndex | undefined
+let memoryV4SemanticBackgroundIndex: MemoryV4SemanticBackgroundIndex | undefined
 let memoryInitializationError = ''
 let memoryLegacyMigrated = false
 let memoryV4Shadow: V4ShadowWriter | undefined
@@ -305,6 +315,8 @@ const memoryV4InternalReview = createMemoryV4InternalReviewController({
   timeoutMs: 1_500,
 })
 let memoryStore: VectorStore | undefined
+let memorySemanticActive = false
+let memoryV4SemanticError = ''
 let memoryV4Error = ''
 let memoryV4Reconciliation = { changed: false, sourceCount: 0, mirroredCount: 0, deletedCount: 0 }
 let memoryV4Audit: ReturnType<typeof auditV3V4Consistency> | undefined
@@ -322,6 +334,8 @@ const memoryV4JournalPath = join(userDataDir, 'memory-v4.enc.journal')
 const memoryV4KeyPath = join(userDataDir, 'memory-v4-key.json')
 const memoryV4ShadowEvaluationPath = join(userDataDir, 'memory-v4-shadow-eval.enc')
 const memoryV4ShadowEvaluationKeyPath = join(userDataDir, 'memory-v4-shadow-eval-key.json')
+const memoryV4EmbeddingStoragePath = join(userDataDir, 'memory-v4-embeddings.enc')
+const memoryV4EmbeddingKeyPath = join(userDataDir, 'memory-v4-embedding-key.json')
 let semanticModelProgress: SemanticModelProgress = { status: 'idle' }
 let semanticPreparationPromise: Promise<void> | undefined
 let imageMemoryProgress: { status: string; progress?: number } = { status: 'idle' }
@@ -437,6 +451,28 @@ function createV4ShadowQueryHasher(): (query: string) => string {
   return query => createHmac('sha256', key).update(query.normalize('NFKC')).digest('hex')
 }
 
+/**
+ * Reuse the verified, encrypted V3 side-index vectors for their mirrored V4
+ * facts. Content-hash lookup prevents a vector from surviving a fact edit, and
+ * the Worker validates revision/model/dimension again before indexing it.
+ */
+function buildV4SemanticIndexSnapshot(snapshot: MemoryV4Snapshot): MemoryV4SemanticIndexSnapshot | undefined {
+  if (memoryV4SemanticBackgroundIndex)
+    return memoryV4SemanticBackgroundIndex.semanticSnapshot(snapshot)
+  const index = memoryEmbeddingIndex
+  if (!memorySemanticActive || !index)
+    return undefined
+  return buildMemoryV4SemanticIndexSnapshot({
+    snapshot,
+    model: SEMANTIC_MEMORY_FINGERPRINT,
+    expectedDimension: SEMANTIC_MEMORY_EXPECTED_DIMENSION,
+    factVector: ({ sourceMemoryId, content }) => index.get(sourceMemoryId, SEMANTIC_MEMORY_FINGERPRINT, content),
+    // Summary vectors are prepared in the next background-indexing slice. V4
+    // keeps hash/BM25 summary navigation until then; learned fact retrieval is
+    // already independent and complete for mirrored V3 facts.
+  })
+}
+
 function initializeMemory(): void {
   memoryV4ShadowGeneration += 1
   memoryV4InternalReview.cancelAll()
@@ -455,6 +491,8 @@ function initializeMemory(): void {
   memory = undefined
   memoryPersistence = undefined
   memoryEmbeddingIndex = undefined
+  memoryV4EmbeddingIndex = undefined
+  memoryV4SemanticBackgroundIndex = undefined
   memoryV4Shadow = undefined
   memoryV4Repository = undefined
   memoryV4Lifecycle = undefined
@@ -471,6 +509,8 @@ function initializeMemory(): void {
   memoryCandidateReview = undefined
   memoryV4Persistence = undefined
   memoryStore = undefined
+  memorySemanticActive = false
+  memoryV4SemanticError = ''
   purgeConfirmation.clear()
   memoryInitializationError = ''
   memoryLegacyMigrated = false
@@ -514,6 +554,7 @@ function initializeMemory(): void {
     const requestedSemantic = semanticRequested && semanticMemory.isVerified()
     const preparedSemantic = probeStore.embeddingStatus(SEMANTIC_MEMORY_FINGERPRINT, localMemoryScope)
     const semanticActive = !!embeddingIndex && requestedSemantic && preparedSemantic.pending === 0
+    memorySemanticActive = semanticActive
     if (semanticRequested && !semanticActive) {
       memorySettings.semanticEnabled = false
       saveMemorySettings()
@@ -634,9 +675,53 @@ function initializeMemory(): void {
         writeBootLog(`Memory V4 dual-write ready: ${memoryV4Reconciliation.mirroredCount}/${memoryV4Reconciliation.sourceCount} facts reconciled, ${memoryV4Reconciliation.deletedCount} tombstoned`)
         writeBootLog(`Memory V4 diff audit: ${(memoryV4Audit.consistency * 100).toFixed(4)}% exact, ${memoryV4Audit.issues.length} issues`)
       }
+      if (memorySemanticActive && embeddingIndex) {
+        try {
+          const semanticGeneration = memoryV4ShadowGeneration
+          const v4EmbeddingPersistence = createEncryptedFilePersistence({
+            encryptedPath: memoryV4EmbeddingStoragePath,
+            keyPath: memoryV4EmbeddingKeyPath,
+            protectKey: key => safeStorage.encryptString(key.toString('base64')),
+            unprotectKey: protectedKey => Buffer.from(safeStorage.decryptString(protectedKey), 'base64'),
+          })
+          const v4EmbeddingIndex = createMemoryEmbeddingIndex({ persistence: v4EmbeddingPersistence })
+          const semanticIndex = createMemoryV4SemanticBackgroundIndex({
+            index: v4EmbeddingIndex,
+            model: SEMANTIC_MEMORY_FINGERPRINT,
+            dimension: SEMANTIC_MEMORY_EXPECTED_DIMENSION,
+            embed: semanticMemory.embed,
+            seedFactVector: ({ sourceMemoryId, content }) =>
+              embeddingIndex.get(sourceMemoryId, SEMANTIC_MEMORY_FINGERPRINT, content),
+          })
+          memoryV4EmbeddingIndex = v4EmbeddingIndex
+          memoryV4SemanticBackgroundIndex = semanticIndex
+          const seeded = semanticIndex.seed(v4Repository.snapshot())
+          writeBootLog(`Memory V4 learned semantic index seeded: ${seeded.ready}/${seeded.total}, revision ${seeded.semanticRevision}`)
+          void semanticIndex.prepare(v4Repository.snapshot(), {
+            batchSize: 8,
+            maxItems: 128,
+            shouldCancel: () => semanticGeneration !== memoryV4ShadowGeneration,
+          })
+            .then((status) => {
+              if (semanticGeneration === memoryV4ShadowGeneration)
+                writeBootLog(`Memory V4 learned semantic background preparation: ${status.ready}/${status.total}, ${status.pending} pending`)
+            })
+            .catch((error) => {
+              memoryV4SemanticError = errorMessage(error)
+              writeBootLog(`Memory V4 learned semantic background preparation failed: ${memoryV4SemanticError}`)
+            })
+        }
+        catch (error) {
+          memoryV4EmbeddingIndex = undefined
+          memoryV4SemanticBackgroundIndex = undefined
+          memoryV4SemanticError = errorMessage(error)
+          writeBootLog(`Memory V4 learned semantic side index disabled; hash fallback remains active: ${memoryV4SemanticError}`)
+        }
+      }
       const shadowWorkerClient = createMemoryV4ShadowWorkerClient({
         workerPath: join(moduleDir, 'memory-v4-shadow-worker.js'),
         getSnapshot: () => v4Repository.snapshot(),
+        getSemanticIndex: snapshot => buildV4SemanticIndexSnapshot(snapshot),
         timeoutMs: 1_000,
       })
       memoryV4ShadowWorkerClient = shadowWorkerClient
@@ -687,6 +772,22 @@ function initializeMemory(): void {
             return
           }
           try {
+            let semanticQuery: { model: string; vector: number[] } | undefined
+            if (memorySemanticActive) {
+              try {
+                semanticQuery = {
+                  model: SEMANTIC_MEMORY_FINGERPRINT,
+                  vector: await semanticMemory.embed(task.query),
+                }
+                memoryV4SemanticError = ''
+              }
+              catch (error) {
+                const message = errorMessage(error)
+                if (message !== memoryV4SemanticError)
+                  writeBootLog(`Memory V4 learned semantic query fell back to local hash: ${message}`)
+                memoryV4SemanticError = message
+              }
+            }
             const v4 = await shadowWorkerClient.recall(task.query, {
               scope: task.scope,
               limit: Math.max(1, Math.min(50, task.v3RetrievedIds.length || 10)),
@@ -694,6 +795,7 @@ function initializeMemory(): void {
               sensitivities: memorySettings.remotePolicy === 'allow-private'
                 ? ['normal', 'private']
                 : ['normal'],
+              ...(semanticQuery ? { semanticQuery } : {}),
             })
             if (task.generation !== memoryV4ShadowGeneration) {
               if (task.internalReviewRequestId)
@@ -737,6 +839,7 @@ function initializeMemory(): void {
       // overflow facts and merges duplicate episodes, then consolidates
       // summaries against the cleaned-up graph.
       const tiering = createMemoryTieringService(v4Repository)
+      const consolidationGeneration = memoryV4ShadowGeneration
       memoryV4ConsolidationRunner = createIdleConsolidationRunner({
         service: createMemoryConsolidationService(v4Repository),
         scope: localMemoryScope,
@@ -748,6 +851,17 @@ function initializeMemory(): void {
           maxRuntimeMs: 10_000,
         },
         onIdle: async () => {
+          if (memoryV4SemanticBackgroundIndex) {
+            const semanticStatus = await memoryV4SemanticBackgroundIndex.prepare(
+              v4Repository.snapshot(),
+              {
+                batchSize: 8,
+                maxItems: 64,
+                shouldCancel: () => consolidationGeneration !== memoryV4ShadowGeneration,
+              },
+            )
+            writeBootLog(`Memory V4 learned semantic idle preparation: ${semanticStatus.ready}/${semanticStatus.total}, ${semanticStatus.pending} pending`)
+          }
           const tieringReport = await tiering.run(localMemoryScope)
           writeBootLog(`Memory V4 tiering: hot ${tieringReport.tierCounts.hot}, warm ${tieringReport.tierCounts.warm}, cold ${tieringReport.tierCounts.cold}, quarantine ${tieringReport.tierCounts.quarantine}, ${tieringReport.archiveCandidates.length} archive candidates`)
           const archived = await tiering.archiveColdFacts(localMemoryScope, { maxArchives: 8 })
@@ -990,6 +1104,10 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
     // Make the V4 privacy deletion durable and remove recoverable managed V4
     // copies before deleting the authoritative V3 record.
     memoryV4Persistence.scrubBackups()
+    memoryV4EmbeddingIndex?.removeMemoryIds([fact.id, ...snapshot.derivedArtifacts
+      .filter(artifact => artifact.sourceFactIds.includes(fact.id))
+      .map(artifact => artifact.id)])
+    memoryV4EmbeddingIndex?.scrubBackups()
     removedV3 = await memory.purge(id, localMemoryScope)
     memoryV4Shadow!.flush()
     const recoveredV3 = memoryPersistence?.loadReadOnly()
@@ -998,6 +1116,7 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
       memoryV4Audit = auditV3V4Consistency(recoveredV3, memoryV4Repository.snapshot())
     }
     memoryV4Persistence.scrubBackups()
+    memoryV4EmbeddingIndex?.scrubBackups()
   }
   catch (error) {
     writeBootLog(`Memory purge partially failed for ${id}: ${errorMessage(error)}`)
@@ -1012,6 +1131,8 @@ async function confirmMemoryPurge(input: { id?: unknown; token?: unknown; phrase
     residual.push('V3 当前索引仍含该记忆')
   if (memoryEmbeddingIndex?.hasMemory(id))
     residual.push('派生向量索引仍含该记忆')
+  if (memoryV4EmbeddingIndex?.hasMemory(fact.id))
+    residual.push('V4 派生语义索引仍含该记忆')
   if (residual.length > 0)
     return { ok: false as const, error: `清除后残留审计失败：${residual.join('；')}`, residual }
   writeBootLog(`Memory purge completed: ${id}, V3 removed=${removedV3}, V4 version=${lifecycle.version}, residual=0`)
@@ -1177,6 +1298,11 @@ function setupIPC() {
         authoritativeAnswerSource: 'v3',
         rolloutStage: 'shadow',
         internalReview: memoryV4InternalReview.status(),
+        learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
+          ? memoryV4SemanticBackgroundIndex.status(memoryV4Repository.snapshot())
+          : undefined,
+        learnedSemanticPath: memoryV4EmbeddingStoragePath,
+        learnedSemanticError: memoryV4SemanticError,
       },
     },
     settings: memorySettings,
@@ -1221,6 +1347,11 @@ function setupIPC() {
         authoritativeAnswerSource: 'v3',
         rolloutStage: 'shadow',
         internalReview: memoryV4InternalReview.status(),
+        learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
+          ? memoryV4SemanticBackgroundIndex.status(memoryV4Repository.snapshot())
+          : undefined,
+        learnedSemanticPath: memoryV4EmbeddingStoragePath,
+        learnedSemanticError: memoryV4SemanticError,
       },
     },
     settings: memorySettings,
@@ -1532,6 +1663,12 @@ app.on('before-quit', (event) => {
   memoryV4ShadowGeneration += 1
   memoryV4ShadowTaskQueue?.stop()
   memoryV4ShadowWorkerClient?.stop()
+  try {
+    memoryV4EmbeddingIndex?.compact()
+  }
+  catch (error) {
+    writeBootLog(`Memory V4 learned semantic index final compact failed: ${errorMessage(error)}`)
+  }
   try {
     memoryV4ShadowEvaluationStore?.flush()
   }

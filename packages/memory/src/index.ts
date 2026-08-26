@@ -53,6 +53,15 @@ export type {
   SparseVectorCandidateIndex,
   SparseVectorSearchHit,
 } from './long-term/sparse-vector-candidate-index'
+export {
+  MEMORY_DENSE_VECTOR_CANDIDATE_INDEX_VERSION,
+  createDenseVectorCandidateIndex,
+} from './long-term/dense-vector-candidate-index'
+export type {
+  DenseVectorCandidateIndex,
+  DenseVectorSearchHit,
+  DenseVectorSearchOptions,
+} from './long-term/dense-vector-candidate-index'
 
 export {
   createMemoryWriter,

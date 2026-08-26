@@ -65,6 +65,8 @@ export interface MemoryV4InternalReviewHandle {
 }
 
 export interface MemoryV4InternalReviewController {
+  /** Runtime-safe stage switch. Disabling settles every pending review. */
+  setEnabled: (enabled: boolean) => number
   begin: (query: string) => MemoryV4InternalReviewHandle | undefined
   claim: (query: string) => string | undefined
   complete: (
@@ -98,7 +100,7 @@ export function createMemoryV4InternalReviewController(options: {
   now?: () => number
   idFactory?: () => string
 } = {}): MemoryV4InternalReviewController {
-  const enabled = options.enabled === true
+  let enabled = options.enabled === true
   const timeoutMs = clampInteger(options.timeoutMs ?? 1_500, 100, 10_000)
   const now = options.now ?? Date.now
   const idFactory = options.idFactory ?? randomUUID
@@ -226,7 +228,15 @@ export function createMemoryV4InternalReviewController(options: {
     return requests.length
   }
 
+  function setEnabled(nextEnabled: boolean): number {
+    if (enabled === nextEnabled)
+      return 0
+    enabled = nextEnabled
+    return enabled ? 0 : cancelAll()
+  }
+
   return {
+    setEnabled,
     begin,
     claim,
     complete,

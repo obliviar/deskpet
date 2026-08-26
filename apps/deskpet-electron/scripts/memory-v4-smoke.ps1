@@ -93,10 +93,14 @@ try {
   $env:DESKPET_SMOKE_TEST = 'true'
   $env:DESKPET_MEMORY = 'true'
   $env:DESKPET_MEMORY_V4_INTERNAL_REVIEW = 'true'
+  $env:DESKPET_SMOKE_EXPECT_ROLLOUT_STAGE = 'internal'
 
   Invoke-SmokeLaunch
   if (-not (Select-String -Path $logPath -Pattern 'Memory V4 internal candidate review enabled; V3 remains authoritative' -Quiet)) {
     throw 'The opt-in V4 internal candidate review controller was not initialized.'
+  }
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 rollout smoke verified: internal, V3 authoritative' -Quiet)) {
+    throw 'The effective Internal stage was not reported with V3 remaining authoritative.'
   }
   if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow migrated: 2 facts, 1 warnings' -Quiet)) {
     throw 'The first launch did not migrate two V3 facts into the V4 shadow.'
@@ -147,6 +151,7 @@ try {
 
   $v3Path = Join-Path $dataPath 'memories.enc'
   $v3HashBefore = Get-Sha256Hex $v3Path
+  Remove-Item Env:DESKPET_SMOKE_EXPECT_ROLLOUT_STAGE -ErrorAction SilentlyContinue
   [IO.File]::WriteAllText((Join-Path $dataPath 'memory-v4.enc'), '{corrupt-v4', [Text.UTF8Encoding]::new($false))
   Invoke-SmokeLaunch
   $v3HashAfter = Get-Sha256Hex $v3Path
@@ -210,7 +215,7 @@ try {
   Write-Output 'Memory V4 Electron smoke test passed: isolated worker execution, migration, journal replay, 100% diff audit, strong-confirm zero-residual purge, post-purge restart, encrypted artifacts, renderer startup, and safe V4/embedding-index/model-integrity failure fallbacks.'
 }
 finally {
-  Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_SMOKE_PURGE_ID,Env:DESKPET_MEMORY,Env:DESKPET_MEMORY_V4_INTERNAL_REVIEW -ErrorAction SilentlyContinue
+  Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_SMOKE_PURGE_ID,Env:DESKPET_SMOKE_EXPECT_ROLLOUT_STAGE,Env:DESKPET_MEMORY,Env:DESKPET_MEMORY_V4_INTERNAL_REVIEW -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath $testRoot) {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'

@@ -77,6 +77,11 @@ import {
   createMemoryV4SemanticBackgroundIndex,
   type MemoryV4SemanticBackgroundIndex,
 } from './memory-v4-semantic-index'
+import {
+  checkMemoryV4RolloutTransition,
+  normalizeMemoryV4RolloutStage,
+  type MemoryV4RolloutStageSetting,
+} from './memory-v4-rollout-settings'
 
 // Some Windows systems cannot initialize Electron's GPU subprocess. Disable
 // hardware acceleration before app readiness so the packaged app still starts.
@@ -255,12 +260,18 @@ function saveSessions() {
 // ── Scheme A long-term memory ───────────────────────────
 type MemoryExtractionMode = 'rules' | 'smart'
 type MemoryRemotePolicy = 'normal-only' | 'allow-private' | 'disabled'
+const memoryV4InternalReviewEnvironmentOverride
+  = typeof process.env.DESKPET_MEMORY_V4_INTERNAL_REVIEW === 'string'
+    ? config.memoryV4InternalReviewEnabled
+    : undefined
 
 interface MemorySettings {
   extractionMode: MemoryExtractionMode
   semanticEnabled: boolean
   imageMemoryEnabled: boolean
   remotePolicy: MemoryRemotePolicy
+  /** Only non-authoritative stages are user-selectable before the 1% gate. */
+  v4RolloutStage: MemoryV4RolloutStageSetting
 }
 
 const defaultMemorySettings: MemorySettings = {
@@ -268,6 +279,7 @@ const defaultMemorySettings: MemorySettings = {
   semanticEnabled: false,
   imageMemoryEnabled: true,
   remotePolicy: 'normal-only',
+  v4RolloutStage: config.memoryV4InternalReviewEnabled ? 'internal' : 'shadow',
 }
 
 function normalizeMemorySettings(value: Partial<MemorySettings> | undefined): MemorySettings {
@@ -278,6 +290,12 @@ function normalizeMemorySettings(value: Partial<MemorySettings> | undefined): Me
     remotePolicy: value?.remotePolicy === 'allow-private' || value?.remotePolicy === 'disabled'
       ? value.remotePolicy
       : 'normal-only',
+    v4RolloutStage: normalizeMemoryV4RolloutStage(value?.v4RolloutStage, {
+      defaultStage: defaultMemorySettings.v4RolloutStage,
+      ...(memoryV4InternalReviewEnvironmentOverride === undefined
+        ? {}
+        : { environmentOverride: memoryV4InternalReviewEnvironmentOverride ? 'internal' : 'shadow' }),
+    }),
   }
 }
 
@@ -311,7 +329,7 @@ let memoryV4ShadowTaskQueue: MemoryV4ShadowTaskQueue<MemoryV4ShadowComparisonTas
 let memoryV4ShadowGeneration = 0
 let memoryV4ShadowEvaluationError = ''
 const memoryV4InternalReview = createMemoryV4InternalReviewController({
-  enabled: config.memoryV4InternalReviewEnabled,
+  enabled: false,
   timeoutMs: 1_500,
 })
 let memoryStore: VectorStore | undefined
@@ -475,7 +493,7 @@ function buildV4SemanticIndexSnapshot(snapshot: MemoryV4Snapshot): MemoryV4Seman
 
 function initializeMemory(): void {
   memoryV4ShadowGeneration += 1
-  memoryV4InternalReview.cancelAll()
+  memoryV4InternalReview.setEnabled(false)
   try {
     memoryV4Shadow?.flush()
   }
@@ -829,8 +847,10 @@ function initializeMemory(): void {
           writeBootLog(`Memory V4 shadow comparison dropped: ${reason}`)
         },
       })
-      if (config.memoryV4InternalReviewEnabled)
+      if (memorySettings.v4RolloutStage === 'internal') {
+        memoryV4InternalReview.setEnabled(true)
         writeBootLog('Memory V4 internal candidate review enabled; V3 remains authoritative')
+      }
       // Stage-four offline consolidation: rebuild session/day/topic/entity/
       // temporal-stage summaries in
       // derivedArtifacts while the user is idle. Runs are idempotent, so an
@@ -884,6 +904,7 @@ function initializeMemory(): void {
       memoryV4ShadowWorkerClient?.stop()
       memoryV4ShadowWorkerClient = undefined
       memoryV4Shadow = undefined
+      memoryV4InternalReview.setEnabled(false)
       memoryV4Error = errorMessage(error)
       writeBootLog(`Memory V4 shadow initialization failed: ${memoryV4Error}`)
     }
@@ -892,6 +913,12 @@ function initializeMemory(): void {
     memoryInitializationError = errorMessage(error)
     writeBootLog(`long-term memory disabled after initialization error: ${memoryInitializationError}`)
   }
+}
+
+function effectiveMemoryV4RolloutStage(): MemoryV4RolloutStageSetting {
+  return memoryV4Shadow && memoryV4ShadowWorkerClient && memoryV4InternalReview.status().enabled
+    ? 'internal'
+    : 'shadow'
 }
 
 function isStageOneV4Shadow(snapshot: ReturnType<ReturnType<typeof createMemoryV4Repository>['snapshot']>): boolean {
@@ -1296,7 +1323,9 @@ function setupIPC() {
         evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
         evaluationError: memoryV4ShadowEvaluationError,
         authoritativeAnswerSource: 'v3',
-        rolloutStage: 'shadow',
+        rolloutStage: effectiveMemoryV4RolloutStage(),
+        requestedRolloutStage: memorySettings.v4RolloutStage,
+        rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
         internalReview: memoryV4InternalReview.status(),
         learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
           ? memoryV4SemanticBackgroundIndex.status(memoryV4Repository.snapshot())
@@ -1345,7 +1374,9 @@ function setupIPC() {
         evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
         evaluationError: memoryV4ShadowEvaluationError,
         authoritativeAnswerSource: 'v3',
-        rolloutStage: 'shadow',
+        rolloutStage: effectiveMemoryV4RolloutStage(),
+        requestedRolloutStage: memorySettings.v4RolloutStage,
+        rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
         internalReview: memoryV4InternalReview.status(),
         learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
           ? memoryV4SemanticBackgroundIndex.status(memoryV4Repository.snapshot())
@@ -1499,6 +1530,32 @@ function setupIPC() {
   ipcMain.handle('memory:settings-set', async (_event, input: Partial<MemorySettings>) => {
     await memory?.flushPendingCaptures()
     const nextSettings = normalizeMemorySettings({ ...memorySettings, ...input })
+    const requestedRolloutStage = input.v4RolloutStage === undefined
+      ? nextSettings.v4RolloutStage
+      : normalizeMemoryV4RolloutStage(input.v4RolloutStage, { defaultStage: memorySettings.v4RolloutStage })
+    const rolloutTransition = checkMemoryV4RolloutTransition({
+      currentStage: memorySettings.v4RolloutStage,
+      requestedStage: requestedRolloutStage,
+      ...(memoryV4InternalReviewEnvironmentOverride === undefined
+        ? {}
+        : { environmentOverride: memoryV4InternalReviewEnvironmentOverride ? 'internal' : 'shadow' }),
+      shadowAvailable: !!memoryV4Shadow,
+      workerAvailable: !!memoryV4ShadowWorkerClient,
+    })
+    if (!rolloutTransition.ok && rolloutTransition.reason === 'environment-locked') {
+      return {
+        ok: false,
+        error: 'V4 阶段由 DESKPET_MEMORY_V4_INTERNAL_REVIEW 环境变量锁定，无法在界面修改。',
+        settings: memorySettings,
+      }
+    }
+    if (!rolloutTransition.ok && rolloutTransition.reason === 'runtime-unavailable') {
+      return {
+        ok: false,
+        error: 'V4 影子存储或隔离召回 Worker 不可用，不能进入 Internal 阶段。',
+        settings: memorySettings,
+      }
+    }
     if (nextSettings.semanticEnabled && !semanticMemory.isInstalled()) {
       return { ok: false, error: '请先下载本地语义模型。', settings: memorySettings }
     }
@@ -1599,6 +1656,13 @@ function createWindow() {
         }
         else {
           writeBootLog('Memory V4 worker smoke skipped: shadow runtime unavailable')
+        }
+        const expectedRolloutStage = process.env.DESKPET_SMOKE_EXPECT_ROLLOUT_STAGE?.trim()
+        if (expectedRolloutStage) {
+          const actualRolloutStage = effectiveMemoryV4RolloutStage()
+          if (expectedRolloutStage !== actualRolloutStage)
+            throw new Error(`Expected V4 rollout stage ${expectedRolloutStage}, received ${actualRolloutStage}`)
+          writeBootLog(`Memory V4 rollout smoke verified: ${actualRolloutStage}, V3 authoritative`)
         }
         const purgeId = process.env.DESKPET_SMOKE_PURGE_ID?.trim()
         if (purgeId) {

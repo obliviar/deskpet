@@ -1,6 +1,6 @@
 {
   "name": "@deskpet/electron",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "private": true,
   "type": "module",
   "description": "DeskPet Electron desktop app",

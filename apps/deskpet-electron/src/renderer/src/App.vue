@@ -72,6 +72,7 @@ interface MemorySettings {
   semanticEnabled: boolean
   imageMemoryEnabled: boolean
   remotePolicy: 'normal-only' | 'allow-private' | 'disabled'
+  v4RolloutStage: 'shadow' | 'internal'
 }
 
 interface MemoryReviewItem {
@@ -220,8 +221,12 @@ const memorySettings = ref<MemorySettings>({
   semanticEnabled: false,
   imageMemoryEnabled: true,
   remotePolicy: 'normal-only',
+  v4RolloutStage: 'shadow',
 })
 const memoryEncrypted = ref(false)
+const memoryV4RuntimeEnabled = ref(false)
+const memoryV4EffectiveRolloutStage = ref<'shadow' | 'internal'>('shadow')
+const memoryV4RolloutStageLocked = ref(false)
 const semanticInstalled = ref(false)
 const semanticModelName = ref('Xenova/bge-small-zh-v1.5')
 const semanticModelProgress = ref<{
@@ -423,6 +428,11 @@ function applyMemoryRuntimeStatus(status: any) {
   if (status?.settings)
     memorySettings.value = { ...memorySettings.value, ...status.settings }
   memoryEncrypted.value = !!status?.encrypted
+  memoryV4RuntimeEnabled.value = !!status?.v4?.enabled
+  memoryV4EffectiveRolloutStage.value = status?.v4?.shadowRead?.rolloutStage === 'internal'
+    ? 'internal'
+    : 'shadow'
+  memoryV4RolloutStageLocked.value = !!status?.v4?.shadowRead?.rolloutStageLocked
   const integrityState = status?.semantic?.integrity?.state
   semanticInstalled.value = !!status?.semantic?.installed
     && integrityState !== 'corrupt'
@@ -1318,6 +1328,24 @@ async function doReset() {
             </button>
             <button v-else :class="['secondary-btn', { selected: memorySettings.semanticEnabled }]" :disabled="memoryMutating" @click="saveMemorySettings({ semanticEnabled: !memorySettings.semanticEnabled })">
               {{ memorySettings.semanticEnabled ? '语义检索已启用' : '启用语义检索' }}
+            </button>
+          </div>
+          <div class="semantic-model-card">
+            <div>
+              <strong>V4 Internal 内部评审</strong>
+              <p>
+                当前 {{ memoryV4EffectiveRolloutStage === 'internal' ? 'Internal' : 'Shadow' }}；
+                V3 始终负责正式回答，V4 候选仅显示在回复下方供检查。
+              </p>
+            </div>
+            <button
+              :class="['secondary-btn', { selected: memorySettings.v4RolloutStage === 'internal' }]"
+              :disabled="memoryMutating || !memoryV4RuntimeEnabled || memoryV4RolloutStageLocked"
+              @click="saveMemorySettings({ v4RolloutStage: memorySettings.v4RolloutStage === 'internal' ? 'shadow' : 'internal' })"
+            >
+              {{ memoryV4RolloutStageLocked
+                ? '已由环境变量锁定'
+                : memorySettings.v4RolloutStage === 'internal' ? '退出 Internal' : '进入 Internal' }}
             </button>
           </div>
           <div class="field-hint">模型与 OCR 数据保存在可执行文件旁的 DeskPetData；智能提取只分析用户原话，失败时自动退回本地规则。</div>

@@ -53,6 +53,23 @@ describe('Memory V4 internal candidate review', () => {
     expect(controller.status()).toMatchObject({ pending: 0, cancelled: 1 })
   })
 
+  it('switches stages at runtime and fail-closes pending internal reviews', async () => {
+    const controller = createMemoryV4InternalReviewController({ enabled: false })
+    expect(controller.setEnabled(true)).toBe(0)
+    expect(controller.status().enabled).toBe(true)
+    const pending = controller.begin('切换阶段时不能泄漏挂起任务')!
+    expect(controller.claim('切换阶段时不能泄漏挂起任务')).toBeTruthy()
+
+    expect(controller.setEnabled(false)).toBe(1)
+    await expect(pending.finish()).resolves.toBeUndefined()
+    expect(controller.status()).toMatchObject({ enabled: false, pending: 0, cancelled: 1 })
+    expect(controller.begin('关闭后不能再开始')).toBeUndefined()
+
+    expect(controller.setEnabled(true)).toBe(0)
+    expect(controller.begin('重新开启后可以评审')).toBeDefined()
+    controller.setEnabled(false)
+  })
+
   it('settles dropped, timed-out and lifecycle-cancelled work without leaking pending promises', async () => {
     vi.useFakeTimers()
     try {

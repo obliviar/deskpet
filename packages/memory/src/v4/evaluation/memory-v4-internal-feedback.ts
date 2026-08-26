@@ -1,5 +1,5 @@
-export const MEMORY_V4_INTERNAL_FEEDBACK_VERSION = 'memory-v4-internal-feedback-v1'
-export const MEMORY_V4_INTERNAL_FEEDBACK_SCHEMA_VERSION = 1 as const
+export const MEMORY_V4_INTERNAL_FEEDBACK_VERSION = 'memory-v4-internal-feedback-v2'
+export const MEMORY_V4_INTERNAL_FEEDBACK_SCHEMA_VERSION = 2 as const
 
 export const MEMORY_V4_INTERNAL_FEEDBACK_LABELS = [
   'correct',
@@ -7,6 +7,7 @@ export const MEMORY_V4_INTERNAL_FEEDBACK_LABELS = [
   'incorrect',
   'expired',
   'missing',
+  'no-memory',
   'privacy',
 ] as const
 
@@ -21,7 +22,9 @@ export interface MemoryV4InternalFeedbackCandidate {
 export interface MemoryV4InternalFeedbackReviewInput {
   reviewId: string
   queryHash: string
+  queryIntent: string
   calibrationVersion: string
+  bestEvidenceScore: number
   createdAt: number
   candidates: readonly MemoryV4InternalFeedbackCandidate[]
 }
@@ -40,11 +43,13 @@ interface PersistedLabel {
 interface PersistedReview {
   reviewId: string
   queryHash: string
+  queryIntent: string
   calibrationVersion: string
+  bestEvidenceScore: number
   createdAt: number
   candidates: MemoryV4InternalFeedbackCandidate[]
   labels: Record<string, PersistedLabel>
-  missing?: PersistedLabel
+  queryLabel?: PersistedLabel
 }
 
 interface MemoryV4InternalFeedbackSnapshot {
@@ -61,7 +66,9 @@ export interface MemoryV4InternalFeedbackStatus {
   encrypted: boolean
   retainedReviews: number
   labeledCandidates: number
+  queryFeedback: number
   missingFeedback: number
+  noMemoryFeedback: number
   droppedReviews: number
   pendingWrites: number
   byLabel: Record<MemoryV4InternalFeedbackLabel, number>
@@ -81,11 +88,29 @@ export interface MemoryV4InternalFeedbackStore {
     label: MemoryV4InternalFeedbackLabel
   }) => MemoryV4InternalFeedbackResult
   feedbackFor: (reviewId: string, factId?: string) => MemoryV4InternalFeedbackLabel | undefined
+  calibrationReviews: () => MemoryV4InternalFeedbackCalibrationReview[]
   removeFactIds: (factIds: readonly string[]) => number
   hasFact: (factId: string) => boolean
   status: () => MemoryV4InternalFeedbackStatus
   flush: () => void
   clear: () => void
+}
+
+export interface MemoryV4InternalFeedbackCalibrationCandidate extends MemoryV4InternalFeedbackCandidate {
+  label?: Exclude<MemoryV4InternalFeedbackLabel, 'missing' | 'no-memory'>
+  recordedAt?: number
+}
+
+export interface MemoryV4InternalFeedbackCalibrationReview {
+  reviewId: string
+  queryHash: string
+  queryIntent: string
+  calibrationVersion: string
+  bestEvidenceScore: number
+  createdAt: number
+  candidates: MemoryV4InternalFeedbackCalibrationCandidate[]
+  queryLabel?: Extract<MemoryV4InternalFeedbackLabel, 'missing' | 'no-memory'>
+  queryLabelRecordedAt?: number
 }
 
 /**
@@ -178,7 +203,7 @@ export function createMemoryV4InternalFeedbackStore(options: {
       const eligibleIds = new Set(review.candidates.map(candidate => candidate.factId))
       review.labels = Object.fromEntries(Object.entries(existing.labels)
         .filter(([factId]) => eligibleIds.has(factId)))
-      review.missing = existing.missing
+      review.queryLabel = existing.queryLabel
       snapshot.reviews.splice(existingIndex, 1)
     }
     snapshot.reviews.push(review)
@@ -200,16 +225,20 @@ export function createMemoryV4InternalFeedbackStore(options: {
     if (!isMemoryV4InternalFeedbackLabel(input.label))
       return { ok: false, reason: 'invalid-target' }
     const recordedAt = timestamp(now(), 'recordedAt')
-    if (input.label === 'missing') {
+    if (input.label === 'missing' || input.label === 'no-memory') {
       if (factId)
         return { ok: false, reason: 'invalid-target' }
-      review.missing = { label: 'missing', recordedAt }
+      if (input.label === 'no-memory' && Object.values(review.labels).some(feedback => feedback.label === 'correct'))
+        return { ok: false, reason: 'invalid-target' }
+      review.queryLabel = { label: input.label, recordedAt }
     }
     else {
       if (!factId)
         return { ok: false, reason: 'invalid-target' }
       if (!review.candidates.some(candidate => candidate.factId === factId))
         return { ok: false, reason: 'unknown-candidate' }
+      if (input.label === 'correct' && review.queryLabel?.label === 'no-memory')
+        return { ok: false, reason: 'invalid-target' }
       review.labels[factId] = { label: input.label, recordedAt }
     }
     snapshot.updatedAt = Math.max(snapshot.updatedAt, recordedAt)
@@ -233,7 +262,7 @@ export function createMemoryV4InternalFeedbackStore(options: {
       const eligibleIds = new Set(candidates.map(candidate => candidate.factId))
       const labels = Object.fromEntries(Object.entries(review.labels)
         .filter(([factId]) => eligibleIds.has(factId)))
-      if (candidates.length > 0 || review.missing)
+      if (candidates.length > 0 || review.queryLabel)
         retained.push({ ...review, candidates, labels })
     }
     if (removed > 0) {
@@ -249,8 +278,31 @@ export function createMemoryV4InternalFeedbackStore(options: {
     recordFeedback,
     feedbackFor: (reviewId, factId) => {
       const review = snapshot.reviews.find(item => item.reviewId === reviewId)
-      return factId ? review?.labels[factId]?.label : review?.missing?.label
+      return factId ? review?.labels[factId]?.label : review?.queryLabel?.label
     },
+    calibrationReviews: () => snapshot.reviews.map(review => ({
+      reviewId: review.reviewId,
+      queryHash: review.queryHash,
+      queryIntent: review.queryIntent,
+      calibrationVersion: review.calibrationVersion,
+      bestEvidenceScore: review.bestEvidenceScore,
+      createdAt: review.createdAt,
+      candidates: review.candidates.map(candidate => ({
+        ...candidate,
+        ...(review.labels[candidate.factId]
+          ? {
+              label: review.labels[candidate.factId]!.label as Exclude<MemoryV4InternalFeedbackLabel, 'missing' | 'no-memory'>,
+              recordedAt: review.labels[candidate.factId]!.recordedAt,
+            }
+          : {}),
+      })),
+      ...(review.queryLabel
+        ? {
+            queryLabel: review.queryLabel.label as Extract<MemoryV4InternalFeedbackLabel, 'missing' | 'no-memory'>,
+            queryLabelRecordedAt: review.queryLabel.recordedAt,
+          }
+        : {}),
+    })),
     removeFactIds,
     hasFact: factId => snapshot.reviews.some(review => review.candidates.some(candidate => (
       candidate.factId === factId || candidate.sourceMemoryId === factId
@@ -280,7 +332,9 @@ function normalizeReview(input: MemoryV4InternalFeedbackReviewInput): PersistedR
   return {
     reviewId,
     queryHash: input.queryHash,
+    queryIntent: boundedString(input.queryIntent, 64, 'unknown'),
     calibrationVersion: boundedString(input.calibrationVersion, 160, 'unknown'),
+    bestEvidenceScore: clamp01(input.bestEvidenceScore),
     createdAt: timestamp(input.createdAt, 'createdAt'),
     candidates,
     labels: {},
@@ -297,28 +351,38 @@ function parseSnapshot(payload: string): MemoryV4InternalFeedbackSnapshot {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
     throw new Error('Internal feedback payload must be an object')
-  const value = parsed as Partial<MemoryV4InternalFeedbackSnapshot>
-  if (value.schemaVersion !== MEMORY_V4_INTERNAL_FEEDBACK_SCHEMA_VERSION || !Array.isArray(value.reviews))
+  const value = parsed as {
+    schemaVersion?: unknown
+    createdAt?: unknown
+    updatedAt?: unknown
+    droppedReviews?: unknown
+    reviews?: unknown
+  }
+  if ((value.schemaVersion !== 1 && value.schemaVersion !== MEMORY_V4_INTERNAL_FEEDBACK_SCHEMA_VERSION)
+    || !Array.isArray(value.reviews))
     throw new Error('Unsupported Internal feedback schema')
   return {
     schemaVersion: MEMORY_V4_INTERNAL_FEEDBACK_SCHEMA_VERSION,
     createdAt: timestamp(value.createdAt, 'createdAt'),
     updatedAt: timestamp(value.updatedAt, 'updatedAt'),
     droppedReviews: nonNegativeInteger(value.droppedReviews, 'droppedReviews'),
-    reviews: value.reviews.map(parseReview),
+    reviews: value.reviews.map(review => parseReview(review, value.schemaVersion as 1 | 2)),
   }
 }
 
-function parseReview(value: unknown): PersistedReview {
+function parseReview(value: unknown, schemaVersion: 1 | 2): PersistedReview {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new Error('Internal feedback review is invalid')
-  const source = value as Partial<PersistedReview>
+  const source = value as Partial<PersistedReview> & { missing?: PersistedLabel }
   if (!Array.isArray(source.candidates))
     throw new Error('Internal feedback candidates are invalid')
   const base = normalizeReview({
     reviewId: requiredId(source.reviewId, 'reviewId'),
     queryHash: source.queryHash ?? '',
+    queryIntent: source.queryIntent ?? 'unknown',
     calibrationVersion: source.calibrationVersion ?? 'unknown',
+    bestEvidenceScore: source.bestEvidenceScore
+      ?? Math.max(0, ...source.candidates.map(candidate => clamp01(candidate.score))),
     createdAt: source.createdAt ?? 0,
     candidates: source.candidates,
   })
@@ -329,17 +393,21 @@ function parseReview(value: unknown): PersistedReview {
     if (!eligibleIds.has(factId) || !raw || typeof raw !== 'object')
       continue
     const label = (raw as Partial<PersistedLabel>).label
-    if (!isMemoryV4InternalFeedbackLabel(label) || label === 'missing')
+    if (!isMemoryV4InternalFeedbackLabel(label) || label === 'missing' || label === 'no-memory')
       throw new Error('Internal feedback candidate label is invalid')
     base.labels[factId] = {
       label,
       recordedAt: timestamp((raw as Partial<PersistedLabel>).recordedAt, 'recordedAt'),
     }
   }
-  if (source.missing !== undefined) {
-    if (!source.missing || source.missing.label !== 'missing')
-      throw new Error('Internal feedback missing label is invalid')
-    base.missing = { label: 'missing', recordedAt: timestamp(source.missing.recordedAt, 'recordedAt') }
+  const queryLabel = schemaVersion === 1 ? source.missing : source.queryLabel
+  if (queryLabel !== undefined) {
+    if (!queryLabel || (queryLabel.label !== 'missing' && queryLabel.label !== 'no-memory'))
+      throw new Error('Internal feedback query label is invalid')
+    base.queryLabel = {
+      label: queryLabel.label,
+      recordedAt: timestamp(queryLabel.recordedAt, 'recordedAt'),
+    }
   }
   return base
 }
@@ -363,15 +431,21 @@ function buildStatus(
 ): MemoryV4InternalFeedbackStatus {
   const byLabel = Object.fromEntries(MEMORY_V4_INTERNAL_FEEDBACK_LABELS.map(label => [label, 0])) as Record<MemoryV4InternalFeedbackLabel, number>
   let labeledCandidates = 0
+  let queryFeedback = 0
   let missingFeedback = 0
+  let noMemoryFeedback = 0
   for (const review of snapshot.reviews) {
     for (const feedback of Object.values(review.labels)) {
       byLabel[feedback.label] += 1
       labeledCandidates += 1
     }
-    if (review.missing) {
-      byLabel.missing += 1
-      missingFeedback += 1
+    if (review.queryLabel) {
+      byLabel[review.queryLabel.label] += 1
+      queryFeedback += 1
+      if (review.queryLabel.label === 'missing')
+        missingFeedback += 1
+      else
+        noMemoryFeedback += 1
     }
   }
   const timestamps = snapshot.reviews.map(review => review.createdAt).sort((left, right) => left - right)
@@ -381,7 +455,9 @@ function buildStatus(
     encrypted,
     retainedReviews: snapshot.reviews.length,
     labeledCandidates,
+    queryFeedback,
     missingFeedback,
+    noMemoryFeedback,
     droppedReviews: snapshot.droppedReviews,
     pendingWrites,
     byLabel,

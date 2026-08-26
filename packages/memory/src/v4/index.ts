@@ -153,8 +153,28 @@ export {
   createMemoryV4InternalFeedbackStore,
   isMemoryV4InternalFeedbackLabel,
 } from './evaluation/memory-v4-internal-feedback'
+export {
+  DEFAULT_MEMORY_V4_FEEDBACK_CALIBRATION_POLICY,
+  MEMORY_V4_FEEDBACK_CALIBRATION_DATASET_VERSION,
+  MEMORY_V4_FEEDBACK_CALIBRATION_GATE_VERSION,
+  evaluateMemoryV4FeedbackCalibrationGate,
+  fitMemoryV4InternalFeedbackCalibration,
+  freezeMemoryV4InternalFeedbackDataset,
+} from './evaluation/memory-v4-feedback-calibration'
+export type {
+  MemoryV4FeedbackCalibrationAudit,
+  MemoryV4FeedbackCalibrationDataset,
+  MemoryV4FeedbackCalibrationGateCheck,
+  MemoryV4FeedbackCalibrationGateDecision,
+  MemoryV4FeedbackCalibrationGateReport,
+  MemoryV4FeedbackCalibrationPolicy,
+  MemoryV4FeedbackRankingValidation,
+  MemoryV4FeedbackSplitStats,
+} from './evaluation/memory-v4-feedback-calibration'
 export type {
   MemoryV4InternalFeedbackCandidate,
+  MemoryV4InternalFeedbackCalibrationCandidate,
+  MemoryV4InternalFeedbackCalibrationReview,
   MemoryV4InternalFeedbackLabel,
   MemoryV4InternalFeedbackPersistence,
   MemoryV4InternalFeedbackResult,

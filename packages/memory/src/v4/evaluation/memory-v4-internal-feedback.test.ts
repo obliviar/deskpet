@@ -52,6 +52,21 @@ describe('Memory V4 Internal feedback store', () => {
     expect(store.status()).toMatchObject({ missingFeedback: 1, byLabel: { missing: 1 } })
   })
 
+  it('collects an explicit no-memory negative without allowing a correct candidate conflict', () => {
+    const store = createMemoryV4InternalFeedbackStore({ now: () => NOW })
+    store.registerReview(review())
+    expect(store.recordFeedback({ reviewId: 'review-1', label: 'no-memory' }))
+      .toEqual({ ok: true, label: 'no-memory' })
+    expect(store.recordFeedback({ reviewId: 'review-1', factId: 'fact-coffee', label: 'correct' }))
+      .toEqual({ ok: false, reason: 'invalid-target' })
+    expect(store.calibrationReviews()[0]).toMatchObject({
+      queryIntent: 'specific',
+      bestEvidenceScore: 0.9,
+      queryLabel: 'no-memory',
+    })
+    expect(store.status()).toMatchObject({ queryFeedback: 1, noMemoryFeedback: 1 })
+  })
+
   it('purges references by either V4 fact ID or V3 source memory ID', () => {
     const store = createMemoryV4InternalFeedbackStore({ now: () => NOW })
     store.registerReview(review())
@@ -70,13 +85,42 @@ describe('Memory V4 Internal feedback store', () => {
       persistence: { load: () => JSON.stringify({ schemaVersion: 99, reviews: [] }), save: () => undefined },
     })).toThrow(/Unsupported Internal feedback schema/u)
   })
+
+
+  it('loads the v1 schema as v2 without inventing plaintext or intent', () => {
+    const payload = JSON.stringify({
+      schemaVersion: 1,
+      createdAt: NOW,
+      updatedAt: NOW,
+      droppedReviews: 0,
+      reviews: [{
+        reviewId: 'legacy-review',
+        queryHash: QUERY,
+        calibrationVersion: 'legacy-calibration',
+        createdAt: NOW,
+        candidates: [{ factId: 'legacy-fact', score: 0.4 }],
+        labels: {},
+        missing: { label: 'missing', recordedAt: NOW },
+      }],
+    })
+    const store = createMemoryV4InternalFeedbackStore({
+      persistence: { load: () => payload, save: () => undefined },
+    })
+    expect(store.calibrationReviews()[0]).toMatchObject({
+      queryIntent: 'unknown',
+      bestEvidenceScore: 0.4,
+      queryLabel: 'missing',
+    })
+  })
 })
 
 function review() {
   return {
     reviewId: 'review-1',
     queryHash: QUERY,
+    queryIntent: 'specific',
     calibrationVersion: 'calibration-v1',
+    bestEvidenceScore: 0.9,
     createdAt: NOW,
     candidates: [{ factId: 'fact-coffee', sourceMemoryId: 'memory-coffee', score: 0.9 }],
   }

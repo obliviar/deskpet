@@ -2,6 +2,7 @@ import {
   createMemoryV4InternalFeedbackStore as createCoreStore,
   isMemoryV4InternalFeedbackLabel,
   type MemoryV4InternalFeedbackLabel,
+  type MemoryV4InternalFeedbackCalibrationReview,
   type MemoryV4InternalFeedbackPersistence,
   type MemoryV4InternalFeedbackResult,
   type MemoryV4InternalFeedbackStatus,
@@ -11,6 +12,7 @@ import type { MemoryV4InternalCandidateReview } from './memory-v4-internal-revie
 export {
   isMemoryV4InternalFeedbackLabel,
   type MemoryV4InternalFeedbackLabel,
+  type MemoryV4InternalFeedbackCalibrationReview,
   type MemoryV4InternalFeedbackPersistence,
   type MemoryV4InternalFeedbackResult,
   type MemoryV4InternalFeedbackStatus,
@@ -24,6 +26,7 @@ export interface MemoryV4InternalFeedbackStore {
     label: MemoryV4InternalFeedbackLabel
   }) => MemoryV4InternalFeedbackResult
   feedbackFor: (reviewId: string, factId?: string) => MemoryV4InternalFeedbackLabel | undefined
+  calibrationReviews: () => MemoryV4InternalFeedbackCalibrationReview[]
   removeFactIds: (factIds: readonly string[]) => number
   hasFact: (factId: string) => boolean
   status: () => MemoryV4InternalFeedbackStatus
@@ -46,7 +49,9 @@ export function createMemoryV4InternalFeedbackStore(options: {
       core.registerReview({
         reviewId: review.reviewId,
         queryHash: review.queryHash,
+        queryIntent: review.queryIntent,
         calibrationVersion: review.v4.calibrationVersion,
+        bestEvidenceScore: review.v4.bestEvidenceScore,
         createdAt: review.createdAt,
         candidates: review.v4.candidates.map(candidate => ({
           factId: candidate.factId,
@@ -57,6 +62,7 @@ export function createMemoryV4InternalFeedbackStore(options: {
     },
     recordFeedback: core.recordFeedback,
     feedbackFor: core.feedbackFor,
+    calibrationReviews: core.calibrationReviews,
     removeFactIds: core.removeFactIds,
     hasFact: core.hasFact,
     status: core.status,

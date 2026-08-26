@@ -53,6 +53,7 @@ function review(): MemoryV4InternalCandidateReview {
     v4InfluencedAnswer: false,
     createdAt: NOW,
     queryHash: 'a'.repeat(64),
+    queryIntent: 'specific',
     v3: { retrievedCount: 1, injectedCount: 1 },
     v4: {
       abstained: false,

@@ -16,6 +16,7 @@ interface MemoryV4InternalCandidateReview {
   mode: 'internal-candidate'
   authoritativeAnswerSource: 'v3'
   v4InfluencedAnswer: false
+  queryIntent: string
   v3: { retrievedCount: number; injectedCount: number }
   v4: {
     abstained: boolean
@@ -40,6 +41,7 @@ type MemoryV4InternalFeedbackLabel =
   | 'incorrect'
   | 'expired'
   | 'missing'
+  | 'no-memory'
   | 'privacy'
 
 const V4_INTERNAL_CANDIDATE_FEEDBACK_OPTIONS: Array<{
@@ -247,6 +249,7 @@ const memoryEncrypted = ref(false)
 const memoryV4RuntimeEnabled = ref(false)
 const memoryV4EffectiveRolloutStage = ref<'shadow' | 'internal'>('shadow')
 const memoryV4RolloutStageLocked = ref(false)
+const memoryV4FeedbackCalibration = ref<any>(null)
 const semanticInstalled = ref(false)
 const semanticModelName = ref('Xenova/bge-small-zh-v1.5')
 const semanticModelProgress = ref<{
@@ -456,6 +459,7 @@ function applyMemoryRuntimeStatus(status: any) {
     ? 'internal'
     : 'shadow'
   memoryV4RolloutStageLocked.value = !!status?.v4?.shadowRead?.rolloutStageLocked
+  memoryV4FeedbackCalibration.value = status?.v4?.shadowRead?.internalFeedbackCalibration || null
   const integrityState = status?.semantic?.integrity?.state
   semanticInstalled.value = !!status?.semantic?.installed
     && integrityState !== 'corrupt'
@@ -1151,6 +1155,21 @@ function v4FeedbackKey(reviewId: string, factId?: string): string {
   return `${reviewId}:${factId || '__missing__'}`
 }
 
+function v4FeedbackGateLabel(): string {
+  const calibration = memoryV4FeedbackCalibration.value
+  if (!calibration || calibration.error)
+    return calibration?.error ? `校准状态错误：${calibration.error}` : '尚无反馈校准数据'
+  const gate = calibration.gate
+  const calibrationSamples = Number(calibration.calibrationStats?.samples) || 0
+  const validationSamples = Number(calibration.validationStats?.samples) || 0
+  const decision = gate?.decision === 'eligible-for-offline-fit'
+    ? '可进行离线拟合'
+    : gate?.decision === 'blocked'
+      ? '质量门禁阻止'
+      : '数据不足'
+  return `反馈冻结集：校准 ${calibrationSamples} / 验证 ${validationSamples}；${decision}，不影响在线排序`
+}
+
 async function submitV4InternalFeedback(
   reviewId: string,
   factId: string | undefined,
@@ -1394,6 +1413,7 @@ async function doReset() {
                 当前 {{ memoryV4EffectiveRolloutStage === 'internal' ? 'Internal' : 'Shadow' }}；
                 V3 始终负责正式回答，V4 候选仅显示在回复下方供检查。
               </p>
+              <p>{{ v4FeedbackGateLabel() }}</p>
             </div>
             <button
               :class="['secondary-btn', { selected: memorySettings.v4RolloutStage === 'internal' }]"
@@ -1580,12 +1600,17 @@ async function doReset() {
               <span>重合 {{ msg.memoryReview.agreement.overlapCount }}</span>
             </div>
             <div class="v4-review-query-feedback">
-              <span>正确记忆没有出现在候选中？</span>
+              <span>请评价这一轮是否需要长期记忆：</span>
               <button
                 :class="{ selected: v4InternalFeedback[v4FeedbackKey(msg.memoryReview.reviewId)] === 'missing' }"
                 :disabled="!!v4InternalFeedbackPending"
                 @click="submitV4InternalFeedback(msg.memoryReview.reviewId, undefined, 'missing')"
               >标记遗漏</button>
+              <button
+                :class="{ selected: v4InternalFeedback[v4FeedbackKey(msg.memoryReview.reviewId)] === 'no-memory' }"
+                :disabled="!!v4InternalFeedbackPending"
+                @click="submitV4InternalFeedback(msg.memoryReview.reviewId, undefined, 'no-memory')"
+              >确认无需记忆</button>
               <small v-if="v4InternalFeedbackError[v4FeedbackKey(msg.memoryReview.reviewId)]">
                 {{ v4InternalFeedbackError[v4FeedbackKey(msg.memoryReview.reviewId)] }}
               </small>

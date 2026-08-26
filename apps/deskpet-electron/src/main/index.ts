@@ -18,6 +18,7 @@ import {
   createMemoryV4ShadowEvaluationStore,
   createMemoryV4ShadowTaskQueue,
   createV3V4ShadowComparator,
+  evaluateMemoryV4FeedbackCalibrationGate,
   evaluateMemoryV4RolloutGate,
   mergeDuplicateEpisodes,
   createMemoryCandidateReviewService,
@@ -31,6 +32,7 @@ import {
   createVectorStore,
   extractMemoryCandidates,
   fitIsotonicMemoryConfidenceCalibrator,
+  freezeMemoryV4InternalFeedbackDataset,
   inferMemoryPrivacy,
   isSafeMemoryContent,
   LOCAL_EMBEDDING_MODEL,
@@ -340,6 +342,35 @@ const memoryV4InternalReview = createMemoryV4InternalReviewController({
   enabled: false,
   timeoutMs: 1_500,
 })
+
+function memoryV4InternalFeedbackCalibrationStatus() {
+  if (!memoryV4InternalFeedbackStore)
+    return undefined
+  try {
+    const dataset = freezeMemoryV4InternalFeedbackDataset(
+      memoryV4InternalFeedbackStore.calibrationReviews(),
+    )
+    const gate = evaluateMemoryV4FeedbackCalibrationGate(dataset)
+    return {
+      version: dataset.version,
+      datasetVersion: dataset.datasetVersion,
+      datasetFingerprint: dataset.datasetFingerprint,
+      calibrationVersion: dataset.calibrationVersion,
+      calibrationStats: dataset.calibrationStats,
+      validationStats: dataset.validationStats,
+      rankingValidation: dataset.rankingValidation,
+      audit: dataset.audit,
+      gate,
+      onlineInfluence: false,
+    }
+  }
+  catch (error) {
+    return {
+      error: errorMessage(error),
+      onlineInfluence: false,
+    }
+  }
+}
 let memoryStore: VectorStore | undefined
 let memorySemanticActive = false
 let memoryV4SemanticError = ''
@@ -1383,6 +1414,7 @@ function setupIPC() {
         rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
         internalReview: memoryV4InternalReview.status(),
         internalFeedback: memoryV4InternalFeedbackStore?.status(),
+        internalFeedbackCalibration: memoryV4InternalFeedbackCalibrationStatus(),
         internalFeedbackPath: memoryV4InternalFeedbackPath,
         internalFeedbackError: memoryV4InternalFeedbackError,
         learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
@@ -1437,6 +1469,7 @@ function setupIPC() {
         rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
         internalReview: memoryV4InternalReview.status(),
         internalFeedback: memoryV4InternalFeedbackStore?.status(),
+        internalFeedbackCalibration: memoryV4InternalFeedbackCalibrationStatus(),
         internalFeedbackPath: memoryV4InternalFeedbackPath,
         internalFeedbackError: memoryV4InternalFeedbackError,
         learnedSemantic: memoryV4SemanticBackgroundIndex && memoryV4Repository
@@ -1499,7 +1532,7 @@ function setupIPC() {
       const errors = {
         'unknown-review': '评审记录已过期或不存在。',
         'unknown-candidate': '候选不属于该评审。',
-        'invalid-target': '“遗漏”只能标记整轮评审，其他反馈必须选择具体候选。',
+        'invalid-target': '“遗漏/无需记忆”只能标记整轮评审，其他反馈必须选择具体候选；“无需记忆”不能与“正确”候选并存。',
       }
       return { ok: false, error: errors[result.reason] }
     }

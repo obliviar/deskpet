@@ -14,6 +14,7 @@ export interface MemoryV4InternalCandidateReview {
   v4InfluencedAnswer: false
   createdAt: number
   queryHash: string
+  queryIntent: string
   v3: {
     retrievedCount: number
     injectedCount: number
@@ -273,6 +274,7 @@ function buildReview(
     v4InfluencedAnswer: false,
     createdAt,
     queryHash: comparison.queryHash,
+    queryIntent: boundedString(recall.queryIntent, 64, 'unknown'),
     v3: {
       retrievedCount: comparison.v3RetrievedCount,
       injectedCount: comparison.v3InjectedCount,

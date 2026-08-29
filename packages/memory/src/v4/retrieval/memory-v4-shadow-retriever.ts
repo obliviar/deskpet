@@ -18,31 +18,34 @@ import type {
   MemoryV4Snapshot,
 } from '../domain/types'
 import type { MemoryV4Repository } from '../repository/memory-v4-repository'
+import {
+  DEFAULT_MEMORY_V4_RETRIEVAL_POLICY,
+  createMemoryV4RetrievalPolicy,
+  memoryV4RetrievalPolicyIdentity,
+  type MemoryV4RetrievalPolicy,
+  type MemoryV4RetrievalPolicyIdentity,
+} from '../policy/memory-v4-retrieval-policy'
+import {
+  MEMORY_V4_EVIDENCE_SELECTOR_VERSION,
+  selectMemoryV4Evidence,
+  type MemoryV4EvidenceSelectionStopReason,
+} from './memory-v4-evidence-selector'
+import {
+  MEMORY_V4_TIER_ROUTER_VERSION,
+  memoryV4TierSearchIds,
+  routeMemoryV4Tiers,
+  type MemoryV4ColdPolicy,
+  type MemoryV4SearchTier,
+  type MemoryV4TierRoutingPlan,
+} from './memory-v4-tier-router'
 
 export const MEMORY_V4_SHADOW_RETRIEVER_VERSION = 'memory-v4-shadow-retriever-v2'
 export const MEMORY_V3_V4_SHADOW_COMPARATOR_VERSION = 'memory-v3-v4-shadow-comparator-v1'
 export const MEMORY_V4_SEMANTIC_INDEX_VERSION = 1 as const
 export const MEMORY_V4_LEARNED_SEMANTIC_EVIDENCE_VERSION = 'memory-v4-learned-semantic-evidence-v1'
-export const MEMORY_V4_LOCAL_CALIBRATION_DATASET_FINGERPRINT = 'e039d598c093be3b22d4727762fdcaf0db0da3f41715d3e1a50f3d505e160899'
-export const DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION: RecallAbstentionCalibrationModel = {
-  version: 'memory-v4-local-calibration-v1:deskpet-v4-local-synthetic-calibration-v1',
-  defaultThreshold: 0.45778665141358,
-  thresholds: {
-    enumerative: 0.36,
-    'multi-fact': 0.59778665141358,
-    specific: 0.583808110636619,
-    temporal: 0.5519159852738316,
-    timeline: 0.5,
-  },
-  datasetVersion: 'deskpet-v4-local-synthetic-calibration-v1',
-  sampleCount: 700,
-}
-
-const MIN_LEXICAL_CANDIDATE_SCORE = 0.12
-const MIN_SEMANTIC_CANDIDATE_SCORE = 0.08
-const MIN_LEARNED_SEMANTIC_COSINE = 0.45
-const MIN_SUMMARY_EVIDENCE_SCORE = 0.28
-const SUMMARY_EVIDENCE_WEIGHT = 0.25
+export const MEMORY_V4_LOCAL_CALIBRATION_DATASET_FINGERPRINT = '3690433a42c1f27844245d1a3003c7f56db51005740babd6ee1b0ba69d7bfdc3'
+export const DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION: RecallAbstentionCalibrationModel
+  = DEFAULT_MEMORY_V4_RETRIEVAL_POLICY.abstentionCalibration
 const V4_BM25_STOP_TERMS = new Set([
   'w:a', 'w:an', 'w:and', 'w:are', 'w:do', 'w:does', 'w:i', 'w:is', 'w:me',
   'w:my', 'w:of', 'w:please', 'w:tell', 'w:the', 'w:to', 'w:user', 'w:what',
@@ -98,6 +101,33 @@ export interface MemoryV4ShadowRecallHit {
   sensitivity: MemoryFactV4['sensitivity']
   validFrom?: number
   validTo?: number
+  recordedAt?: number
+  updatedAt?: number
+  origin?: MemoryFactV4['origin']
+  importance?: number
+  accessCount?: number
+  tier?: MemoryV4SearchTier
+}
+
+export interface MemoryV4TierRoutingTelemetry {
+  version: typeof MEMORY_V4_TIER_ROUTER_VERSION
+  assignmentVersion?: string
+  coldPolicy: MemoryV4ColdPolicy
+  coldAwakened: boolean
+  candidateBudgets: Record<MemoryV4SearchTier, number>
+  eligibleCounts: Record<MemoryV4SearchTier, number>
+  searchedCounts: Record<MemoryV4SearchTier, number>
+  quarantineExcluded: number
+  unassignedAsWarm: number
+}
+
+export interface MemoryV4EvidenceSelectionTelemetry {
+  version: typeof MEMORY_V4_EVIDENCE_SELECTOR_VERSION
+  evaluatedCount: number
+  selectedCount: number
+  coveredRequirements: string[]
+  stopReason: MemoryV4EvidenceSelectionStopReason
+  usedCharacters: number
 }
 
 export interface MemoryV4ShadowRecallResult {
@@ -111,6 +141,9 @@ export interface MemoryV4ShadowRecallResult {
   privacyFiltered: number
   temporalFiltered: number
   hits: MemoryV4ShadowRecallHit[]
+  tierRouting: MemoryV4TierRoutingTelemetry
+  evidenceSelection: MemoryV4EvidenceSelectionTelemetry
+  policy: MemoryV4RetrievalPolicyIdentity
   /** Absolute-evidence reject decision; RRF rank is deliberately excluded. */
   abstention?: MemoryRecallAbstention
   latencyMs: number
@@ -146,6 +179,8 @@ export interface MemoryV4ShadowRetriever {
 
 export interface MemoryV4ShadowRetrieverOptions {
   now?: () => number
+  /** Immutable offline-selected policy; the retriever never modifies it. */
+  policy?: MemoryV4RetrievalPolicy
   /** Must be fitted on V4 absolute-evidence scores, never on normalized RRF. */
   abstentionCalibration?: RecallAbstentionCalibrationModel
 }
@@ -169,8 +204,12 @@ export function createMemoryV4ShadowRetriever(
   options: MemoryV4ShadowRetrieverOptions = {},
 ): MemoryV4ShadowRetriever {
   const now = options.now ?? Date.now
+  const policy = options.policy
+    ? createMemoryV4RetrievalPolicy(options.policy)
+    : DEFAULT_MEMORY_V4_RETRIEVAL_POLICY
+  const policyIdentity = memoryV4RetrievalPolicyIdentity(policy)
   const abstentionCalibration = options.abstentionCalibration
-    ?? DEFAULT_MEMORY_V4_RECALL_ABSTENTION_CALIBRATION
+    ?? policy.abstentionCalibration
   const summaryLexical = createMemoryBm25Index({ tokenizer: tokenizeV4Evidence })
   const factLexical = createMemoryBm25Index({ tokenizer: tokenizeV4Evidence })
   const summarySemantic = createSparseVectorCandidateIndex()
@@ -293,9 +332,18 @@ export function createMemoryV4ShadowRetriever(
       ...(recallOptions.asOf ? { asOf: recallOptions.asOf } : {}),
     })
     const mode = plan.temporalMode === 'current' ? 'current' : 'historical'
-    const candidateBudget = Math.max(8, Math.min(256, plan.candidateBudget))
+    const candidateBudget = Math.max(8, Math.min(
+      256,
+      Math.round(plan.candidateBudget * policy.candidateBudgetScale[plan.intent]),
+    ))
     const summaryLimit = clampInteger(
-      recallOptions.summaryLimit ?? Math.max(4, Math.min(24, Math.ceil(candidateBudget / 4))),
+      recallOptions.summaryLimit ?? Math.max(
+        policy.summarySelection.minimum,
+        Math.min(
+          policy.summarySelection.maximum,
+          Math.ceil(candidateBudget / policy.summarySelection.candidateDivisor),
+        ),
+      ),
       1,
       64,
     )
@@ -316,8 +364,18 @@ export function createMemoryV4ShadowRetriever(
       }
       allowedFacts.add(id)
     }
+    const tierRouting = routeMemoryV4Tiers(snapshot, {
+      scope: recallOptions.scope,
+      eligibleFactIds: allowedFacts,
+      intent: plan.intent,
+      temporalMode: plan.temporalMode,
+      candidateBudget: Math.max(1, candidateBudget),
+      tierQuotas: policy.tierQuotas,
+    })
+    let coldAwakened = tierRouting.coldPolicy === 'eager'
 
-    if (!normalizedQuery || !plan.requiresMemory || allowedFacts.size === 0) {
+    if (!normalizedQuery || !plan.requiresMemory
+      || memoryV4TierSearchIds(tierRouting, coldAwakened).size === 0) {
       const abstention = calibrateRecallAbstention(plan.intent, 0, abstentionCalibration)
       return result({
         snapshot,
@@ -339,6 +397,9 @@ export function createMemoryV4ShadowRetriever(
         semanticDimension,
         semanticFacts: learnedFactSemantic.size(),
         semanticSummaries: learnedSummarySemantic.size(),
+        tierRouting: tierRoutingTelemetry(tierRouting, coldAwakened),
+        evidenceSelection: emptyEvidenceSelectionTelemetry(),
+        policy: policyIdentity,
       })
     }
 
@@ -347,12 +408,12 @@ export function createMemoryV4ShadowRetriever(
       scope: summaryScope,
       mode: 'current',
       limit: candidateBudget,
-      minScore: MIN_LEXICAL_CANDIDATE_SCORE,
+      minScore: policy.evidenceThresholds.lexicalCandidateScore,
     })
     const queryVector = createLocalEmbedding(normalizedQuery)
     const summarySemanticHits = summarySemantic.search(queryVector, {
       limit: candidateBudget,
-      minScore: MIN_SEMANTIC_CANDIDATE_SCORE,
+      minScore: policy.evidenceThresholds.semanticCandidateScore,
       allow: id => summaries.get(id)?.artifact
         ? matchesScope(summaries.get(id)!.artifact.scope, recallOptions.scope)
         : false,
@@ -363,7 +424,7 @@ export function createMemoryV4ShadowRetriever(
     const learnedSummarySemanticHits = learnedQuery
       ? learnedSummarySemantic.search(learnedQuery.vector, {
           limit: candidateBudget,
-          minScore: MIN_LEARNED_SEMANTIC_COSINE,
+          minScore: policy.evidenceThresholds.learnedSemanticCosine,
           allow: id => summaries.get(id)?.artifact
             ? matchesScope(summaries.get(id)!.artifact.scope, recallOptions.scope)
             : false,
@@ -389,7 +450,7 @@ export function createMemoryV4ShadowRetriever(
         name: 'summary-semantic-learned',
         items: learnedSummarySemanticHits.map(item => ({ id: item.indexed.artifact.id, item: item.indexed.artifact })),
       },
-    ], { windowSize: candidateBudget })
+    ], { rankConstant: policy.rrfRankConstant, windowSize: candidateBudget })
       .map(item => ({
         ...item,
         evidenceScore: combineRouteEvidence([
@@ -400,133 +461,200 @@ export function createMemoryV4ShadowRetriever(
           ),
         ]),
       }))
-      .filter(item => item.evidenceScore >= MIN_SUMMARY_EVIDENCE_SCORE)
+      .filter(item => item.evidenceScore >= policy.evidenceThresholds.summaryEvidenceScore)
       .sort((left, right) =>
         right.evidenceScore - left.evidenceScore
         || right.normalizedScore - left.normalizedScore
         || left.id.localeCompare(right.id))
     const selectedSummaries = fusedSummaries.slice(0, summaryLimit)
-    const summaryFactSupport = new Map<string, { rank: number; evidenceScore: number }>()
-    for (const [rank, summary] of selectedSummaries.entries()) {
-      for (const factId of summary.item.sourceFactIds) {
-        if (!allowedFacts.has(factId))
-          continue
-        const current = summaryFactSupport.get(factId)
-        if (!current || summary.evidenceScore > current.evidenceScore) {
-          summaryFactSupport.set(factId, {
-            rank: rank + 1,
-            evidenceScore: summary.evidenceScore,
-          })
+    const tierFactIds: Record<MemoryV4SearchTier, ReadonlySet<string>> = {
+      hot: new Set(tierRouting.tiers.hot),
+      warm: new Set(tierRouting.tiers.warm),
+      cold: new Set(tierRouting.tiers.cold),
+    }
+    function rankFacts(includeCold: boolean) {
+      const activeTiers: MemoryV4SearchTier[] = includeCold ? ['hot', 'warm', 'cold'] : ['hot', 'warm']
+      const enabledFacts = memoryV4TierSearchIds(tierRouting, includeCold)
+      const summaryFactSupport = new Map<string, { rank: number; evidenceScore: number }>()
+      for (const [rank, summary] of selectedSummaries.entries()) {
+        for (const factId of summary.item.sourceFactIds) {
+          if (!enabledFacts.has(factId))
+            continue
+          const current = summaryFactSupport.get(factId)
+          if (!current || summary.evidenceScore > current.evidenceScore)
+            summaryFactSupport.set(factId, { rank: rank + 1, evidenceScore: summary.evidenceScore })
         }
       }
+
+      const lexicalHits = activeTiers.flatMap(tier => factLexical.search(normalizedQuery, {
+        scope: summaryScope,
+        mode,
+        limit: tierRouting.candidateBudgets[tier],
+        minScore: policy.evidenceThresholds.lexicalCandidateScore,
+        allow: id => tierFactIds[tier].has(id),
+      })).sort((left, right) => right.score - left.score || left.id.localeCompare(right.id)).slice(0, candidateBudget)
+      const semanticHits = activeTiers.flatMap(tier => factSemantic.search(queryVector, {
+        limit: tierRouting.candidateBudgets[tier],
+        minScore: policy.evidenceThresholds.semanticCandidateScore,
+        allow: id => tierFactIds[tier].has(id),
+      })).sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+        .slice(0, candidateBudget)
+        .flatMap(hit => facts.get(hit.id) ? [{ indexed: facts.get(hit.id)!, score: hit.score }] : [])
+      const learnedSemanticHits = learnedQuery
+        ? activeTiers.flatMap(tier => learnedFactSemantic.search(learnedQuery.vector, {
+            limit: tierRouting.candidateBudgets[tier],
+            minScore: policy.evidenceThresholds.learnedSemanticCosine,
+            allow: id => tierFactIds[tier].has(id),
+          })).sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+            .slice(0, candidateBudget)
+            .flatMap(hit => facts.get(hit.id)
+              ? [{ indexed: facts.get(hit.id)!, score: learnedSemanticEvidence(hit.score) }]
+              : [])
+        : []
+      const structuredHits = plan.concepts.length === 0 && plan.intent !== 'enumerative'
+        ? []
+        : activeTiers.flatMap(tier => tierRouting.tiers[tier]
+            .flatMap(id => facts.get(id) ? [facts.get(id)!.fact] : [])
+            .filter(fact => structuredConceptEvidence(fact, plan.concepts, plan.intent) > 0)
+            .sort((left, right) => right.utilityScore - left.utilityScore || left.id.localeCompare(right.id))
+            .slice(0, tierRouting.candidateBudgets[tier]))
+            .slice(0, candidateBudget)
+      const lexicalScores = new Map(lexicalHits.map(hit => [hit.id, hit.score]))
+      const semanticScores = new Map(semanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
+      const learnedSemanticScores = new Map(learnedSemanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
+      const structuredScores = new Map(structuredHits.map(fact => [
+        fact.id,
+        structuredConceptEvidence(fact, plan.concepts, plan.intent),
+      ]))
+      const directCandidateIds = new Set([
+        ...lexicalScores.keys(),
+        ...semanticScores.keys(),
+        ...learnedSemanticScores.keys(),
+        ...structuredScores.keys(),
+        ...summaryFactSupport.keys(),
+      ])
+      const directEvidence = new Map([...directCandidateIds].map(id => [
+        id,
+        combineRouteEvidence([
+          lexicalScores.get(id) ?? 0,
+          Math.max(semanticScores.get(id) ?? 0, learnedSemanticScores.get(id) ?? 0),
+          structuredScores.get(id) ?? 0,
+        ]),
+      ]))
+      const threshold = calibrateRecallAbstention(plan.intent, 0, abstentionCalibration).threshold
+      const minimumSummaryFactEvidence
+        = threshold * policy.evidenceThresholds.minimumSummaryFactEvidenceRatio
+      const summaryHits = [...summaryFactSupport]
+        // A summary is navigation, not evidence that every fact in its bucket is relevant.
+        .filter(([id]) => (directEvidence.get(id) ?? 0) >= minimumSummaryFactEvidence)
+        .sort((left, right) => left[1].rank - right[1].rank || left[0].localeCompare(right[0]))
+        .flatMap(([id]) => facts.get(id)?.fact ? [{ id, item: facts.get(id)!.fact }] : [])
+      const routes = [
+        {
+          name: 'fact-lexical',
+          items: lexicalHits.flatMap(hit => facts.get(hit.id)?.fact
+            ? [{ id: hit.id, item: facts.get(hit.id)!.fact }]
+            : []),
+        },
+        {
+          name: learnedQuery ? 'fact-semantic-hash' : 'fact-semantic',
+          items: semanticHits.map(item => ({ id: item.indexed.fact.id, item: item.indexed.fact })),
+        },
+        {
+          name: 'fact-semantic-learned',
+          items: learnedSemanticHits.map(item => ({ id: item.indexed.fact.id, item: item.indexed.fact })),
+        },
+        { name: 'fact-structured', items: structuredHits.map(fact => ({ id: fact.id, item: fact })) },
+        { name: 'summary-down-drill', items: summaryHits },
+      ].filter(route => route.items.length > 0)
+      const fusedFacts = reciprocalRankFusion<MemoryFactV4>(routes, {
+        rankConstant: policy.rrfRankConstant,
+        windowSize: candidateBudget,
+      })
+        .map((item) => {
+          const directScore = directEvidence.get(item.id) ?? 0
+          const summaryScore = item.routes.includes('summary-down-drill')
+            ? summaryFactSupport.get(item.id)?.evidenceScore ?? 0
+            : 0
+          const evidenceScore = clamp01(
+            directScore + policy.evidenceThresholds.summaryEvidenceWeight * summaryScore * (1 - directScore),
+          )
+          // Rank support and static quality may break close ties, but cannot make
+          // an item eligible when its absolute evidence is below the reject gate.
+          const rankingScore = clamp01(
+            0.88 * evidenceScore
+            + 0.06 * item.normalizedScore * evidenceScore
+            + 0.02 * item.item.verificationScore
+            + 0.02 * item.item.utilityScore
+            + 0.02 * item.item.importance,
+          )
+          return { ...item, evidenceScore, rankingScore }
+        })
+        // A recognized structured field is an explicit user constraint. Local
+        // hash similarity can otherwise promote an unrelated surviving fact
+        // after the requested field was deleted (for example drink preference
+        // for an absent weekly-exercise query). Unknown/free-form queries keep
+        // the lexical and semantic paths, while enumerative queries still scan
+        // every eligible fact.
+        .filter(item => plan.intent === 'enumerative'
+          || plan.concepts.length === 0
+          || structuredConceptEvidence(item.item, plan.concepts, plan.intent) > 0
+          // A verified learned embedding is an explicit semantic mapping and
+          // may legitimately bridge a custom memoryKey to a known query field.
+          || (learnedSemanticScores.get(item.id) ?? 0) > 0)
+        .sort((left, right) =>
+          right.rankingScore - left.rankingScore
+          || right.evidenceScore - left.evidenceScore
+          || left.id.localeCompare(right.id))
+        .slice(0, candidateBudget)
+      return { fusedFacts, routes }
     }
 
-    const lexicalHits = factLexical.search(normalizedQuery, {
-      scope: summaryScope,
-      mode,
-      limit: candidateBudget,
-      minScore: MIN_LEXICAL_CANDIDATE_SCORE,
-      allow: id => allowedFacts.has(id),
-    })
-    const semanticHits = factSemantic.search(queryVector, {
-      limit: candidateBudget,
-      minScore: MIN_SEMANTIC_CANDIDATE_SCORE,
-      allow: id => allowedFacts.has(id),
-    }).flatMap(hit => facts.get(hit.id) ? [{ indexed: facts.get(hit.id)!, score: hit.score }] : [])
-    const learnedSemanticHits = learnedQuery
-      ? learnedFactSemantic.search(learnedQuery.vector, {
-          limit: candidateBudget,
-          minScore: MIN_LEARNED_SEMANTIC_COSINE,
-          allow: id => allowedFacts.has(id),
-        }).flatMap(hit => facts.get(hit.id)
-          ? [{ indexed: facts.get(hit.id)!, score: learnedSemanticEvidence(hit.score) }]
-          : [])
-      : []
-    const structuredHits = plan.concepts.length === 0 && plan.intent !== 'enumerative'
+    let ranked = rankFacts(coldAwakened)
+    let bestEvidenceScore = ranked.fusedFacts[0]?.evidenceScore ?? 0
+    let abstention = calibrateRecallAbstention(plan.intent, bestEvidenceScore, abstentionCalibration)
+    let eligibleFacts = abstention.abstained
       ? []
-      : [...allowedFacts]
-          .flatMap(id => facts.get(id) ? [facts.get(id)!.fact] : [])
-          .filter(fact => structuredConceptEvidence(fact, plan.concepts, plan.intent) > 0)
-          .sort((left, right) => right.utilityScore - left.utilityScore || left.id.localeCompare(right.id))
-          .slice(0, candidateBudget)
-    const lexicalScores = new Map(lexicalHits.map(hit => [hit.id, hit.score]))
-    const semanticScores = new Map(semanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
-    const learnedSemanticScores = new Map(learnedSemanticHits.map(hit => [hit.indexed.fact.id, hit.score]))
-    const structuredScores = new Map(structuredHits.map(fact => [
-      fact.id,
-      structuredConceptEvidence(fact, plan.concepts, plan.intent),
-    ]))
-    const directCandidateIds = new Set([
-      ...lexicalScores.keys(),
-      ...semanticScores.keys(),
-      ...learnedSemanticScores.keys(),
-      ...structuredScores.keys(),
-      ...summaryFactSupport.keys(),
-    ])
-    const directEvidence = new Map([...directCandidateIds].map(id => [
-      id,
-      combineRouteEvidence([
-        lexicalScores.get(id) ?? 0,
-        Math.max(semanticScores.get(id) ?? 0, learnedSemanticScores.get(id) ?? 0),
-        structuredScores.get(id) ?? 0,
-      ]),
-    ]))
-    const threshold = calibrateRecallAbstention(plan.intent, 0, abstentionCalibration).threshold
-    const minimumSummaryFactEvidence = threshold * 0.5
-    const summaryHits = [...summaryFactSupport]
-      // A summary is navigation, not evidence that every fact in its bucket is relevant.
-      .filter(([id]) => (directEvidence.get(id) ?? 0) >= minimumSummaryFactEvidence)
-      .sort((left, right) => left[1].rank - right[1].rank || left[0].localeCompare(right[0]))
-      .flatMap(([id]) => facts.get(id)?.fact ? [{ id, item: facts.get(id)!.fact }] : [])
-
-    const routes = [
+      : ranked.fusedFacts.filter(item => item.evidenceScore >= abstention.threshold)
+    let evidenceSelection = selectMemoryV4Evidence(
+      eligibleFacts.map(item => ({ ...item, fact: item.item })),
       {
-        name: 'fact-lexical',
-        items: lexicalHits.flatMap(hit => facts.get(hit.id)?.fact
-          ? [{ id: hit.id, item: facts.get(hit.id)!.fact }]
-          : []),
+        query: normalizedQuery,
+        intent: plan.intent,
+        concepts: plan.concepts,
+        subQueries: plan.subQueries,
+        maxSelected: limit,
+        maxCharacters: Math.round(plan.selection.maxCharacters * policy.evidenceSelection.maximumCharactersScale),
+        minMarginalGain: plan.intent === 'enumerative' || plan.intent === 'timeline'
+          ? policy.evidenceSelection.broadMinimumMarginalGain
+          : policy.evidenceSelection.defaultMinimumMarginalGain,
       },
-      {
-        name: learnedQuery ? 'fact-semantic-hash' : 'fact-semantic',
-        items: semanticHits.map(item => ({ id: item.indexed.fact.id, item: item.indexed.fact })),
-      },
-      {
-        name: 'fact-semantic-learned',
-        items: learnedSemanticHits.map(item => ({ id: item.indexed.fact.id, item: item.indexed.fact })),
-      },
-      { name: 'fact-structured', items: structuredHits.map(fact => ({ id: fact.id, item: fact })) },
-      { name: 'summary-down-drill', items: summaryHits },
-    ].filter(route => route.items.length > 0)
-    const fusedFacts = reciprocalRankFusion<MemoryFactV4>(routes, { windowSize: candidateBudget })
-      .map((item) => {
-        const directScore = directEvidence.get(item.id) ?? 0
-        const summaryScore = item.routes.includes('summary-down-drill')
-          ? summaryFactSupport.get(item.id)?.evidenceScore ?? 0
-          : 0
-        const evidenceScore = clamp01(
-          directScore + SUMMARY_EVIDENCE_WEIGHT * summaryScore * (1 - directScore),
-        )
-        // Rank support and static quality may break close ties, but cannot make
-        // an item eligible when its absolute evidence is below the reject gate.
-        const rankingScore = clamp01(
-          0.88 * evidenceScore
-          + 0.06 * item.normalizedScore * evidenceScore
-          + 0.02 * item.item.verificationScore
-          + 0.02 * item.item.utilityScore
-          + 0.02 * item.item.importance,
-        )
-        return { ...item, evidenceScore, rankingScore }
-      })
-      .sort((left, right) =>
-        right.rankingScore - left.rankingScore
-        || right.evidenceScore - left.evidenceScore
-        || left.id.localeCompare(right.id))
-    const bestEvidenceScore = fusedFacts[0]?.evidenceScore ?? 0
-    const abstention = calibrateRecallAbstention(plan.intent, bestEvidenceScore, abstentionCalibration)
-    const eligibleFacts = abstention.abstained
-      ? []
-      : fusedFacts.filter(item => item.evidenceScore >= abstention.threshold)
-    const hits = eligibleFacts.slice(0, limit).map(({ item, evidenceScore, routes }) => ({
+    )
+    if (tierRouting.coldPolicy === 'fallback' && tierRouting.tiers.cold.length > 0
+      && shouldAwakenCold(plan.intent, eligibleFacts.length, evidenceSelection.stopReason)) {
+      coldAwakened = true
+      ranked = rankFacts(true)
+      bestEvidenceScore = ranked.fusedFacts[0]?.evidenceScore ?? 0
+      abstention = calibrateRecallAbstention(plan.intent, bestEvidenceScore, abstentionCalibration)
+      eligibleFacts = abstention.abstained
+        ? []
+        : ranked.fusedFacts.filter(item => item.evidenceScore >= abstention.threshold)
+      evidenceSelection = selectMemoryV4Evidence(
+        eligibleFacts.map(item => ({ ...item, fact: item.item })),
+        {
+          query: normalizedQuery,
+          intent: plan.intent,
+          concepts: plan.concepts,
+          subQueries: plan.subQueries,
+          maxSelected: limit,
+          maxCharacters: Math.round(plan.selection.maxCharacters * policy.evidenceSelection.maximumCharactersScale),
+          minMarginalGain: plan.intent === 'enumerative' || plan.intent === 'timeline'
+            ? policy.evidenceSelection.broadMinimumMarginalGain
+            : policy.evidenceSelection.defaultMinimumMarginalGain,
+        },
+      )
+    }
+    const hits = evidenceSelection.selected.map(({ item, evidenceScore, routes }) => ({
       factId: item.id,
       ...(facts.get(item.id)?.sourceMemoryId ? { sourceMemoryId: facts.get(item.id)!.sourceMemoryId } : {}),
       content: item.canonicalText,
@@ -541,6 +669,12 @@ export function createMemoryV4ShadowRetriever(
       sensitivity: item.sensitivity,
       ...(item.validFrom === undefined ? {} : { validFrom: item.validFrom }),
       ...(item.validTo === undefined ? {} : { validTo: item.validTo }),
+      recordedAt: item.recordedAt,
+      updatedAt: item.updatedAt,
+      origin: item.origin,
+      importance: item.importance,
+      accessCount: item.accessCount,
+      tier: memoryV4FactTier(tierRouting, item.id),
     }))
     return result({
       snapshot,
@@ -550,8 +684,8 @@ export function createMemoryV4ShadowRetriever(
       hits,
       summaryCandidates: fusedSummaries.length,
       summariesUsed: selectedSummaries.map(summary => summary.id),
-      routes: routes.map(route => route.name),
-      candidateCount: fusedFacts.length,
+      routes: ranked.routes.map(route => route.name),
+      candidateCount: ranked.fusedFacts.length,
       startedAt,
       summaries: summaries.size,
       facts: facts.size,
@@ -562,6 +696,16 @@ export function createMemoryV4ShadowRetriever(
       semanticDimension,
       semanticFacts: learnedFactSemantic.size(),
       semanticSummaries: learnedSummarySemantic.size(),
+      tierRouting: tierRoutingTelemetry(tierRouting, coldAwakened),
+      evidenceSelection: {
+        version: evidenceSelection.version,
+        evaluatedCount: evidenceSelection.evaluatedFactIds.length,
+        selectedCount: evidenceSelection.selected.length,
+        coveredRequirements: evidenceSelection.coveredRequirements,
+        stopReason: evidenceSelection.stopReason,
+        usedCharacters: evidenceSelection.usedCharacters,
+      },
+      policy: policyIdentity,
     })
   }
 
@@ -755,6 +899,9 @@ function result(input: {
   semanticDimension?: number
   semanticFacts?: number
   semanticSummaries?: number
+  tierRouting: MemoryV4TierRoutingTelemetry
+  evidenceSelection: MemoryV4EvidenceSelectionTelemetry
+  policy: MemoryV4RetrievalPolicyIdentity
 }): MemoryV4ShadowRecallResult {
   return {
     version: MEMORY_V4_SHADOW_RETRIEVER_VERSION,
@@ -767,6 +914,9 @@ function result(input: {
     privacyFiltered: input.privacyFiltered,
     temporalFiltered: input.temporalFiltered,
     hits: input.hits,
+    tierRouting: input.tierRouting,
+    evidenceSelection: input.evidenceSelection,
+    policy: input.policy,
     ...(input.abstention ? { abstention: input.abstention } : {}),
     latencyMs: Math.max(0, performance.now() - input.startedAt),
     index: {
@@ -781,6 +931,60 @@ function result(input: {
       ...(input.semanticQueryUsed ? { semanticEvidenceVersion: MEMORY_V4_LEARNED_SEMANTIC_EVIDENCE_VERSION } : {}),
     },
   }
+}
+
+function shouldAwakenCold(
+  intent: string,
+  eligibleCount: number,
+  selectionStopReason: MemoryV4EvidenceSelectionStopReason,
+): boolean {
+  if (eligibleCount === 0)
+    return true
+  return intent === 'multi-fact' && selectionStopReason !== 'coverage-satisfied'
+}
+
+function tierRoutingTelemetry(
+  plan: MemoryV4TierRoutingPlan,
+  coldAwakened: boolean,
+): MemoryV4TierRoutingTelemetry {
+  return {
+    version: plan.version,
+    ...(plan.assignmentVersion ? { assignmentVersion: plan.assignmentVersion } : {}),
+    coldPolicy: plan.coldPolicy,
+    coldAwakened,
+    candidateBudgets: { ...plan.candidateBudgets },
+    eligibleCounts: {
+      hot: plan.tiers.hot.length,
+      warm: plan.tiers.warm.length,
+      cold: plan.tiers.cold.length,
+    },
+    searchedCounts: {
+      hot: plan.tiers.hot.length,
+      warm: plan.tiers.warm.length,
+      cold: coldAwakened ? plan.tiers.cold.length : 0,
+    },
+    quarantineExcluded: plan.quarantineFactIds.length,
+    unassignedAsWarm: plan.unassignedFactIds.length,
+  }
+}
+
+function emptyEvidenceSelectionTelemetry(): MemoryV4EvidenceSelectionTelemetry {
+  return {
+    version: MEMORY_V4_EVIDENCE_SELECTOR_VERSION,
+    evaluatedCount: 0,
+    selectedCount: 0,
+    coveredRequirements: [],
+    stopReason: 'no-candidates',
+    usedCharacters: 0,
+  }
+}
+
+function memoryV4FactTier(plan: MemoryV4TierRoutingPlan, factId: string): MemoryV4SearchTier {
+  if (plan.tiers.hot.includes(factId))
+    return 'hot'
+  if (plan.tiers.cold.includes(factId))
+    return 'cold'
+  return 'warm'
 }
 
 function indexSignature(snapshot: MemoryV4Snapshot): string {
@@ -861,6 +1065,9 @@ function structuredConceptEvidence(
     return 0.72
   if (concepts.includes(fact.memoryKey))
     return 1
+  const hasSpecificPreference = concepts.some(concept => concept.startsWith('preference.') && concept !== 'preference.any')
+  if (concepts.includes('preference.any') && !hasSpecificPreference && fact.memoryKey.startsWith('preference.'))
+    return 0.65
   return concepts.some(concept =>
     fact.memoryKey.startsWith(`${concept}.`) || concept.startsWith(`${fact.memoryKey}.`))
     ? 0.86

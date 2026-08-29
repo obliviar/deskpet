@@ -14,7 +14,7 @@ import {
 const NOW = Date.UTC(2026, 7, 25)
 const CALIBRATION_OWNERS = 50
 const VALIDATION_OWNERS = 80
-const DATASET_VERSION = 'deskpet-v4-local-synthetic-calibration-v1'
+const DATASET_VERSION = 'deskpet-v4-local-synthetic-calibration-v2'
 
 interface LocalCase {
   id: string
@@ -39,12 +39,11 @@ describe('Memory V4 local absolute-evidence calibration', () => {
       falsePositiveCost: 3,
       falseNegativeCost: 1,
     })
-
     expect(artifact).toMatchObject({
       calibrationSamples: 700,
       validationSamples: 1_120,
       model: {
-        version: `memory-v4-local-calibration-v1:${DATASET_VERSION}`,
+        version: `memory-v4-local-calibration-v2:${DATASET_VERSION}`,
         datasetVersion: DATASET_VERSION,
         sampleCount: 700,
       },

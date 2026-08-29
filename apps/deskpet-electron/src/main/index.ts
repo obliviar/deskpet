@@ -89,6 +89,11 @@ import {
   normalizeMemoryV4RolloutStage,
   type MemoryV4RolloutStageSetting,
 } from './memory-v4-rollout-settings'
+import {
+  createMemoryV4ReadController,
+  resolveMemoryV4ReadMode,
+  type MemoryV4ReadController,
+} from './memory-v4-read-controller'
 
 // Some Windows systems cannot initialize Electron's GPU subprocess. Disable
 // hardware acceleration before app readiness so the packaged app still starts.
@@ -142,6 +147,10 @@ const config = {
   memoryV4InternalReviewEnabled: process.env.DESKPET_MEMORY_V4_INTERNAL_REVIEW
     ? process.env.DESKPET_MEMORY_V4_INTERNAL_REVIEW === 'true'
     : (fileConfig.memoryV4InternalReviewEnabled === true),
+  memoryV4ReadMode: resolveMemoryV4ReadMode(
+    process.env.DESKPET_MEMORY_V4_READ_MODE,
+    fileConfig.memoryV4ReadMode,
+  ),
   embeddingApiKey: process.env.DESKPET_EMBEDDING_API_KEY || fileConfig.embeddingApiKey || process.env.OPENAI_API_KEY || fileConfig.apiKey || '',
   embeddingBaseURL: process.env.DESKPET_EMBEDDING_BASE_URL || fileConfig.embeddingBaseURL || process.env.OPENAI_BASE_URL || fileConfig.baseURL || undefined,
   embeddingModel: process.env.DESKPET_EMBEDDING_MODEL || fileConfig.embeddingModel || LOCAL_EMBEDDING_MODEL,
@@ -321,6 +330,7 @@ let memoryCandidateReview: MemoryCandidateReviewService | undefined
 let memoryV4Persistence: JournaledV4Persistence | undefined
 let memoryV4ConsolidationRunner: IdleConsolidationRunner | undefined
 let memoryV4ShadowWorkerClient: MemoryV4ShadowWorkerClient | undefined
+let memoryV4ReadController: MemoryV4ReadController | undefined
 let memoryV4ShadowComparator: V3V4ShadowComparator = createV3V4ShadowComparator()
 interface MemoryV4ShadowComparisonTask {
   generation: number
@@ -567,6 +577,7 @@ function initializeMemory(): void {
   memoryV4ShadowTaskQueue = undefined
   memoryV4ShadowWorkerClient?.stop()
   memoryV4ShadowWorkerClient = undefined
+  memoryV4ReadController = undefined
   memoryV4ShadowComparator = createV3V4ShadowComparator()
   memoryV4ShadowEvaluationPersistence = undefined
   memoryV4ShadowEvaluationStore = undefined
@@ -867,22 +878,7 @@ function initializeMemory(): void {
             return
           }
           try {
-            let semanticQuery: { model: string; vector: number[] } | undefined
-            if (memorySemanticActive) {
-              try {
-                semanticQuery = {
-                  model: SEMANTIC_MEMORY_FINGERPRINT,
-                  vector: await semanticMemory.embed(task.query),
-                }
-                memoryV4SemanticError = ''
-              }
-              catch (error) {
-                const message = errorMessage(error)
-                if (message !== memoryV4SemanticError)
-                  writeBootLog(`Memory V4 learned semantic query fell back to local hash: ${message}`)
-                memoryV4SemanticError = message
-              }
-            }
+            const semanticQuery = await prepareMemoryV4SemanticQuery(task.query)
             const v4 = await shadowWorkerClient.recall(task.query, {
               scope: task.scope,
               limit: Math.max(1, Math.min(50, task.v3RetrievedIds.length || 10)),
@@ -928,7 +924,7 @@ function initializeMemory(): void {
       })
       if (memorySettings.v4RolloutStage === 'internal') {
         memoryV4InternalReview.setEnabled(true)
-        writeBootLog('Memory V4 internal candidate review enabled; V3 remains authoritative')
+        writeBootLog('Memory V4 internal candidate review enabled; review does not modify official read mode')
       }
       // Stage-four offline consolidation: rebuild session/day/topic/entity/
       // temporal-stage summaries in
@@ -1015,6 +1011,28 @@ function isStageOneV4Shadow(snapshot: ReturnType<ReturnType<typeof createMemoryV
   return empty || migrationOnly
 }
 
+async function prepareMemoryV4SemanticQuery(
+  query: string,
+): Promise<{ model: string; vector: number[] } | undefined> {
+  if (!memorySemanticActive)
+    return undefined
+  try {
+    const semanticQuery = {
+      model: SEMANTIC_MEMORY_FINGERPRINT,
+      vector: await semanticMemory.embed(query),
+    }
+    memoryV4SemanticError = ''
+    return semanticQuery
+  }
+  catch (error) {
+    const message = errorMessage(error)
+    if (message !== memoryV4SemanticError)
+      writeBootLog(`Memory V4 learned semantic query fell back to local hash: ${message}`)
+    memoryV4SemanticError = message
+    return undefined
+  }
+}
+
 function scheduleV4ShadowComparison(
   query: string,
   scope: { ownerId: string; agentId?: string; sessionId?: string },
@@ -1048,6 +1066,47 @@ function memoryForRemoteRuntime() {
   if (!memory)
     return undefined
   const localMemory = memory
+  const worker = memoryV4ShadowWorkerClient
+  const readController = createMemoryV4ReadController({
+    mode: config.memoryV4ReadMode,
+    recallV3: (query, scope, options) => localMemory.recallAdaptive!(query, scope, options),
+    ...(worker
+      ? {
+          recallV4: async (query, options) => {
+            const semanticQuery = await prepareMemoryV4SemanticQuery(query)
+            return worker.recall(query, {
+              ...options,
+              ...(semanticQuery ? { semanticQuery } : {}),
+            })
+          },
+        }
+      : {}),
+    isV4Ready: () => !!memoryV4Shadow
+      && !!memoryV4Repository
+      && memoryV4ShadowWorkerClient === worker
+      && !!worker
+      && !worker.status().active,
+    onDecision: (decision, { query, scope }) => {
+      memoryV4Shadow?.enqueueRetrieval({
+        query,
+        scope,
+        retrievedMemoryIds: [...decision.result.retrievedMemoryIds],
+        injectedMemoryIds: [...decision.result.injectedMemoryIds],
+        queryType: 'adaptive',
+        answerModel: apiConfig.model,
+      })
+      if (decision.requestedMode === 'v3') {
+        scheduleV4ShadowComparison(
+          query,
+          scope,
+          decision.result.retrievedMemoryIds,
+          decision.result.injectedMemoryIds,
+        )
+      }
+    },
+  })
+  memoryV4ReadController = readController
+  writeBootLog(`Memory V4 official read controller ready: ${config.memoryV4ReadMode}, per-request V3 fallback enabled`)
   return {
     ...localMemory,
     async recall(query: string, scope: Parameters<typeof localMemory.recall>[1], topK = 5) {
@@ -1078,22 +1137,12 @@ function memoryForRemoteRuntime() {
           stopReason: 'no-candidates' as const,
         }
       }
-      const recalled = await localMemory.recallAdaptive!(query, scope, {
+      return readController.recallAdaptive(query, scope, {
         sharePolicies: ['allow-remote'],
         sensitivities: memorySettings.remotePolicy === 'allow-private'
           ? ['normal', 'private']
           : ['normal'],
       })
-      memoryV4Shadow?.enqueueRetrieval({
-        query,
-        scope,
-        retrievedMemoryIds: recalled.retrievedMemoryIds,
-        injectedMemoryIds: recalled.injectedMemoryIds,
-        queryType: 'adaptive',
-        answerModel: apiConfig.model,
-      })
-      scheduleV4ShadowComparison(query, scope, recalled.retrievedMemoryIds, recalled.injectedMemoryIds)
-      return recalled
     },
   }
 }
@@ -1408,7 +1457,9 @@ function setupIPC() {
         rolloutGate: evaluateMemoryV4RolloutGate(),
         evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
         evaluationError: memoryV4ShadowEvaluationError,
-        authoritativeAnswerSource: 'v3',
+        authoritativeAnswerSource: memoryV4ReadController?.status().last?.authoritativeReadSource ?? 'v3',
+        configuredReadMode: config.memoryV4ReadMode,
+        officialRead: memoryV4ReadController?.status(),
         rolloutStage: effectiveMemoryV4RolloutStage(),
         requestedRolloutStage: memorySettings.v4RolloutStage,
         rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
@@ -1463,7 +1514,9 @@ function setupIPC() {
         rolloutGate: evaluateMemoryV4RolloutGate(),
         evaluationStoragePath: memoryV4ShadowEvaluationPersistence?.encryptedPath,
         evaluationError: memoryV4ShadowEvaluationError,
-        authoritativeAnswerSource: 'v3',
+        authoritativeAnswerSource: memoryV4ReadController?.status().last?.authoritativeReadSource ?? 'v3',
+        configuredReadMode: config.memoryV4ReadMode,
+        officialRead: memoryV4ReadController?.status(),
         rolloutStage: effectiveMemoryV4RolloutStage(),
         requestedRolloutStage: memorySettings.v4RolloutStage,
         rolloutStageLocked: memoryV4InternalReviewEnvironmentOverride !== undefined,
@@ -1773,6 +1826,18 @@ function createWindow() {
     // initialization without leaving Electron processes behind.
     if (process.env.DESKPET_SMOKE_TEST === 'true') {
       void (async () => {
+        if (memoryV4ReadController) {
+          const recalled = await memoryV4ReadController.recallAdaptive('我叫什么名字？', localMemoryScope, {
+            maxInjected: 3,
+            sharePolicies: ['allow-remote'],
+            sensitivities: ['normal'],
+          })
+          const status = memoryV4ReadController.status()
+          writeBootLog(`Memory V4 official read smoke completed: mode ${status.configuredMode}, source ${status.last?.authoritativeReadSource ?? 'none'}, fallback ${status.last?.fallbackReason ?? 'none'}, memories ${recalled.injectedMemoryIds.length}`)
+        }
+        else {
+          writeBootLog('Memory V4 official read smoke skipped: controller unavailable')
+        }
         if (memoryV4ShadowWorkerClient) {
           const result = await memoryV4ShadowWorkerClient.recall('我叫什么名字？', {
             scope: localMemoryScope,
@@ -1790,7 +1855,7 @@ function createWindow() {
           const actualRolloutStage = effectiveMemoryV4RolloutStage()
           if (expectedRolloutStage !== actualRolloutStage)
             throw new Error(`Expected V4 rollout stage ${expectedRolloutStage}, received ${actualRolloutStage}`)
-          writeBootLog(`Memory V4 rollout smoke verified: ${actualRolloutStage}, V3 authoritative`)
+          writeBootLog(`Memory V4 rollout smoke verified: ${actualRolloutStage}, read mode ${config.memoryV4ReadMode}`)
         }
         const purgeId = process.env.DESKPET_SMOKE_PURGE_ID?.trim()
         if (purgeId) {

@@ -85,6 +85,23 @@ describe('Memory V4 Internal feedback calibration', () => {
     })
     expect(() => fitMemoryV4InternalFeedbackCalibration(dataset, gate)).toThrow(/not eligible/u)
   })
+
+  it('excludes unconfirmed reviews from every calibration split', () => {
+    const confirmed = review(1, true)
+    const unconfirmed = { ...review(2, false), confirmedAt: undefined }
+    const dataset = freezeMemoryV4InternalFeedbackDataset([confirmed, unconfirmed], {
+      createdAt: NOW,
+      policy: permissivePolicy(),
+    })
+
+    expect(dataset.audit).toMatchObject({
+      selectedVersionReviews: 2,
+      confirmedReviews: 1,
+      unconfirmedReviews: 1,
+      adjudicatedQueries: 1,
+    })
+    expect(dataset.calibrationStats.samples + dataset.validationStats.samples).toBe(1)
+  })
 })
 
 function review(index: number, relevant: boolean, sourceMemoryId = `memory-${index}`): MemoryV4InternalFeedbackCalibrationReview {
@@ -96,6 +113,7 @@ function review(index: number, relevant: boolean, sourceMemoryId = `memory-${ind
     calibrationVersion: 'calibration-production-candidate-v1',
     bestEvidenceScore: relevant ? 0.9 : 0.1,
     createdAt: NOW + index,
+    confirmedAt: NOW + index + 1,
     candidates: [{
       factId: `fact-${index}`,
       sourceMemoryId,

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { localSemanticConcepts } from '../../long-term/local-embedding'
 import type {
   EvidenceLinkV4,
   JsonObject,
@@ -229,6 +230,7 @@ export function migrateV3PayloadToV4(
 
     const memoryKey = normalizedString(item.memoryKey)
       ?? normalizedString(item.metadata?.memoryKey)
+      ?? inferLegacyMemoryKey(item)
       ?? `legacy.fact.${item.id}`
     const predicate = memoryKey.startsWith('legacy.fact.')
       ? normalizedString(item.metadata?.kind) ?? 'legacy.fact'
@@ -451,6 +453,18 @@ function uniqueStrings(value: unknown): string[] {
 
 function normalizedString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+/**
+ * Old V3 records did not always persist memoryKey. Infer only an unambiguous
+ * specific field from the retained canonical text; otherwise keep the lossless
+ * legacy namespace. Broad preference.any is deliberately never persisted as a
+ * concrete key.
+ */
+function inferLegacyMemoryKey(item: V3MemoryItem): string | undefined {
+  const concepts = localSemanticConcepts(`${normalizedString(item.metadata?.kind) ?? ''} ${item.content}`)
+    .filter(concept => concept !== 'preference.any')
+  return concepts.length === 1 ? concepts[0] : undefined
 }
 
 function score(value: unknown, fallback: number): number {

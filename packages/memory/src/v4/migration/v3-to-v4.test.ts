@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createMemoryV4Repository } from '../repository/memory-v4-repository'
+import { createMemoryV4ShadowRetriever } from '../retrieval/memory-v4-shadow-retriever'
 import { migrateV3PayloadToV4, migrateV3SourceIntoV4 } from './v3-to-v4'
 
 const MIGRATION_TIME = 1_800_000_000_000
@@ -101,6 +102,34 @@ describe('V3 to V4 migration', () => {
     const migrated = migrateV3PayloadToV4(payload, { now: () => MIGRATION_TIME })
     expect(migrated.facts[0]?.status).toBe('quarantined')
     expect(migrated.facts[0]?.verificationState).toBe('legacy-unverified')
+  })
+
+  it('infers an unambiguous key for legacy manual facts and makes them V4-readable', () => {
+    const payload = JSON.stringify({
+      version: 3,
+      items: [{
+        id: 'legacy-manual-name', content: '用户姓名：小秦', metadata: { kind: 'identity', cardinality: 'single' },
+        status: 'active', origin: 'manual', importance: 0.9, confidence: 1, accessCount: 0,
+        sourceMessageIds: [], sourceAttachmentIds: [], sharePolicy: 'allow-remote', sensitivity: 'normal',
+        scope: { ownerId: 'local-user', agentId: 'deskpet' }, embedding: [], embeddingModel: 'local-hash-v2',
+        createdAt: 1000, updatedAt: 1001,
+      }],
+    })
+    const migrated = migrateV3PayloadToV4(payload, { now: () => MIGRATION_TIME })
+    expect(migrated.facts[0]?.memoryKey).toBe('profile.name')
+    const repository = createMemoryV4Repository({ now: () => MIGRATION_TIME })
+    repository.replace(migrated)
+
+    const recalled = createMemoryV4ShadowRetriever(repository, { now: () => MIGRATION_TIME })
+      .recall('我叫什么名字？', {
+        scope: { ownerId: 'local-user', agentId: 'deskpet' },
+        sharePolicies: ['allow-remote'],
+        sensitivities: ['normal'],
+        limit: 3,
+      })
+
+    expect(recalled.abstention?.abstained).toBe(false)
+    expect(recalled.hits.map(hit => hit.sourceMemoryId)).toEqual(['legacy-manual-name'])
   })
 
   it('uses conservative privacy defaults for missing or damaged V3 fields', () => {

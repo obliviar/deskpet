@@ -29,6 +29,8 @@ describe('Memory V4 Internal feedback store', () => {
     expect(store.status()).toMatchObject({
       encrypted: true,
       retainedReviews: 1,
+      confirmedReviews: 0,
+      unconfirmedReviews: 1,
       labeledCandidates: 1,
       missingFeedback: 0,
       byLabel: { correct: 0, incorrect: 1 },
@@ -59,12 +61,38 @@ describe('Memory V4 Internal feedback store', () => {
       .toEqual({ ok: true, label: 'no-memory' })
     expect(store.recordFeedback({ reviewId: 'review-1', factId: 'fact-coffee', label: 'correct' }))
       .toEqual({ ok: false, reason: 'invalid-target' })
+    expect(store.confirmReview('review-1')).toEqual({ ok: false, reason: 'incomplete-candidates' })
+    expect(store.recordFeedback({ reviewId: 'review-1', factId: 'fact-coffee', label: 'incorrect' }))
+      .toEqual({ ok: true, label: 'incorrect' })
+    expect(store.confirmReview('review-1')).toEqual({ ok: true, confirmedAt: NOW })
     expect(store.calibrationReviews()[0]).toMatchObject({
       queryIntent: 'specific',
       bestEvidenceScore: 0.9,
       queryLabel: 'no-memory',
+      confirmedAt: NOW,
     })
-    expect(store.status()).toMatchObject({ queryFeedback: 1, noMemoryFeedback: 1 })
+    expect(store.status()).toMatchObject({
+      queryFeedback: 1,
+      noMemoryFeedback: 1,
+      confirmedReviews: 1,
+      unconfirmedReviews: 0,
+    })
+    expect(store.recordFeedback({ reviewId: 'review-1', factId: 'fact-coffee', label: 'expired' }))
+      .toEqual({ ok: true, label: 'expired' })
+    expect(store.status()).toMatchObject({ confirmedReviews: 0, unconfirmedReviews: 1 })
+  })
+
+  it('requires complete and self-contained judgments before confirmation', () => {
+    const store = createMemoryV4InternalFeedbackStore({ now: () => NOW })
+    store.registerReview(review())
+    expect(store.confirmReview('forged')).toEqual({ ok: false, reason: 'unknown-review' })
+    expect(store.confirmReview('review-1')).toEqual({ ok: false, reason: 'incomplete-candidates' })
+    expect(store.recordFeedback({ reviewId: 'review-1', factId: 'fact-coffee', label: 'expired' }))
+      .toEqual({ ok: true, label: 'expired' })
+    expect(store.confirmReview('review-1')).toEqual({ ok: false, reason: 'missing-query-verdict' })
+    expect(store.recordFeedback({ reviewId: 'review-1', label: 'missing' }))
+      .toEqual({ ok: true, label: 'missing' })
+    expect(store.confirmReview('review-1')).toEqual({ ok: true, confirmedAt: NOW })
   })
 
   it('purges references by either V4 fact ID or V3 source memory ID', () => {
@@ -87,7 +115,7 @@ describe('Memory V4 Internal feedback store', () => {
   })
 
 
-  it('loads the v1 schema as v2 without inventing plaintext or intent', () => {
+  it('loads the v1 schema as v3 without inventing plaintext, intent or confirmation', () => {
     const payload = JSON.stringify({
       schemaVersion: 1,
       createdAt: NOW,
@@ -111,6 +139,7 @@ describe('Memory V4 Internal feedback store', () => {
       bestEvidenceScore: 0.4,
       queryLabel: 'missing',
     })
+    expect(store.status()).toMatchObject({ confirmedReviews: 0, unconfirmedReviews: 1 })
   })
 })
 

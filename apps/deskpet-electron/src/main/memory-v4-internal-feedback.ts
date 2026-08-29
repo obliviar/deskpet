@@ -3,6 +3,7 @@ import {
   isMemoryV4InternalFeedbackLabel,
   type MemoryV4InternalFeedbackLabel,
   type MemoryV4InternalFeedbackCalibrationReview,
+  type MemoryV4InternalFeedbackConfirmationResult,
   type MemoryV4InternalFeedbackPersistence,
   type MemoryV4InternalFeedbackResult,
   type MemoryV4InternalFeedbackStatus,
@@ -13,6 +14,7 @@ export {
   isMemoryV4InternalFeedbackLabel,
   type MemoryV4InternalFeedbackLabel,
   type MemoryV4InternalFeedbackCalibrationReview,
+  type MemoryV4InternalFeedbackConfirmationResult,
   type MemoryV4InternalFeedbackPersistence,
   type MemoryV4InternalFeedbackResult,
   type MemoryV4InternalFeedbackStatus,
@@ -25,6 +27,7 @@ export interface MemoryV4InternalFeedbackStore {
     factId?: string
     label: MemoryV4InternalFeedbackLabel
   }) => MemoryV4InternalFeedbackResult
+  confirmReview: (reviewId: string) => MemoryV4InternalFeedbackConfirmationResult
   feedbackFor: (reviewId: string, factId?: string) => MemoryV4InternalFeedbackLabel | undefined
   calibrationReviews: () => MemoryV4InternalFeedbackCalibrationReview[]
   removeFactIds: (factIds: readonly string[]) => number
@@ -61,6 +64,7 @@ export function createMemoryV4InternalFeedbackStore(options: {
       })
     },
     recordFeedback: core.recordFeedback,
+    confirmReview: core.confirmReview,
     feedbackFor: core.feedbackFor,
     calibrationReviews: core.calibrationReviews,
     removeFactIds: core.removeFactIds,

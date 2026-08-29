@@ -93,14 +93,22 @@ try {
   $env:DESKPET_SMOKE_TEST = 'true'
   $env:DESKPET_MEMORY = 'true'
   $env:DESKPET_MEMORY_V4_INTERNAL_REVIEW = 'true'
+  $env:DESKPET_MEMORY_V4_READ_MODE = 'auto'
   $env:DESKPET_SMOKE_EXPECT_ROLLOUT_STAGE = 'internal'
 
   Invoke-SmokeLaunch
-  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 internal candidate review enabled; V3 remains authoritative' -Quiet)) {
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 official read controller ready: auto, per-request V3 fallback enabled' -Quiet)) {
+    throw 'The default-auto V4 official read controller was not attached to AgentRuntime.'
+  }
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 official read smoke completed: mode auto, source v4, fallback none, memories 1' -Quiet)) {
+    $observedOfficialReads = (Select-String -Path $logPath -Pattern 'Memory V4 (official read|worker) smoke').Line -join ' | '
+    throw "Auto mode did not inject the accepted V4 fact through the official read controller. Observed: $observedOfficialReads"
+  }
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 internal candidate review enabled; review does not modify official read mode' -Quiet)) {
     throw 'The opt-in V4 internal candidate review controller was not initialized.'
   }
-  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 rollout smoke verified: internal, V3 authoritative' -Quiet)) {
-    throw 'The effective Internal stage was not reported with V3 remaining authoritative.'
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 rollout smoke verified: internal, read mode auto' -Quiet)) {
+    throw 'The effective Internal review stage and default auto read mode were not reported.'
   }
   if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow migrated: 2 facts, 1 warnings' -Quiet)) {
     throw 'The first launch did not migrate two V3 facts into the V4 shadow.'
@@ -161,6 +169,9 @@ try {
   if (-not (Select-String -Path $logPath -Pattern 'Memory V4 shadow initialization failed' -Quiet)) {
     throw 'The damaged V4 shadow did not enter the expected non-fatal fallback path.'
   }
+  if (-not (Select-String -Path $logPath -Pattern 'Memory V4 official read smoke completed: mode auto, source v3' -Quiet)) {
+    throw 'Auto mode did not fall back to V3 after the V4 shadow was intentionally damaged.'
+  }
 
   [IO.File]::WriteAllText((Join-Path $dataPath 'memory-embeddings.enc'), '{corrupt-embedding-index', [Text.UTF8Encoding]::new($false))
   Invoke-SmokeLaunch
@@ -212,10 +223,10 @@ try {
     throw 'The isolated Memory V4 worker did not execute on every healthy shadow launch.'
   }
 
-  Write-Output 'Memory V4 Electron smoke test passed: isolated worker execution, migration, journal replay, 100% diff audit, strong-confirm zero-residual purge, post-purge restart, encrypted artifacts, renderer startup, and safe V4/embedding-index/model-integrity failure fallbacks.'
+  Write-Output 'Memory V4 Electron smoke test passed: default-auto official V4 read, per-request V3 fallback, isolated worker execution, migration, journal replay, 100% diff audit, strong-confirm zero-residual purge, post-purge restart, encrypted artifacts, renderer startup, and safe V4/embedding-index/model-integrity failure fallbacks.'
 }
 finally {
-  Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_SMOKE_PURGE_ID,Env:DESKPET_SMOKE_EXPECT_ROLLOUT_STAGE,Env:DESKPET_MEMORY,Env:DESKPET_MEMORY_V4_INTERNAL_REVIEW -ErrorAction SilentlyContinue
+  Remove-Item Env:DESKPET_USER_DATA_DIR,Env:DESKPET_BOOT_LOG,Env:DESKPET_SMOKE_TEST,Env:DESKPET_SMOKE_PURGE_ID,Env:DESKPET_SMOKE_EXPECT_ROLLOUT_STAGE,Env:DESKPET_MEMORY,Env:DESKPET_MEMORY_V4_INTERNAL_REVIEW,Env:DESKPET_MEMORY_V4_READ_MODE -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath $testRoot) {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'

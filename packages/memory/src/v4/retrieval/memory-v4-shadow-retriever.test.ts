@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import { createMemoryConsolidationService } from '../consolidation/memory-consolidation-service'
+import { createMemoryTieringService } from '../consolidation/memory-tiering-service'
 import { migrateV3PayloadToV4 } from '../migration/v3-to-v4'
 import { createMemoryV4Repository } from '../repository/memory-v4-repository'
 import {
@@ -124,6 +125,14 @@ describe('Memory V4 read-only shadow retrieval', () => {
     expect(absentDoorCode.hits).toEqual([])
     expect(absentDoorCode.abstention?.abstained).toBe(true)
 
+    const absentExercise = retriever.recall('我现在的每周锻炼安排是什么？', { scope, limit: 5 })
+    expect(absentExercise.hits).toEqual([])
+    expect(absentExercise.abstention?.abstained).toBe(true)
+
+    const absentBook = retriever.recall('我喜欢哪本书？', { scope, limit: 5 })
+    expect(absentBook.hits).toEqual([])
+    expect(absentBook.abstention?.abstained).toBe(true)
+
     const weather = retriever.recall('明天会不会下雨？', { scope, limit: 5 })
     expect(weather.queryIntent).toBe('external')
     expect(weather.routes).toEqual([])
@@ -145,7 +154,7 @@ describe('Memory V4 read-only shadow retrieval', () => {
     expect(recalled.hits[0]?.routes).toContain('fact-lexical')
     expect(recalled.abstention).toMatchObject({
       abstained: false,
-      version: 'memory-v4-local-calibration-v1:deskpet-v4-local-synthetic-calibration-v1',
+      version: 'memory-v4-local-calibration-v2:deskpet-v4-local-synthetic-calibration-v2',
     })
   })
 
@@ -182,6 +191,33 @@ describe('Memory V4 read-only shadow retrieval', () => {
     })
     retriever.recall('我叫什么？', { scope })
     expect(retriever.indexStatus().rebuildCount).toBe(1)
+  })
+
+  it('excludes tier-quarantined facts before any retrieval route can rank them', async () => {
+    const repository = await seedRepository()
+    const coffee = repository.snapshot().legacyImports.find(item => item.sourceItemId === 'coffee')!
+    repository.transaction((draft) => {
+      for (const offset of [0, 1]) {
+        draft.retrievalEvents.push({
+          id: `quarantine-coffee-${offset}`,
+          scope,
+          queryHash: `hash-${offset}`,
+          queryType: 'fixed',
+          retrievedFactIds: [coffee.factId],
+          injectedFactIds: [coffee.factId],
+          adoptedFactIds: [], correctedFactIds: [], deniedFactIds: [coffee.factId],
+          createdAt: NOW + offset,
+          retrievalVersion: 'test',
+        })
+      }
+    })
+    await createMemoryTieringService(repository, { now: () => NOW }).run(scope)
+    const recalled = createMemoryV4ShadowRetriever(repository, { now: () => NOW })
+      .recall('我平时喝什么？', { scope, limit: 5 })
+
+    expect(recalled.hits.some(hit => hit.sourceMemoryId === 'coffee')).toBe(false)
+    expect(recalled.tierRouting.quarantineExcluded).toBe(1)
+    expect(recalled.candidateCount).toBe(0)
   })
 
   it('uses a verified learned embedding for paraphrases while retaining hash fallback', () => {
@@ -283,7 +319,7 @@ describe('V3/V4 shadow comparator', () => {
       v4Abstained: false,
       v4BestEvidenceScore: recalled.abstention?.bestScore,
       v4AbstentionThreshold: recalled.abstention?.threshold,
-      v4AbstentionVersion: 'memory-v4-local-calibration-v1:deskpet-v4-local-synthetic-calibration-v1',
+      v4AbstentionVersion: 'memory-v4-local-calibration-v2:deskpet-v4-local-synthetic-calibration-v2',
     })
     expect(comparison.queryHash).toBe('a'.repeat(64))
     expect(comparison).toMatchObject({

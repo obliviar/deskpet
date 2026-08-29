@@ -132,6 +132,7 @@ function comparison(): V3V4ShadowComparison {
 function recall(): MemoryV4ShadowRecallResult {
   return {
     version: 'memory-v4-shadow-retriever-v2',
+    policy: { policyId: 'test-policy', policyVersion: 'test-v1', fingerprint: 'test-fingerprint' },
     snapshotRevision: 1,
     queryIntent: 'specific',
     routes: ['fact-structured'],
@@ -140,6 +141,16 @@ function recall(): MemoryV4ShadowRecallResult {
     summariesUsed: [],
     privacyFiltered: 0,
     temporalFiltered: 0,
+    tierRouting: {
+      version: 'memory-v4-tier-router-v1', coldPolicy: 'fallback', coldAwakened: false,
+      candidateBudgets: { hot: 8, warm: 16, cold: 8 },
+      eligibleCounts: { hot: 1, warm: 0, cold: 0 }, searchedCounts: { hot: 1, warm: 0, cold: 0 },
+      quarantineExcluded: 0, unassignedAsWarm: 0,
+    },
+    evidenceSelection: {
+      version: 'memory-v4-evidence-selector-v1', evaluatedCount: 1, selectedCount: 1,
+      coveredRequirements: ['concept:preference.drink'], stopReason: 'coverage-satisfied', usedCharacters: 11,
+    },
     hits: [{
       factId: 'fact-coffee',
       sourceMemoryId: 'coffee',

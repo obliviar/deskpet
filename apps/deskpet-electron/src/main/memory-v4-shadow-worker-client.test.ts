@@ -149,6 +149,7 @@ function recallOptions() {
 function result(snapshotRevision: number): MemoryV4ShadowRecallResult {
   return {
     version: 'memory-v4-shadow-retriever-v2',
+    policy: { policyId: 'test-policy', policyVersion: 'test-v1', fingerprint: 'test-fingerprint' },
     snapshotRevision,
     queryIntent: 'personal-specific',
     routes: [],
@@ -157,6 +158,16 @@ function result(snapshotRevision: number): MemoryV4ShadowRecallResult {
     summariesUsed: [],
     privacyFiltered: 0,
     temporalFiltered: 0,
+    tierRouting: {
+      version: 'memory-v4-tier-router-v1', coldPolicy: 'fallback', coldAwakened: false,
+      candidateBudgets: { hot: 8, warm: 16, cold: 8 },
+      eligibleCounts: { hot: 0, warm: 0, cold: 0 }, searchedCounts: { hot: 0, warm: 0, cold: 0 },
+      quarantineExcluded: 0, unassignedAsWarm: 0,
+    },
+    evidenceSelection: {
+      version: 'memory-v4-evidence-selector-v1', evaluatedCount: 0, selectedCount: 0,
+      coveredRequirements: [], stopReason: 'no-candidates', usedCharacters: 0,
+    },
     hits: [],
     latencyMs: 1,
     index: { summaries: 0, facts: 0, rebuildCount: 1 },

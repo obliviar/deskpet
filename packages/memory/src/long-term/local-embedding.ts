@@ -27,7 +27,7 @@ const SEMANTIC_CONCEPT_PATTERNS: Array<[string, RegExp]> = [
   ['preference.food', /不喜欢.{0,12}(?:食物|吃)|不要(?:放|加)|吃饭|点菜|口味.{0,8}(?:禁忌|避讳)|忌口|不能吃|香菜|\bdislike\b|\bhate\b|cilantro|food.{0,12}(?:preference|restriction)/i],
   ['preference.interface-theme', /界面.{0,8}(?:主题|模式)|深色主题|黑色主题|dark\s+mode|interface\s+theme/i],
   ['plan.travel', /旅行|目的地|去哪里玩|下一趟|京都|\btravel\b|\btrip\b|\bdestination\b/i],
-  ['preference.book', /喜欢的书|小说|哪部.{0,8}心头好|三体|\bbook\b|\bnovel\b/i],
+  ['preference.book', /喜欢的书|喜欢.{0,4}(?:哪|什么|哪一)(?:本|部)书|哪(?:一)?本书|什么书|小说|哪部.{0,8}心头好|三体|\bbook\b|\bnovel\b/i],
   ['profile.education', /毕业院校|高校毕业|大学|本科|硕士|博士|就读|在哪.{0,8}读|\buniversity\b|\bcollege\b|education/i],
   ['preference.color', /颜色|什么色|色系|衣服.{0,8}色|藏青|墨绿|\bcolor\b|\bcolour\b/i],
   ['routine.rent', /房租|房东.{0,12}收钱|每月.{0,6}号|\brent\b/i],
@@ -60,7 +60,7 @@ export function sharesLocalSemanticConcept(text: string, concepts: ReadonlySet<s
 
 /**
  * Produce a deterministic feature-hashed vector from Latin words, Chinese
- * unigrams/bigrams and weighted semantic field aliases. Version 2 improves
+ * unigrams/bigrams and weighted semantic field aliases. Version 3 improves
  * paraphrase recall without sending personal text to a remote service.
  */
 export function createLocalEmbedding(text: string, dimensions = DEFAULT_DIMENSIONS): number[] {

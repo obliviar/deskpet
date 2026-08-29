@@ -6,8 +6,8 @@ import {
   type RecallAbstentionCalibrationModel,
 } from '../../long-term/abstention-calibration'
 
-export const MEMORY_V4_LOCAL_CALIBRATION_VERSION = 'memory-v4-local-calibration-v1'
-export const MEMORY_V4_ABSOLUTE_EVIDENCE_SCORE_VERSION = 'memory-v4-absolute-evidence-v1'
+export const MEMORY_V4_LOCAL_CALIBRATION_VERSION = 'memory-v4-local-calibration-v2'
+export const MEMORY_V4_ABSOLUTE_EVIDENCE_SCORE_VERSION = 'memory-v4-absolute-evidence-v2'
 
 export interface MemoryV4CalibrationObservation {
   id: string

@@ -16,17 +16,20 @@ describe('Electron Memory V4 Internal feedback adapter', () => {
     store.registerReview(review())
     expect(store.recordFeedback({ reviewId: 'review-1', factId: 'fact-coffee', label: 'correct' }))
       .toEqual({ ok: true, label: 'correct' })
+    expect(store.confirmReview('review-1')).toEqual({ ok: true, confirmedAt: NOW })
     expect(payload).not.toContain('用户喜欢喝手冲咖啡')
     expect(payload).not.toContain('我的饮品偏好是什么')
     expect(payload).toContain('fact-coffee')
 
     const restored = createMemoryV4InternalFeedbackStore({ persistence, encrypted: true, flushDelayMs: 0, now: () => NOW })
     expect(restored.feedbackFor('review-1', 'fact-coffee')).toBe('correct')
+    expect(restored.status().confirmedReviews).toBe(1)
     expect(restored.recordFeedback({ reviewId: 'review-1', factId: 'fact-coffee', label: 'expired' }))
       .toEqual({ ok: true, label: 'expired' })
     expect(restored.status()).toMatchObject({
       encrypted: true,
       retainedReviews: 1,
+      confirmedReviews: 0,
       labeledCandidates: 1,
       byLabel: { correct: 0, expired: 1 },
     })

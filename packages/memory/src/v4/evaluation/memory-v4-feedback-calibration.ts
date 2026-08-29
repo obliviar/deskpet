@@ -53,6 +53,8 @@ export interface MemoryV4FeedbackSplitStats {
 export interface MemoryV4FeedbackCalibrationAudit {
   sourceReviews: number
   selectedVersionReviews: number
+  confirmedReviews: number
+  unconfirmedReviews: number
   excludedOtherVersionReviews: number
   adjudicatedQueries: number
   incompleteQueries: number
@@ -152,7 +154,8 @@ export function freezeMemoryV4InternalFeedbackDataset(
   const splitSalt = boundedString(options.splitSalt, 160, DEFAULT_SPLIT_SALT)
   const calibrationVersion = selectCalibrationVersion(reviews, options.calibrationVersion)
   const selected = reviews.filter(review => review.calibrationVersion === calibrationVersion)
-  const assessed = selected.map(assessReview)
+  const confirmed = selected.filter(review => review.confirmedAt !== undefined)
+  const assessed = confirmed.map(assessReview)
   const groups = new Map<string, AssessedReview[]>()
   for (const review of assessed)
     groups.set(review.review.queryHash, [...(groups.get(review.review.queryHash) ?? []), review])
@@ -218,6 +221,8 @@ export function freezeMemoryV4InternalFeedbackDataset(
   const audit: MemoryV4FeedbackCalibrationAudit = {
     sourceReviews: reviews.length,
     selectedVersionReviews: selected.length,
+    confirmedReviews: confirmed.length,
+    unconfirmedReviews: selected.length - confirmed.length,
     excludedOtherVersionReviews: reviews.length - selected.length,
     adjudicatedQueries: chosen.length,
     incompleteQueries,
@@ -268,9 +273,9 @@ export function evaluateMemoryV4FeedbackCalibrationGate(
   add('minimum-validation-negatives', 'evidence', dataset.validationStats.negatives, policy.minimumValidationNegatives, dataset.validationStats.negatives >= policy.minimumValidationNegatives)
   add('minimum-ranking-cases', 'evidence', dataset.rankingValidation.cases, policy.minimumValidationRankingCases, dataset.rankingValidation.cases >= policy.minimumValidationRankingCases)
 
-  const conflictRate = dataset.audit.selectedVersionReviews === 0
+  const conflictRate = dataset.audit.confirmedReviews === 0
     ? 0
-    : dataset.audit.conflictingQueries / dataset.audit.selectedVersionReviews
+    : dataset.audit.conflictingQueries / dataset.audit.confirmedReviews
   const unknownIntentRate = dataset.audit.adjudicatedQueries === 0
     ? 1
     : dataset.audit.unknownIntentQueries / dataset.audit.adjudicatedQueries
@@ -450,6 +455,7 @@ function fingerprintDatasetSource(
       || left.candidateHash.localeCompare(right.candidateHash)),
     queryLabel: review.queryLabel,
     queryLabelRecordedAt: review.queryLabelRecordedAt,
+    confirmedAt: review.confirmedAt,
   })).sort((left, right) => left.queryHash.localeCompare(right.queryHash)
     || left.createdAt - right.createdAt
     || left.reviewKey.localeCompare(right.reviewKey))

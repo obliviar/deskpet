@@ -192,7 +192,10 @@ function extractClause(candidates: MemoryCandidate[], clause: string): void {
 }
 
 function addRoutineMatch(candidates: MemoryCandidate[], input: string): void {
-  const match = /(?:我)?每周([一二三四五六日天1-7])(?:我)?(?:都会|会|通常)?(?:去)?\s*([^，。！？,.!?\n]{1,80})/u.exec(input)
+  // Do not begin in the middle of a third-person subject such as
+  // “别人说‘用户每周六晨跑’”. A first-person marker, start of clause or
+  // punctuation boundary remains eligible.
+  const match = /(?<![\p{L}\p{N}])(?:我)?每周([一二三四五六日天1-7])(?:我)?(?:都会|会|通常)?(?:去)?\s*([^，。！？,.!?\n]{1,80})/u.exec(input)
   const day = match?.[1]
   const activity = cleanValue(match?.[2] ?? '')
   if (!day || !activity || isUnsafe(activity))

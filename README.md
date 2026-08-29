@@ -2,7 +2,7 @@
 
 DeskPet 是一个基于 Electron、Vue 3 和 TypeScript 的 Windows 桌面 AI 伙伴。项目采用 Monorepo 与 Port/Adapter 架构，将聊天模型、会话、长期记忆、工具和语音能力拆分为独立模块。
 
-> 当前版本：`0.3.9`。本版完成 V4 Internal 反馈冻结集和离线校准预门禁：按查询与共享事实隔离校准/验证集，审计矛盾、遗漏、隐私和排序质量；门禁不会自动训练、切换或影响正式回答。V3 仍是唯一正式回答来源。
+> 当前版本：`0.3.9`。本版完成 V4 正式读、分层检索、365 天自动功能实验、只读策略搜索和 20k V4 Beta 默认切读：统一 EvidenceBundle、`v3` / `v4-beta` / `auto` 路由、逐请求 V3 回退、真实 hot/warm/cold/quarantine 候选路由、最小充分证据选择，以及可重放的一年生命周期/重启/重建/20k 门禁已经接通。默认模式为 `auto`；V4 Worker 就绪且证据充分时使用 V4，其他请求自动回退 V3。
 
 ## 主要功能
 
@@ -53,13 +53,13 @@ pnpm dev:electron
 
 DeskPet 同时保留短期会话和长期记忆：
 
-> V4 安全双写和隔离影子召回已经启用，但尚未接管正式回答。V3 仍是唯一正式读写与回滚来源；每次 V3 成功提交后，V4 旁路同步 Episode、Candidate、Fact、EvidenceLink、FactVersion 和 RetrievalEvent。V4 在独立 Worker 中用 BM25、结构化字段、摘要下钻、本地哈希和可选的已校验 BGE 向量产生候选，只用于与 V3 结果比较和内部评估。任何 V4、向量索引或 Worker 故障都会回退，不会中断 V3。
+> V3 继续承担正式写入和回滚；每次 V3 成功提交后，V4 旁路同步 Episode、Candidate、Fact、EvidenceLink、FactVersion 和 RetrievalEvent。默认读模式为 `auto`，也可显式强制 `v3` 或 `v4-beta`。V4 使用 tier-index 分配候选预算，再由 BM25、结构化字段、摘要下钻、本地哈希和可选的已校验 BGE 向量生成 EvidenceBundle；Worker 忙碌、异常、空结果或证据门拒答时，该请求立即回退 V3。
 
 | 类型 | 保存内容 | 用途 | 文件 |
 | --- | --- | --- | --- |
 | 短期会话 | 用户和助手的原始消息 | 保持当前对话连续性，默认最多 200 条 | `sessions.enc` |
 | 长期记忆 v3 | 原子事实、时间版本、来源、向量和隐私字段 | 跨会话及历史时间召回，默认最多 20,000 条 | `memories.enc` + `memories.enc.journal` |
-| V4 影子记忆 | 事实图、证据、版本、摘要、检索事件和冷热层级 | 双写审计、离线巩固和候选质量评估，不直接进入回答 | `memory-v4.enc` + `memory-v4.enc.journal` |
+| V4 记忆 | 事实图、证据、版本、摘要、检索事件和冷热层级 | 双写审计、离线巩固、候选评估，以及在 Beta/Auto 模式下生成正式回答证据 | `memory-v4.enc` + `memory-v4.enc.journal` |
 | V4 学习语义索引 | 与精确正文哈希绑定的 BGE 事实/摘要向量 | 在隔离 Worker 中增强改写和同义表达召回 | `memory-v4-embeddings.enc` |
 | V4 Internal 反馈 | 查询哈希、查询意图、候选/来源 ID、分数和七类人工结论 | 建立可审计的本地冻结校准集；不保存查询、回答或记忆正文，不直接改变排序 | `memory-v4-internal-feedback.enc` |
 
@@ -115,7 +115,10 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 - 捕获到原始用户消息时，候选事实会连接到原生 Episode 和直接 Evidence；整段消息必须通过密钥/指令安全检查，并独立执行隐私推断。
 - 自适应召回分别记录已评估事实与实际注入事实，查询正文只保存 SHA-256 哈希。
 - 启动对账使用线性映射索引；5000 条模拟 V3 记录首次对账约 393 ms，未变化重启约 46 ms（测试机器结果，不是性能保证）。
-- V4 影子检索在独立 Worker 中运行；超时、模型不匹配、索引损坏或语义查询失败时安全退回哈希/BM25 路径，聊天提示词继续只使用经过验证的 V3 召回结果。
+- V4 检索在独立 Worker 中运行；语义模型不可用时退回哈希/BM25，Worker 超时、忙碌、索引异常、空结果或证据不足时按请求退回 V3。默认 `auto` 会把通过证据门的 V4 EvidenceBundle 注入聊天提示词；可用 `v3` 强制 kill switch。
+- V4 tier-index 已成为真实候选路由：普通当前查询先检索 hot/warm，证据不足才以较小预算唤醒 cold；时间线、历史和全量概括直接启用受限 cold；quarantine 在任何排名路线之前排除。tier-index 缺失或失效时，权威 active 事实暂按 warm 处理，避免派生索引导致记忆消失。
+- 绝对证据门之后使用覆盖率、memoryKey/时间状态多样性、正文新颖度和边际收益选择最小充分事实；单值问题覆盖后立即停止，多事实/时间线问题保留必要的独立事实和冲突双边，不再简单截取 Top K。
+- P3 自动实验场使用固定场景合同和随机种子生成 365 天、1826 个事件；其中 1810 个自动 NOOP 也真实经过本地提取器和已知事实去重判定。在第 1/7/30/90/180/365 天执行日志回放、压实重启、派生视图删除/重建和 V3/V4/无摘要消融查询；当前固定场景的 71 个 V4 查询、写入判定、不变量、拒答和重启一致性门槛全部通过。该结果是仓库内确定性开发实验，不是外部盲测结论。
 - 记忆管理界面可以在 `Shadow` 与 `Internal` 之间切换。`Internal` 只把 V4 候选附在本地回复下方供检查，不会修改提示词；退出或运行时失败会立即清理挂起评审并回到 `Shadow`。
 - 每轮实际签发的评审可标注候选级“正确、不应使用、事实错误、已过期、隐私不当”，以及查询级“遗漏、无需记忆”。查询级正负结论使拒答校准不再只有正例；候选反馈必须绑定该轮真实候选，无法通过 IPC 伪造候选。数据经独立 AES-256-GCM 文件保存，彻底清除事实时同步移除 V4/V3 ID 引用。
 - 当前反馈仅用于形成后续冻结校准集，不会在线自学习或直接提高/降低记忆分数，避免少量误标立即污染正式回答。
@@ -131,20 +134,24 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 | √ | 基线与 V3 基础能力 | 加密、增量日志、来源同步、生命周期、冲突、隐私和记忆管理已上线 |
 | √ | V4 第一阶段数据底座 | 独立模型、事务 Repository、严格校验、加密快照和只读 V3→V4 迁移已完成 |
 | √ | 自适应分批召回 | 动态批次、覆盖/增益/分数停止、数量和字符预算已上线 |
-| √ | V4 第二阶段安全双写 | 提交后双写、原始证据、版本历史、删除墓碑、召回事件、启动对账和故障隔离已完成；V4 尚不参与召回 |
+| √ | V4 第二阶段安全双写 | 提交后双写、原始证据、版本历史、删除墓碑、召回事件、启动对账和故障隔离已完成；V3 继续承担正式写入 |
 | √ | 双写差异审计 | 已逐项核对计数、正文、状态、作用域、有效时间、来源、隐私和版本头；隔离应用测试达到 100.0000% exact、0 issues |
-| √ | V4 隔离影子召回 | 独立 Worker、多路 RRF、BM25、结构化查询、摘要导航、绝对证据门槛、拒答和持久化对比已完成；不影响正式回答 |
+| √ | V4 隔离召回基础 | 独立 Worker、多路 RRF、BM25、结构化查询、摘要导航、绝对证据门槛、拒答和持久化对比已完成 |
+| √ | V4 正式读 MVP | EvidenceBundle、`v3` / `v4-beta` / `auto` 路由、提示词注入、来源/Fact ID/策略指纹记录，以及 Worker 异常、忙碌、空结果和拒答时的逐请求 V3 回退已完成；默认为 `auto` |
+| √ | V4 分层路由与最小充分证据 | tier-index 候选预算、普通查询 cold 按需唤醒、历史/概括 cold 主动导航、quarantine 前置排除、覆盖与边际收益选择，以及写入→版本→摘要→重建→召回→归档/恢复时间线测试已完成 |
+| √ | V4 365 天自动功能实验 | 固定种子生成 1826 个事件，六个检查点覆盖重启/日志压实/派生重建，比较 V3、V4 和无摘要消融；固定场景 V4 Recall@5、Top-1、时间正确率和拒答均为 100%，20k P95 门槛通过 |
+| √ | V4 只读策略制品与自动搜索 | 候选预算、RRF、证据阈值、tier 配额和停止条件已收口；固定 365 天 replay 选出带 SHA-256 指纹的 `budget-625`，功能硬门不退化且 20k 最大候选窗口 16→10 |
 | √ | V4 学习语义旁路 | 固定指纹 BGE、SHA-256 模型清单、启动探针、V3 向量复用、独立加密索引、后台增量补齐、内容哈希校验和哈希降级已完成 |
-| √ | V4 Internal 内部评审 | 阶段持久化、运行时启停、界面控制、环境锁、Worker 前置校验和挂起任务清理已完成；V3 始终权威 |
+| √ | V4 Internal 内部评审 | 阶段持久化、运行时启停、界面控制、环境锁、Worker 前置校验和挂起任务清理已完成；内部评审本身不改变正式读路由 |
 | √ | V4 Internal 人工反馈采集 | 七类绑定式结论、候选防伪、查询级正负例、独立加密存储、明文最小化、删除联动和状态统计已完成；反馈不直接修改在线排序 |
-| √ | V4 反馈冻结集与校准预门禁 | 查询/事实组隔离、确定性冻结指纹、旧数据兼容、查询级负例、矛盾/不完整审计、Top-1/遗漏置信区间和零隐私红线已完成；空数据保持 V3 权威 |
+| √ | V4 反馈冻结集与离线制品核心 | 显式确认、查询/事实组隔离、确定性冻结指纹、旧数据兼容、质量预门禁，以及版本化制品的完整性校验、批准和撤销核心已完成；制品不自动激活或改变正式读路由 |
 | × | 高质量写入门控（3/8） | 已上线双通道候选、本地证据 verifier 和七类写入决策；低证据/冲突候选不进入 V3 正式召回并在 V4 隔离，完整上下文、归一化、审核和重处理仍待完成 |
 | × | 时间与冲突演化 | 完整处理补充、纠正、替代、冲突和历史时间查询 |
-| × | 分层巩固与遗忘 | 日/周/月摘要、稳定事实、事件层和可恢复冷归档 |
+| × | 分层巩固与遗忘 | 已完成摘要下钻、容量 tier、真实分层检索和可恢复冷归档；自动周/月摘要、稳定事实与事件层仍待完成 |
 | × | 大规模多层检索（4/5） | 已有冷热分层、精确密集向量、BM25、哈希、时间/字段检索和摘要下钻；待真实 BGE 冻结集校准后才能成为正式召回 |
-| × | 反馈学习和可解释管理（2/4） | 已完成高质量标签采集、冻结分割和离线预门禁；仍需积累足量真实标注、人工复核冻结版本并产出经批准的校准制品，之后才可实验性接入排序 |
-| × | 长周期可靠性与隐私 | 备份恢复、文件锁、故障注入、隐私泄漏评测和一年尺度模拟 |
-| × | V4 灰度切换与一年验收 | 质量门槛达标后小比例召回，可立即回退 V3，最终完成一年记忆验收 |
+| × | 反馈学习和可解释管理（3/4） | 已完成标签采集、显式确认、冻结分割、离线预门禁和版本化制品核心；尚未把任何制品接入在线排序，当前开发主线转向 V4 正式读路径和自动长期验证 |
+| × | 长周期可靠性与隐私 | 一年尺度确定性模拟已完成；备份恢复、文件锁、故障注入和隐私泄漏评测不属于本轮功能主线，尚未据此宣称完整完成 |
+| √ | V4 灰度切换与一年验收 | 默认 `auto` 已启用；连续三次全仓无缓存回归、20k/365 天门、production build，以及真实 Electron 健康 V4 读取与损坏后 V3 回退均通过 |
 
 ### 事实提取
 
@@ -157,7 +164,7 @@ Port 层仍保留固定 `recall(topK)`；调用方显式传入 `memoryTopK` 时�
 
 ### 混合检索与本地语义模型
 
-默认检索器是无需下载的 `local-hash-v2`。它在字符哈希上增加本地语义字段别名，并由 BM25 词语检索配合相关性门控，综合六项分数：
+默认检索器是无需下载的 `local-hash-v3`。它对拉丁词、中文单字/双字和本地语义字段别名进行确定性特征哈希，并由 BM25 词语检索配合相关性门控，综合六项分数：
 
 | 信号 | 权重 |
 | --- | ---: |
@@ -230,7 +237,7 @@ OCR 使用 Tesseract.js 的简体中文和英文模型，在本机执行。只�
 - 在 Shadow 与 Internal 之间安全切换，并在回复下方查看不参与回答的 V4 候选；
 - 查看实际加密文件位置。
 
-记忆正文目前不能原地编辑；需要修改时可删除旧记录并手动添加新记录。
+记忆正文可以在管理界面中编辑并保存；正文变化后会重新计算向量并持久化更新。
 
 ## 数据文件与迁移
 
@@ -278,6 +285,7 @@ Windows 打包版主要数据位于：
 | `DESKPET_MEMORY=false` | 关闭长期记忆 |
 | `DESKPET_MEMORY_V4_SHADOW=false` | 紧急关闭整个 V4 影子运行时 |
 | `DESKPET_MEMORY_V4_INTERNAL_REVIEW=true/false` | 强制并锁定 Internal/Shadow，优先于界面持久化设置 |
+| `DESKPET_MEMORY_V4_READ_MODE=v3/v4-beta/auto` | 选择正式记忆读路由；默认 `auto`，显式 `v3` 是 kill switch，所有 V4 模式均保留逐请求 V3 回退 |
 | `DESKPET_USER_DATA_DIR` | 覆盖应用数据目录，测试时推荐使用 |
 | `DESKPET_BOOT_LOG` | 将启动诊断写入指定文件 |
 
@@ -320,12 +328,24 @@ deskpet/
 - `packages/memory/src/long-term/encrypted-persistence.ts`：AES-256-GCM 文件适配器
 - `packages/memory/src/v4/dual-write/v4-shadow-writer.ts`：V3 提交后双写、证据连接、版本和召回审计
 - `packages/memory/src/v4/retrieval/memory-v4-shadow-retriever.ts`：V4 多路召回、学习语义、融合和拒答
+- `packages/memory/src/v4/retrieval/memory-v4-tier-router.ts`：将 tier-index 转换为候选预算、quarantine 排除和 cold 唤醒策略
+- `packages/memory/src/v4/retrieval/memory-v4-evidence-selector.ts`：通过覆盖、多样性和边际收益生成最小充分证据
+- `packages/memory/src/v4/read/memory-v4-evidence-bundle.ts`：将通过证据门的 V4 Fact 转换为可引用的正式回答证据
+- `packages/memory/src/v4/read/memory-v4-read-router.ts`：正式读模式选择和逐请求 V3 回退
 - `packages/memory/src/v4/evaluation/memory-v4-internal-feedback.ts`：绑定式七类反馈、最小化持久化、统计和删除联动
 - `packages/memory/src/v4/evaluation/memory-v4-feedback-calibration.ts`：泄漏安全冻结分割、一致性审计、置信区间和离线拟合预门禁
+- `packages/memory/src/v4/evaluation/memory-v4-year-scenario.ts`：365 天场景合同、校验、固定种子生成和自动变换
+- `packages/memory/src/v4/evaluation/memory-v4-year-simulator.ts`：生命周期回放、重启/重建不变量、V3/V4/消融对照和 20k 门禁
+- `packages/memory/src/v4/evaluation/memory-v4-year-report.ts`：机器可读 JSON 与 Markdown 实验报告
+- `packages/memory/src/v4/policy/memory-v4-retrieval-policy.ts`：不可变检索参数、边界校验和稳定指纹
+- `packages/memory/src/v4/policy/memory-v4-policy-search.ts`：固定 replay 上的非退化门和 Pareto 搜索
+- `packages/memory/src/v4/policy/memory-v4-policy-artifact.ts`：只读策略制品、完整性和来源复验
+- `evals/memory/v4-retrieval-policy-v1.json`：P4 当前选中策略制品
 - `packages/core/src/runtime/agent-runtime.ts`：召回、附件和来源 ID
 - `apps/deskpet-electron/src/main/semantic-memory.ts`：本地中文语义模型
 - `apps/deskpet-electron/src/main/memory-v4-semantic-index.ts`：V4 加密语义索引、迁移和后台增量重建
 - `apps/deskpet-electron/src/main/memory-v4-shadow-worker.ts`：隔离 V4 影子召回 Worker
+- `apps/deskpet-electron/src/main/memory-v4-read-controller.ts`：正式读状态、来源和注入 Fact ID 审计
 - `apps/deskpet-electron/src/main/memory-v4-internal-review.ts`：签发本地评审、短时关联查询与影子候选
 - `apps/deskpet-electron/src/main/memory-v4-internal-feedback.ts`：将临时候选裁剪为无正文的核心反馈记录
 - `apps/deskpet-electron/src/main/image-memory.ts`：显式图片 OCR
@@ -364,8 +384,8 @@ pnpm --filter @deskpet/electron package
 - 本地语义模型和 OCR 语言数据需要首次联网下载，未内置到安装 ZIP。
 - 短期会话与长期记忆均已加密；DPAPI 密钥与数据文件必须一起备份。
 - 当前桌面端固定为一个本地用户和一个 Agent 作用域。
-- V4 已执行隔离影子召回、内部评审、加密反馈采集和确定性冻结预门禁，但没有进入聊天提示词；当前真实标注数量不足，尚未生成获批的校准制品，也未通过正式灰度门禁。
-- 桌面设置只允许 `Shadow` 和 `Internal`；尚未实现 `percent-1` 流量分桶、V4 提示词注入与在线自动回滚。
+- V4 20k Beta 已默认使用 `auto` 进入聊天提示词；连续三次完整回归、365 天实验、只读策略搜索和真实启动回退均已通过。V3 仍承担写入、逐请求回退和 kill switch。
+- 桌面界面仍只管理 `Shadow` 和 `Internal` 评审阶段；正式读模式可通过配置文件或 `DESKPET_MEMORY_V4_READ_MODE` 覆盖，尚未实现界面切换。
 - 本次代码回归未执行外部盲测；本机也没有 BGE 模型缓存，因此真实 BGE 开发集对比未执行，不能把合成集成绩视作上线质量证明。
-- 尚无多进程文件锁、正文原地编辑和分层的日/周/月会话摘要。
+- 尚无多进程文件锁和自动周/月分层摘要。
 - OCR 只保留可识别文字，无法完整理解没有文字的图片语义。

@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "artifactVersion": "memory-v4-policy-artifact-v1",
+  "policyFingerprint": "341998c8631a501299571e0b552a9b902a4e0f00318d2d89ccc608fe73bc0e99",
+  "policy": {
+    "schemaVersion": 1,
+    "policyVersion": "memory-v4-retrieval-policy-v1",
+    "policyId": "deskpet-v4-retrieval-budget-625-v1",
+    "candidateBudgetScale": {
+      "external": 1,
+      "specific": 0.625,
+      "multi-fact": 0.625,
+      "temporal": 0.625,
+      "timeline": 0.625,
+      "enumerative": 0.625
+    },
+    "rrfRankConstant": 60,
+    "evidenceThresholds": {
+      "lexicalCandidateScore": 0.12,
+      "semanticCandidateScore": 0.08,
+      "learnedSemanticCosine": 0.45,
+      "summaryEvidenceScore": 0.28,
+      "summaryEvidenceWeight": 0.25,
+      "minimumSummaryFactEvidenceRatio": 0.5
+    },
+    "tierQuotas": {
+      "eagerHotFraction": 0.25,
+      "eagerColdFraction": 0.3,
+      "fallbackHotFraction": 0.3333333333333333,
+      "fallbackColdFraction": 0.3333333333333333,
+      "fallbackColdMaximum": 16
+    },
+    "summarySelection": {
+      "minimum": 4,
+      "maximum": 24,
+      "candidateDivisor": 4
+    },
+    "evidenceSelection": {
+      "broadMinimumMarginalGain": 0.16,
+      "defaultMinimumMarginalGain": 0.08,
+      "maximumCharactersScale": 1
+    },
+    "abstentionCalibration": {
+      "version": "memory-v4-local-calibration-v2:deskpet-v4-local-synthetic-calibration-v2",
+      "defaultThreshold": 0.36,
+      "thresholds": {
+        "enumerative": 0.36,
+        "multi-fact": 0.5,
+        "specific": 0.49321711682041386,
+        "temporal": 0.5,
+        "timeline": 0.5
+      },
+      "datasetVersion": "deskpet-v4-local-synthetic-calibration-v2",
+      "sampleCount": 700
+    }
+  },
+  "source": {
+    "kind": "constrained-search",
+    "scenarioFingerprint": "4e7bb756d2e961ae6dc947dbde561cca4b1ec94c7d6f79f08d94cb0e3b2b6988",
+    "baselinePolicyFingerprint": "9f03c3ce7d7ac499743f09df9471eab09785b7d3368104d5b8081d91f07633ea",
+    "searchVersion": "memory-v4-constrained-pareto-search-v1"
+  }
+}
